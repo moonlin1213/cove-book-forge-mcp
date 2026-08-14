@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 
@@ -28,9 +28,11 @@ class AuthorizedPathPolicy:
 
     @staticmethod
     def validate_root(path: Path) -> Path:
+        if "\x00" in str(path):
+            raise _path_error("Authorized root contains an invalid path component.", path)
         try:
             root = path.expanduser().resolve(strict=True)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             raise _path_error("Authorized root does not exist.", path) from exc
         if not root.is_dir():
             raise _path_error("Authorized root must be a directory.", root)
@@ -52,6 +54,8 @@ class AuthorizedPathPolicy:
                 or "/" in part
                 or "\\" in part
                 or Path(part).is_absolute()
+                or PureWindowsPath(part).drive
+                or PureWindowsPath(part).anchor
             ):
                 raise _path_error("Target contains an invalid path component.", current / part)
             candidate = current / part

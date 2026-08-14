@@ -1,7 +1,9 @@
 import hashlib
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -23,6 +25,56 @@ from cove_book_forge.contracts import (
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.extractors import BookExtractorRegistry
 from cove_book_forge.library import BookLibrary, LibraryDatabase, LibraryRepository
+
+_V1_SCHEMA = """
+CREATE TABLE books (
+    book_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    author TEXT NOT NULL DEFAULT '',
+    language TEXT NOT NULL DEFAULT '',
+    total_chapters INTEGER NOT NULL DEFAULT 0 CHECK (total_chapters >= 0),
+    format TEXT,
+    import_mode TEXT,
+    source_fingerprint TEXT,
+    managed_source_path TEXT,
+    reference_source_path TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (format, source_fingerprint)
+);
+CREATE TABLE chapters (
+    book_id TEXT NOT NULL REFERENCES books(book_id) ON DELETE CASCADE,
+    chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),
+    title TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL,
+    source_locator TEXT NOT NULL DEFAULT '',
+    UNIQUE (book_id, chapter_index)
+);
+CREATE TABLE external_sources (
+    external_source_id INTEGER PRIMARY KEY,
+    book_id TEXT NOT NULL REFERENCES books(book_id) ON DELETE CASCADE,
+    source_system TEXT NOT NULL,
+    external_book_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (source_system, external_book_id)
+);
+CREATE TABLE chapter_snapshots (
+    chapter_snapshot_id INTEGER PRIMARY KEY,
+    external_source_id INTEGER NOT NULL
+        REFERENCES external_sources(external_source_id) ON DELETE CASCADE,
+    chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),
+    snapshot_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (external_source_id, chapter_index)
+);
+PRAGMA user_version = 1;
+"""
+
+_LEGACY_BOOK_ID = "legacy-internal-book"
+_LEGACY_EXTERNAL_SOURCE_ID = 17
+_LEGACY_SNAPSHOT_ID = 23
 
 
 class SyntheticPdfExtractor:
@@ -101,6 +153,69 @@ def _snapshot(
             ),
         ),
     )
+
+
+def _create_v1_external_database(
+    path: Path,
+    snapshot_json: str,
+    *,
+    chapter_index: int = 2,
+) -> None:
+    path.parent.mkdir(parents=True)
+    with sqlite3.connect(path) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.executescript(_V1_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO books (
+                book_id, title, author, language, total_chapters,
+                source_fingerprint, created_at, updated_at
+            ) VALUES (?, 'Legacy title', 'Legacy author', 'zh', 1, NULL, ?, ?)
+            """,
+            (
+                _LEGACY_BOOK_ID,
+                "2026-08-14T01:00:00+00:00",
+                "2026-08-14T01:01:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO chapters (
+                book_id, chapter_index, title, content, source_locator
+            ) VALUES (?, 0, 'Untouched', 'Untouched content.', 'legacy:chapter:0')
+            """,
+            (_LEGACY_BOOK_ID,),
+        )
+        connection.execute(
+            """
+            INSERT INTO external_sources (
+                external_source_id, book_id, source_system, external_book_id,
+                created_at, updated_at
+            ) VALUES (?, ?, 'reader', 'external-1', ?, ?)
+            """,
+            (
+                _LEGACY_EXTERNAL_SOURCE_ID,
+                _LEGACY_BOOK_ID,
+                "2026-08-14T02:00:00+00:00",
+                "2026-08-14T02:01:00+00:00",
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO chapter_snapshots (
+                chapter_snapshot_id, external_source_id, chapter_index,
+                snapshot_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _LEGACY_SNAPSHOT_ID,
+                _LEGACY_EXTERNAL_SOURCE_ID,
+                chapter_index,
+                snapshot_json,
+                "2026-08-14T03:00:00+00:00",
+                "2026-08-14T03:01:00+00:00",
+            ),
+        )
 
 
 def test_disabled_managed_library_still_accepts_external_books_and_snapshots(
@@ -242,69 +357,228 @@ def test_managed_and_external_books_coexist_without_identity_collisions(tmp_path
     assert library.get_book(external).format is None
 
 
-def test_v1_snapshot_schema_migrates_forward_and_backfills_fingerprints(
+def test_real_v1_external_data_migrates_to_readable_idempotent_v2(
     tmp_path: Path,
 ) -> None:
-    path = tmp_path / "legacy.sqlite3"
-    legacy_json = '{"z":"界","a":1}'
-    with sqlite3.connect(path) as connection:
-        connection.executescript(
-            """
-            CREATE TABLE external_sources (
-                external_source_id INTEGER PRIMARY KEY,
-                book_id TEXT NOT NULL,
-                source_system TEXT NOT NULL,
-                external_book_id TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE (source_system, external_book_id)
-            );
-            CREATE TABLE chapter_snapshots (
-                chapter_snapshot_id INTEGER PRIMARY KEY,
-                external_source_id INTEGER NOT NULL
-                    REFERENCES external_sources(external_source_id) ON DELETE CASCADE,
-                chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),
-                snapshot_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                UNIQUE (external_source_id, chapter_index)
-            );
-            PRAGMA user_version = 1;
-            """
+    data_dir = tmp_path / "library"
+    path = data_dir / "library.sqlite3"
+    snapshot = _snapshot(index=2, total_chapters=1, content="Migrated chapter.")
+    legacy_json = json.dumps(snapshot.model_dump(mode="json"), ensure_ascii=False, indent=2)
+    _create_v1_external_database(path, legacy_json)
+    library, database = _library(data_dir)
+    book = BookRef(book_id=_LEGACY_BOOK_ID)
+
+    canonical = json.dumps(
+        snapshot.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    identity_json = json.dumps(
+        snapshot.external_identity.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with database.connect() as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        snapshot_row = connection.execute("SELECT * FROM chapter_snapshots").fetchone()
+        external_row = connection.execute("SELECT * FROM external_sources").fetchone()
+        book_row = connection.execute("SELECT * FROM books").fetchone()
+        chapters = connection.execute(
+            "SELECT chapter_index, content FROM chapters ORDER BY chapter_index"
+        ).fetchall()
+        foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
+        migrated_state = tuple(
+            tuple(tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY 1"))
+            for table in ("books", "chapters", "external_sources", "chapter_snapshots")
         )
-        connection.execute(
-            """
-            INSERT INTO external_sources (
-                external_source_id, book_id, source_system, external_book_id,
-                created_at, updated_at
-            ) VALUES (1, 'book-1', 'reader', 'external-1', 'created', 'updated')
-            """
+    assert version == 2
+    assert snapshot_row is not None
+    assert snapshot_row["chapter_snapshot_id"] == _LEGACY_SNAPSHOT_ID
+    assert snapshot_row["external_source_id"] == _LEGACY_EXTERNAL_SOURCE_ID
+    assert snapshot_row["created_at"] == "2026-08-14T03:00:00+00:00"
+    assert snapshot_row["updated_at"] == "2026-08-14T03:01:00+00:00"
+    assert snapshot_row["snapshot_json"] == canonical
+    assert snapshot_row["content_fingerprint"] == hashlib.sha256(canonical.encode()).hexdigest()
+    assert external_row is not None
+    assert external_row["external_source_id"] == _LEGACY_EXTERNAL_SOURCE_ID
+    assert external_row["created_at"] == "2026-08-14T02:00:00+00:00"
+    assert external_row["updated_at"] == "2026-08-14T02:01:00+00:00"
+    assert book_row is not None
+    assert book_row["source_fingerprint"] == hashlib.sha256(identity_json.encode()).hexdigest()
+    assert book_row["total_chapters"] == 3
+    assert book_row["created_at"] == "2026-08-14T01:00:00+00:00"
+    assert book_row["updated_at"] == "2026-08-14T01:01:00+00:00"
+    assert [(row["chapter_index"], row["content"]) for row in chapters] == [
+        (0, "Untouched content."),
+        (2, "Migrated chapter."),
+    ]
+    assert foreign_key_issues == []
+    assert library.list_books() == (library.get_book(book),)
+    assert library.get_book(book).source_available is True
+    assert library.get_chapter(book, 0).content == "Untouched content."
+    assert library.get_chapter(book, 2).content == "Migrated chapter."
+
+    reopened, reopened_database = _library(data_dir)
+    assert reopened.list_books() == library.list_books()
+    assert reopened.get_chapter(book, 2) == library.get_chapter(book, 2)
+    with reopened_database.connect() as connection:
+        reopened_state = tuple(
+            tuple(tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY 1"))
+            for table in ("books", "chapters", "external_sources", "chapter_snapshots")
         )
+    assert reopened_state == migrated_state
+
+    with (
+        pytest.raises(sqlite3.IntegrityError),
+        reopened_database.transaction() as connection,
+    ):
         connection.execute(
             """
             INSERT INTO chapter_snapshots (
-                external_source_id, chapter_index, snapshot_json, created_at, updated_at
-            ) VALUES (1, 0, ?, 'created', 'updated')
+                external_source_id, chapter_index, snapshot_json,
+                content_fingerprint, created_at, updated_at
+            ) VALUES (?, 2, '{}', ?, 'created', 'updated')
             """,
-            (legacy_json,),
+            (_LEGACY_EXTERNAL_SOURCE_ID, "0" * 64),
+        )
+    with (
+        pytest.raises(sqlite3.IntegrityError),
+        reopened_database.transaction() as connection,
+    ):
+        connection.execute(
+            """
+            INSERT INTO chapter_snapshots (
+                external_source_id, chapter_index, snapshot_json,
+                content_fingerprint, created_at, updated_at
+            ) VALUES (?, -1, '{}', ?, 'created', 'updated')
+            """,
+            (_LEGACY_EXTERNAL_SOURCE_ID, "0" * 64),
+        )
+    with reopened_database.transaction() as connection:
+        connection.execute("DELETE FROM books WHERE book_id = ?", (_LEGACY_BOOK_ID,))
+    with reopened_database.connect() as connection:
+        cascade_counts = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("books", "chapters", "external_sources", "chapter_snapshots")
+        )
+    assert cascade_counts == (0, 0, 0, 0)
+
+
+@pytest.mark.parametrize("failure", ["malformed_json", "invalid_snapshot", "identity_mismatch"])
+def test_invalid_v1_snapshot_migration_fails_closed_and_rolls_back(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    snapshot = _snapshot(index=2, total_chapters=1, content="Private chapter payload.")
+    payload = snapshot.model_dump(mode="json")
+    if failure == "malformed_json":
+        raw_snapshot = '{"source_system":"reader","private":"unterminated"'
+    elif failure == "invalid_snapshot":
+        payload["moon_private"] = True
+        raw_snapshot = json.dumps(payload, ensure_ascii=False)
+    else:
+        payload["external_book_id"] = "different-external-id"
+        raw_snapshot = json.dumps(payload, ensure_ascii=False)
+    path = tmp_path / failure / "library.sqlite3"
+    _create_v1_external_database(path, raw_snapshot)
+
+    with pytest.raises(ForgeException) as exc_info:
+        LibraryDatabase(path).initialize()
+
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert "Private chapter payload" not in str(exc_info.value)
+    assert "unterminated" not in str(exc_info.value)
+    assert "SELECT" not in str(exc_info.value)
+    assert str(path) not in str(exc_info.value)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(chapter_snapshots)")}
+        counts = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("books", "chapters", "external_sources", "chapter_snapshots")
+        )
+        stored_snapshot = connection.execute(
+            "SELECT snapshot_json FROM chapter_snapshots"
+        ).fetchone()[0]
+        book_state = connection.execute(
+            "SELECT source_fingerprint, total_chapters FROM books"
+        ).fetchone()
+        foreign_key_issues = connection.execute("PRAGMA foreign_key_check").fetchall()
+    assert "content_fingerprint" not in columns
+    assert counts == (1, 1, 1, 1)
+    assert stored_snapshot == raw_snapshot
+    assert book_state == (None, 1)
+    assert foreign_key_issues == []
+
+
+def test_independent_initialized_libraries_converge_on_one_external_identity(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "library"
+    first, first_database = _library(data_dir)
+    second, _second_database = _library(data_dir)
+    identity = ExternalIdentity(source_system="reader", external_book_id="race-book")
+    metadata = BookMetadata(title="Racing book", total_chapters=1)
+    barrier = Barrier(2)
+
+    def race(library: BookLibrary) -> BookRef:
+        barrier.wait()
+        return library.upsert_external_book(identity, metadata)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = (executor.submit(race, first), executor.submit(race, second))
+        books = tuple(future.result(timeout=10) for future in futures)
+
+    assert books[0] == books[1]
+    with first_database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM books").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM external_sources").fetchone()[0] == 1
+
+
+def test_snapshot_operation_rolls_back_every_table_and_returns_a_safe_error(
+    tmp_path: Path,
+) -> None:
+    library, database = _library(tmp_path / "library")
+    library.upsert_external_book(
+        ExternalIdentity(source_system="reader", external_book_id="external-1"),
+        BookMetadata(title="Before failure", total_chapters=1),
+    )
+    with database.connect() as connection:
+        before = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("books", "external_sources", "chapter_snapshots", "chapters")
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER fail_chapter_mirror
+            BEFORE INSERT ON chapters
+            BEGIN
+                SELECT RAISE(FAIL, 'private SQLite mirror failure at /private/library.sqlite3');
+            END
+            """
         )
 
-    database = LibraryDatabase(path)
-    database.initialize()
-    database.initialize()
+    snapshot = _snapshot(content="Private chapter content must never leak.")
+    canonical_snapshot = json.dumps(
+        snapshot.model_dump(mode="json"),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    with pytest.raises(ForgeException) as exc_info:
+        library.upsert_chapter_snapshot(snapshot)
 
-    canonical = '{"a":1,"z":"界"}'
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert canonical_snapshot not in str(exc_info.value)
+    assert snapshot.chapter.content not in str(exc_info.value)
+    assert "INSERT" not in str(exc_info.value)
+    assert "SQLite mirror failure" not in str(exc_info.value)
+    assert "/private/library.sqlite3" not in str(exc_info.value)
     with database.connect() as connection:
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        columns = {
-            row[1]: row[3]
-            for row in connection.execute("PRAGMA table_info(chapter_snapshots)").fetchall()
-        }
-        row = connection.execute(
-            "SELECT snapshot_json, content_fingerprint FROM chapter_snapshots"
-        ).fetchone()
-    assert version == 1
-    assert columns["content_fingerprint"] == 1
-    assert row is not None
-    assert row["snapshot_json"] == canonical
-    assert row["content_fingerprint"] == hashlib.sha256(canonical.encode()).hexdigest()
+        after = tuple(
+            connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("books", "external_sources", "chapter_snapshots", "chapters")
+        )
+    assert before == (1, 1, 0, 0)
+    assert after == before

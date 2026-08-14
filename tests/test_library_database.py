@@ -45,13 +45,39 @@ def test_schema_migration_is_explicit_idempotent_and_forward_compatible(tmp_path
             row[1]: row[3] for row in connection.execute("PRAGMA table_info(books)").fetchall()
         }
 
-    assert version == 1
+    assert version == 2
     assert {"books", "chapters", "external_sources", "chapter_snapshots"} <= tables
     assert book_columns["format"] == 0
     assert book_columns["import_mode"] == 0
     assert book_columns["source_fingerprint"] == 0
     assert book_columns["managed_source_path"] == 0
     assert book_columns["reference_source_path"] == 0
+
+
+def test_v2_database_reopens_without_rerunning_or_mutating_schema(tmp_path: Path) -> None:
+    path = tmp_path / "library.sqlite3"
+    first = LibraryDatabase(path)
+    first.initialize()
+    with first.transaction() as connection:
+        _insert_minimal_book(connection)
+    with first.connect() as connection:
+        original_schema = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'chapter_snapshots'"
+        ).fetchone()[0]
+
+    reopened = LibraryDatabase(path)
+    reopened.initialize()
+    reopened.initialize()
+
+    with reopened.connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'chapter_snapshots'"
+            ).fetchone()[0]
+            == original_schema
+        )
+        assert connection.execute("SELECT book_id FROM books").fetchone()[0] == "book-1"
 
 
 def test_every_database_connection_enables_foreign_keys(tmp_path: Path) -> None:

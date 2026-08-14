@@ -442,7 +442,7 @@ def test_first_database_open_is_anchored_when_root_changes_immediately_before_co
 
     assert library.list_books() == ()
     with database.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
 
 
 def test_data_root_replacement_before_managed_book_directory_write_creates_nothing_outside(

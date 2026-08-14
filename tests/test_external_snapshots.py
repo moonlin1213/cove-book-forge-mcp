@@ -75,6 +75,9 @@ PRAGMA user_version = 1;
 _LEGACY_BOOK_ID = "legacy-internal-book"
 _LEGACY_EXTERNAL_SOURCE_ID = 17
 _LEGACY_SNAPSHOT_ID = 23
+_LEGACY_MANAGED_FINGERPRINT = "b" * 64
+_LEGACY_MANAGED_PATH = "/private/legacy-managed-secret.pdf"
+_V1_TABLES = ("books", "chapters", "external_sources", "chapter_snapshots")
 
 
 class SyntheticPdfExtractor:
@@ -160,7 +163,17 @@ def _create_v1_external_database(
     snapshot_json: str,
     *,
     chapter_index: int = 2,
+    managed_provenance: bool = False,
 ) -> None:
+    provenance = (
+        ("pdf", "reference", _LEGACY_MANAGED_FINGERPRINT, None, _LEGACY_MANAGED_PATH)
+        if managed_provenance
+        else (None, None, None, None, None)
+    )
+    chapter_title = "Managed chapter" if managed_provenance else "Untouched"
+    chapter_content = (
+        "Managed chapter remains byte-for-byte." if managed_provenance else "Untouched content."
+    )
     path.parent.mkdir(parents=True)
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
@@ -169,11 +182,14 @@ def _create_v1_external_database(
             """
             INSERT INTO books (
                 book_id, title, author, language, total_chapters,
-                source_fingerprint, created_at, updated_at
-            ) VALUES (?, 'Legacy title', 'Legacy author', 'zh', 1, NULL, ?, ?)
+                format, import_mode, source_fingerprint,
+                managed_source_path, reference_source_path,
+                created_at, updated_at
+            ) VALUES (?, 'Legacy title', 'Legacy author', 'zh', 1, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 _LEGACY_BOOK_ID,
+                *provenance,
                 "2026-08-14T01:00:00+00:00",
                 "2026-08-14T01:01:00+00:00",
             ),
@@ -182,9 +198,9 @@ def _create_v1_external_database(
             """
             INSERT INTO chapters (
                 book_id, chapter_index, title, content, source_locator
-            ) VALUES (?, 0, 'Untouched', 'Untouched content.', 'legacy:chapter:0')
+            ) VALUES (?, 0, ?, ?, 'legacy:chapter:0')
             """,
-            (_LEGACY_BOOK_ID,),
+            (_LEGACY_BOOK_ID, chapter_title, chapter_content),
         )
         connection.execute(
             """
@@ -216,6 +232,31 @@ def _create_v1_external_database(
                 "2026-08-14T03:01:00+00:00",
             ),
         )
+
+
+def _read_v1_database_state(path: Path) -> tuple[object, ...]:
+    file_bytes = path.read_bytes()
+    with sqlite3.connect(path) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        schema = tuple(
+            connection.execute(
+                """
+                SELECT name, sql
+                FROM sqlite_master
+                WHERE type = 'table' AND name IN (?, ?, ?, ?)
+                ORDER BY name
+                """,
+                _V1_TABLES,
+            ).fetchall()
+        )
+        rows = tuple(
+            (
+                table,
+                tuple(connection.execute(f"SELECT * FROM {table} ORDER BY 1").fetchall()),
+            )
+            for table in _V1_TABLES
+        )
+    return file_bytes, version, schema, rows
 
 
 def test_disabled_managed_library_still_accepts_external_books_and_snapshots(
@@ -510,6 +551,96 @@ def test_invalid_v1_snapshot_migration_fails_closed_and_rolls_back(
     assert stored_snapshot == raw_snapshot
     assert book_state == (None, 1)
     assert foreign_key_issues == []
+
+
+@pytest.mark.parametrize(
+    "snapshot_index",
+    [
+        pytest.param(0, id="same-managed-chapter-index"),
+        pytest.param(2, id="different-managed-chapter-index"),
+    ],
+)
+def test_v1_external_reference_to_managed_book_fails_closed_without_mutation(
+    tmp_path: Path,
+    snapshot_index: int,
+) -> None:
+    path = tmp_path / f"collision-{snapshot_index}" / "library.sqlite3"
+    snapshot = _snapshot(
+        index=snapshot_index,
+        total_chapters=1,
+        content=f"Collision snapshot secret at index {snapshot_index}.",
+    )
+    snapshot_json = json.dumps(snapshot.model_dump(mode="json"), ensure_ascii=False)
+    _create_v1_external_database(
+        path,
+        snapshot_json,
+        chapter_index=snapshot_index,
+        managed_provenance=True,
+    )
+    original_state = _read_v1_database_state(path)
+
+    with pytest.raises(ForgeException) as exc_info:
+        LibraryDatabase(path).initialize()
+
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert exc_info.value.as_detail().details == {}
+    public_error = str(exc_info.value)
+    for private_value in (
+        _LEGACY_MANAGED_PATH,
+        _LEGACY_MANAGED_FINGERPRINT,
+        snapshot.source_system,
+        snapshot.external_book_id,
+        snapshot_json,
+        snapshot.chapter.content,
+        "UPDATE books",
+        "SQLite",
+    ):
+        assert private_value not in public_error
+    assert _read_v1_database_state(path) == original_state
+
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        managed_provenance = connection.execute(
+            """
+            SELECT format, import_mode, source_fingerprint,
+                   managed_source_path, reference_source_path,
+                   created_at, updated_at
+            FROM books
+            """
+        ).fetchone()
+        chapters = connection.execute(
+            "SELECT chapter_index, title, content, source_locator FROM chapters"
+        ).fetchall()
+        external_row = connection.execute("SELECT * FROM external_sources").fetchone()
+        snapshot_row = connection.execute("SELECT * FROM chapter_snapshots").fetchone()
+    assert managed_provenance == (
+        "pdf",
+        "reference",
+        _LEGACY_MANAGED_FINGERPRINT,
+        None,
+        _LEGACY_MANAGED_PATH,
+        "2026-08-14T01:00:00+00:00",
+        "2026-08-14T01:01:00+00:00",
+    )
+    assert chapters == [
+        (0, "Managed chapter", "Managed chapter remains byte-for-byte.", "legacy:chapter:0")
+    ]
+    assert external_row == (
+        _LEGACY_EXTERNAL_SOURCE_ID,
+        _LEGACY_BOOK_ID,
+        "reader",
+        "external-1",
+        "2026-08-14T02:00:00+00:00",
+        "2026-08-14T02:01:00+00:00",
+    )
+    assert snapshot_row == (
+        _LEGACY_SNAPSHOT_ID,
+        _LEGACY_EXTERNAL_SOURCE_ID,
+        snapshot_index,
+        snapshot_json,
+        "2026-08-14T03:00:00+00:00",
+        "2026-08-14T03:01:00+00:00",
+    )
 
 
 def test_independent_initialized_libraries_converge_on_one_external_identity(

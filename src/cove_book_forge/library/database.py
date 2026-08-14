@@ -258,11 +258,35 @@ class LibraryDatabase:
         connection: sqlite3.Connection,
     ) -> dict[int, _ExternalMigration]:
         rows = connection.execute(
-            "SELECT * FROM external_sources ORDER BY external_source_id"
+            """
+            SELECT
+                es.*,
+                b.book_id AS referenced_book_id,
+                b.format AS book_format,
+                b.import_mode AS book_import_mode,
+                b.source_fingerprint AS book_source_fingerprint,
+                b.managed_source_path AS book_managed_source_path,
+                b.reference_source_path AS book_reference_source_path
+            FROM external_sources AS es
+            LEFT JOIN books AS b ON b.book_id = es.book_id
+            ORDER BY es.external_source_id
+            """
         ).fetchall()
         migrations: dict[int, _ExternalMigration] = {}
         seen_books: set[str] = set()
         for row in rows:
+            if row["referenced_book_id"] is None:
+                raise ValueError("external source book is missing")
+            if any(
+                row[field] is not None
+                for field in (
+                    "book_format",
+                    "book_import_mode",
+                    "book_managed_source_path",
+                    "book_reference_source_path",
+                )
+            ):
+                raise ValueError("external source references managed provenance")
             identity = ExternalIdentity(
                 source_system=str(row["source_system"]),
                 external_book_id=str(row["external_book_id"]),

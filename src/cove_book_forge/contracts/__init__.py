@@ -10,6 +10,15 @@ from cove_book_forge.contracts.books import (
     Reflection,
     UserNote,
 )
+from cove_book_forge.contracts.jobs import (
+    CostEstimate,
+    ForgeAccepted,
+    ForgeJob,
+    ForgeJobControl,
+    ForgeJobStatus,
+    ForgePlan,
+    ForgeTarget,
+)
 
 __all__ = [
     "Annotation",
@@ -17,8 +26,15 @@ __all__ = [
     "BookRef",
     "ChapterContent",
     "ChapterSnapshot",
+    "CostEstimate",
     "ContractModel",
     "ExternalIdentity",
+    "ForgeAccepted",
+    "ForgeJob",
+    "ForgeJobControl",
+    "ForgeJobStatus",
+    "ForgePlan",
+    "ForgeTarget",
     "Highlight",
     "Reflection",
     "UserNote",

@@ -20,7 +20,13 @@ def test_resolve_target_rejects_traversal(tmp_path: Path) -> None:
     with pytest.raises(ForgeException) as caught:
         policy.resolve_target(root, "..", "outside.md")
     assert caught.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
-    assert "outside.md" not in str(caught.value.as_result())
+    private_path = str(caught.value.details["path"])
+    public_result = caught.value.as_result()
+    public_error = public_result["error"]
+    assert private_path
+    assert private_path not in str(public_result)
+    assert isinstance(public_error, dict)
+    assert public_error["details"] == {}
 
 
 def test_resolve_target_rejects_symlink_escape(tmp_path: Path) -> None:

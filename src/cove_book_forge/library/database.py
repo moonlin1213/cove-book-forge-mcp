@@ -141,18 +141,18 @@ def _inspect_library_schema(connection: sqlite3.Connection) -> _LibrarySchemaRea
     if version_row is None:
         raise sqlite3.DatabaseError("schema version unavailable")
     version = int(version_row[0])
-    schema_names = {
-        str(row[0])
+    schema_objects = {
+        str(row[0]): str(row[1])
         for row in connection.execute(
             """
-            SELECT name
+            SELECT name, type
             FROM sqlite_schema
             WHERE name NOT LIKE 'sqlite_%'
             """
         ).fetchall()
     }
     if version == 0:
-        if schema_names:
+        if schema_objects:
             raise sqlite3.DatabaseError("unrecognized unversioned schema")
         return _LibrarySchemaReadiness.UNINITIALIZED
     if version not in {1, _SCHEMA_VERSION}:
@@ -167,7 +167,7 @@ def _inspect_library_schema(connection: sqlite3.Connection) -> _LibrarySchemaRea
         )
         for table, columns in _REQUIRED_V1_COLUMNS.items()
     }
-    if not required_columns.keys() <= schema_names:
+    if any(schema_objects.get(table) != "table" for table in required_columns):
         raise sqlite3.DatabaseError("required application table is missing")
     for table, expected_columns in required_columns.items():
         actual_columns = {

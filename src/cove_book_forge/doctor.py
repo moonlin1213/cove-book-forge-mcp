@@ -19,6 +19,8 @@ _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _LIBRARY_DATABASE_FILENAME = "library.sqlite3"
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _DATABASE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
+# In-memory SQLite deserialize may require additional working memory beyond this payload.
+_MAX_DATABASE_SNAPSHOT_BYTES = 256 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -252,11 +254,16 @@ def _missing_database_is_stable(
     return False
 
 
-def _read_descriptor(descriptor: int) -> bytes:
-    chunks: list[bytes] = []
-    while chunk := os.read(descriptor, 1024 * 1024):
-        chunks.append(chunk)
-    return b"".join(chunks)
+def _read_descriptor(descriptor: int) -> bytearray:
+    payload = bytearray()
+    while chunk := os.read(
+        descriptor,
+        min(1024 * 1024, _MAX_DATABASE_SNAPSHOT_BYTES - len(payload) + 1),
+    ):
+        payload.extend(chunk)
+        if len(payload) > _MAX_DATABASE_SNAPSHOT_BYTES:
+            raise ValueError("database snapshot exceeds the in-memory limit")
+    return payload
 
 
 def _open_validated_data_root(data_path: Path) -> tuple[Path, int, _FileStatus]:
@@ -273,7 +280,7 @@ def _open_validated_data_root(data_path: Path) -> tuple[Path, int, _FileStatus]:
     return validated, directory_fd, _FileStatus.capture(status)
 
 
-def _inspect_database_snapshot(payload: bytes) -> _LibrarySchemaReadiness:
+def _inspect_database_snapshot(payload: bytes | bytearray) -> _LibrarySchemaReadiness:
     with closing(sqlite3.connect(":memory:")) as connection:
         if payload:
             connection.deserialize(payload)
@@ -305,6 +312,8 @@ def _database_check(data_path: Path, *, enabled: bool) -> DoctorCheck:
         return _database_unavailable()
 
     try:
+        if not _root_is_stable(data_path, validated, directory_fd, root_status):
+            return _database_unavailable()
         if not _sqlite_sidecars_absent(directory_fd):
             return _sidecar_failure()
 
@@ -343,6 +352,14 @@ def _database_check(data_path: Path, *, enabled: bool) -> DoctorCheck:
             _DATABASE_OPEN_FLAGS,
             dir_fd=directory_fd,
         )
+        opened_database_status = os.fstat(database_fd)
+        if (
+            not stat.S_ISREG(opened_database_status.st_mode)
+            or _FileStatus.capture(opened_database_status) != expected_database_status
+        ):
+            return _database_unavailable()
+        if opened_database_status.st_size > _MAX_DATABASE_SNAPSHOT_BYTES:
+            return _database_unavailable()
         if not _database_is_stable(directory_fd, database_fd, expected_database_status):
             return _database_unavailable()
 
@@ -373,7 +390,7 @@ def _database_check(data_path: Path, *, enabled: bool) -> DoctorCheck:
             status=CheckStatus.PASS,
             message="Database schema is ready.",
         )
-    except (OSError, sqlite3.Error, ValueError):
+    except (MemoryError, OSError, sqlite3.Error, ValueError):
         if directory_fd is not None and not _sqlite_sidecars_absent(directory_fd):
             return _sidecar_failure()
         return DoctorCheck(

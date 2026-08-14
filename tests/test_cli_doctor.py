@@ -61,6 +61,25 @@ def _filesystem_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
     return tuple(entries)
 
 
+def _filesystem_metadata_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
+    entries: list[tuple[object, ...]] = []
+    for path in (root, *sorted(root.rglob("*"))):
+        status = path.lstat()
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        entries.append(
+            (
+                relative,
+                status.st_dev,
+                status.st_ino,
+                stat.S_IFMT(status.st_mode),
+                status.st_size,
+                status.st_mtime_ns,
+                status.st_ctime_ns,
+            )
+        )
+    return tuple(entries)
+
+
 def _check(payload: dict[str, object], name: str) -> dict[str, object]:
     checks = payload["checks"]
     assert isinstance(checks, list)
@@ -77,6 +96,54 @@ def _create_library_schema(path: Path, *, version: int) -> None:
                 "ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
             )
         connection.execute(f"PRAGMA user_version = {version}")
+
+
+_REQUIRED_VIEW_COLUMNS = {
+    "books": (
+        "book_id",
+        "title",
+        "author",
+        "language",
+        "total_chapters",
+        "format",
+        "import_mode",
+        "source_fingerprint",
+        "managed_source_path",
+        "reference_source_path",
+        "created_at",
+        "updated_at",
+    ),
+    "chapters": ("book_id", "chapter_index", "title", "content", "source_locator"),
+    "external_sources": (
+        "external_source_id",
+        "book_id",
+        "source_system",
+        "external_book_id",
+        "created_at",
+        "updated_at",
+    ),
+    "chapter_snapshots": (
+        "chapter_snapshot_id",
+        "external_source_id",
+        "chapter_index",
+        "snapshot_json",
+        "created_at",
+        "updated_at",
+    ),
+}
+
+
+def _create_required_view(
+    connection: sqlite3.Connection,
+    name: str,
+    *,
+    version: int,
+) -> None:
+    columns = _REQUIRED_VIEW_COLUMNS[name]
+    if name == "chapter_snapshots" and version == 2:
+        columns = (*columns, "content_fingerprint")
+    projection = ", ".join(f'NULL AS "{column}"' for column in columns)
+    connection.execute(f'CREATE VIEW "{name}" AS SELECT {projection}')
 
 
 def _database_check_from_cli(config: Path) -> tuple[object, dict[str, object], str]:
@@ -444,6 +511,92 @@ def test_doctor_fails_if_an_external_delete_transaction_changes_the_database(
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 999
 
 
+def test_doctor_rejects_ancestor_replacement_before_any_relative_root_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured_parent = tmp_path / "configured-parent"
+    data_dir = configured_parent / "library"
+    data_dir.mkdir(parents=True)
+    displaced_parent = tmp_path / "displaced-parent"
+    private_parent = tmp_path / "private-parent"
+    private_data_dir = private_parent / "library"
+    private_data_dir.mkdir(parents=True)
+    private_database = private_data_dir / "library.sqlite3"
+    _create_library_schema(private_database, version=2)
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=True)
+    private_before = _filesystem_snapshot(private_data_dir)
+    private_root_status = private_data_dir.stat()
+    private_root_identity = (private_root_status.st_dev, private_root_status.st_ino)
+    private_database_status = private_database.stat()
+    private_database_identity = (private_database_status.st_dev, private_database_status.st_ino)
+    real_validate = doctor_module._validate_data_root
+    real_open = os.open
+    real_read = os.read
+    real_stat = os.stat
+    validation_count = 0
+    replacement_performed = False
+    private_relative_stat_requested = False
+    private_database_descriptor_requested = False
+    private_database_read = False
+
+    def validate_then_replace_ancestor(path: Path) -> Path:
+        nonlocal validation_count, replacement_performed
+        validated = real_validate(path)
+        if path == data_dir:
+            validation_count += 1
+            if validation_count == 2:
+                configured_parent.rename(displaced_parent)
+                configured_parent.symlink_to(private_parent, target_is_directory=True)
+                replacement_performed = True
+        return validated
+
+    def stat_with_private_root_sentinel(*args: Any, **kwargs: Any) -> os.stat_result:
+        nonlocal private_relative_stat_requested
+        directory_fd = kwargs.get("dir_fd")
+        if isinstance(directory_fd, int):
+            status = os.fstat(directory_fd)
+            if (status.st_dev, status.st_ino) == private_root_identity:
+                private_relative_stat_requested = True
+        return real_stat(*args, **kwargs)
+
+    def open_with_private_database_sentinel(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal private_database_descriptor_requested
+        if dir_fd is not None:
+            status = os.fstat(dir_fd)
+            if (status.st_dev, status.st_ino) == private_root_identity:
+                private_database_descriptor_requested = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def read_with_private_database_sentinel(descriptor: int, length: int) -> bytes:
+        nonlocal private_database_read
+        status = os.fstat(descriptor)
+        if (status.st_dev, status.st_ino) == private_database_identity:
+            private_database_read = True
+        return real_read(descriptor, length)
+
+    monkeypatch.setattr(doctor_module, "_validate_data_root", validate_then_replace_ancestor)
+    monkeypatch.setattr(doctor_module.os, "stat", stat_with_private_root_sentinel)
+    monkeypatch.setattr(doctor_module.os, "open", open_with_private_database_sentinel)
+    monkeypatch.setattr(doctor_module.os, "read", read_with_private_database_sentinel)
+
+    result, database_check, stdout = _database_check_from_cli(config)
+
+    assert replacement_performed is True
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert private_relative_stat_requested is False
+    assert private_database_descriptor_requested is False
+    assert private_database_read is False
+    assert str(private_data_dir) not in stdout
+    assert _filesystem_snapshot(private_data_dir) == private_before
+
+
 def test_doctor_binds_database_inspection_to_the_validated_data_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -649,6 +802,183 @@ def test_doctor_rejects_unversioned_view_schemas_without_writing(
     assert database_check["status"] == "fail"
     assert view_name not in stdout
     assert str(database) not in stdout
+    assert _filesystem_snapshot(tmp_path) == before
+
+
+def test_doctor_rejects_v2_schema_composed_of_same_named_views(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        for name in _REQUIRED_VIEW_COLUMNS:
+            _create_required_view(connection, name, version=2)
+        connection.execute("PRAGMA user_version = 2")
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_snapshot(tmp_path)
+
+    result, database_check, stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert str(database) not in stdout
+    assert _filesystem_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("required_name", list(_REQUIRED_VIEW_COLUMNS))
+def test_doctor_rejects_required_table_replaced_by_same_named_view(
+    tmp_path: Path,
+    version: int,
+    required_name: str,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    _create_library_schema(database, version=version)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(f'DROP TABLE "{required_name}"')
+        _create_required_view(connection, required_name, version=version)
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_snapshot(tmp_path)
+
+    result, database_check, _stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert _filesystem_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize(("version", "expected_status"), [(1, "warn"), (2, "pass")])
+def test_doctor_allows_non_conflicting_extra_schema_objects(
+    tmp_path: Path,
+    version: int,
+    expected_status: str,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    _create_library_schema(database, version=version)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("CREATE VIEW diagnostic_view AS SELECT 1 AS value")
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_snapshot(tmp_path)
+
+    result, database_check, _stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 0
+    assert database_check["status"] == expected_status
+    assert _filesystem_snapshot(tmp_path) == before
+
+
+def test_doctor_rejects_oversized_sparse_database_without_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    with database.open("wb") as stream:
+        stream.truncate(2 * 1024 * 1024 * 1024)
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_metadata_snapshot(tmp_path)
+    read_called = False
+
+    def record_forbidden_read(_descriptor: int, _length: int) -> bytes:
+        nonlocal read_called
+        read_called = True
+        return b""
+
+    monkeypatch.setattr(doctor_module.os, "read", record_forbidden_read)
+
+    result, database_check, stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert read_called is False
+    assert str(database) not in stdout
+    assert "2147483648" not in stdout
+    assert _filesystem_metadata_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("failure_phase", ["buffer", "deserialize"])
+def test_doctor_maps_snapshot_memory_errors_and_closes_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    _create_library_schema(database, version=2)
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_snapshot(tmp_path)
+    real_open = os.open
+    real_connect = sqlite3.connect
+    opened_descriptors: list[int] = []
+    opened_connections: list[MemoryFailingConnection] = []
+    private_marker = "private allocation detail"
+
+    class MemoryFailingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+            self.closed = False
+
+        def deserialize(self, _payload: bytes) -> None:
+            raise MemoryError(private_marker)
+
+        def close(self) -> None:
+            self.closed = True
+            self._connection.close()
+
+    def record_descriptor_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if os.fspath(path) in {os.fspath(data_dir), "library.sqlite3"}:
+            opened_descriptors.append(descriptor)
+        return descriptor
+
+    def fail_buffer_allocation(_descriptor: int) -> bytes:
+        raise MemoryError(private_marker)
+
+    def connect_with_deserialize_failure(
+        database_arg: object, *args: Any, **kwargs: Any
+    ) -> MemoryFailingConnection:
+        connection = MemoryFailingConnection(real_connect(database_arg, *args, **kwargs))
+        opened_connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(doctor_module.os, "open", record_descriptor_open)
+    if failure_phase == "buffer":
+        monkeypatch.setattr(doctor_module, "_read_descriptor", fail_buffer_allocation)
+    else:
+        monkeypatch.setattr(
+            doctor_module.sqlite3,
+            "connect",
+            connect_with_deserialize_failure,
+        )
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert len(opened_descriptors) == 2
+    for descriptor in opened_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    if failure_phase == "deserialize":
+        assert opened_connections and opened_connections[0].closed is True
+    else:
+        assert not opened_connections
+    assert result.exit_code == 1
+    assert result.stdout.startswith("{")
+    payload = json.loads(result.stdout)
+    assert _check(payload, "library_database")["status"] == "fail"
+    assert private_marker not in result.stdout
+    assert "Traceback" not in result.stdout
     assert _filesystem_snapshot(tmp_path) == before
 
 

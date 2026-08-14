@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
+from cove_book_forge.library import database as library_database
 from cove_book_forge.library.database import LibraryDatabase
 
 
@@ -113,3 +114,29 @@ def test_database_initialization_failure_is_safe(tmp_path: Path) -> None:
     assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
     assert str(database_path) not in str(exc_info.value)
     assert "sqlite" not in str(exc_info.value).lower()
+
+
+def test_failed_stable_connection_setup_closes_the_candidate_safely(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SetupFailingConnection:
+        row_factory: object | None = None
+        closed = False
+
+        def execute(self, statement: str) -> None:
+            raise sqlite3.OperationalError(f"private PRAGMA failed: {statement}")
+
+        def close(self) -> None:
+            self.closed = True
+
+    candidate = SetupFailingConnection()
+    monkeypatch.setattr(library_database.sqlite3, "connect", lambda *args, **kwargs: candidate)
+
+    with pytest.raises(ForgeException) as exc_info:
+        LibraryDatabase(tmp_path / "private-library.sqlite3").initialize()
+
+    assert candidate.closed is True
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert "PRAGMA" not in str(exc_info.value)
+    assert str(tmp_path) not in str(exc_info.value)

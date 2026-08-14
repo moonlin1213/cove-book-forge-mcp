@@ -55,6 +55,31 @@ class FailingCommitDatabase(LibraryDatabase):
                 raise sqlite3.OperationalError("INSERT private SQL failed before commit")
 
 
+class ReplaceRootBeforeConnectDatabase(LibraryDatabase):
+    def __init__(
+        self,
+        path: Path,
+        *,
+        data_root: Path,
+        original_root: Path,
+        outside: Path,
+    ) -> None:
+        super().__init__(path)
+        self._data_root = data_root
+        self._original_root = original_root
+        self._outside = outside
+        self.armed = False
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        if self.armed:
+            self.armed = False
+            self._data_root.rename(self._original_root)
+            self._data_root.symlink_to(self._outside, target_is_directory=True)
+        with super().connect() as connection:
+            yield connection
+
+
 class FlushFailingStream(io.BytesIO):
     def flush(self) -> None:
         raise OSError("flush failed at /private/stage.pdf")
@@ -340,6 +365,40 @@ def test_initialized_data_root_identity_is_required_for_every_database_operation
     assert tuple(outside.iterdir()) == ()
 
 
+@pytest.mark.parametrize("operation", ["list", "reference", "copy"])
+def test_database_operation_is_anchored_when_root_changes_after_the_guard(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    data_dir = tmp_path / "library"
+    original_root = tmp_path / "original-library"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    database = ReplaceRootBeforeConnectDatabase(
+        data_dir / "library.sqlite3",
+        data_root=data_dir,
+        original_root=original_root,
+        outside=outside,
+    )
+    library = _initialized_library(
+        data_dir,
+        repository=LibraryRepository(database),
+    )
+    database.armed = True
+
+    with pytest.raises(ForgeException) as exc_info:
+        if operation == "list":
+            library.list_books()
+        else:
+            library.import_book(
+                _source(tmp_path / f"{operation}.pdf"),
+                ImportMode(operation),
+            )
+
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert tuple(outside.iterdir()) == ()
+
+
 def test_data_root_replacement_before_managed_book_directory_write_creates_nothing_outside(
     tmp_path: Path,
 ) -> None:
@@ -368,6 +427,66 @@ def test_data_root_replacement_before_managed_book_directory_write_creates_nothi
 
     assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
     assert tuple(outside_books.iterdir()) == ()
+
+
+def test_copy_stage_open_is_anchored_when_root_changes_after_the_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    original_root = tmp_path / "original-library"
+    outside = tmp_path / "outside"
+    fixed_uuid = UUID(int=20)
+    outside_book_dir = outside / "books" / fixed_uuid.hex
+    outside_book_dir.mkdir(parents=True)
+    library = _initialized_library(data_dir)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    real_copy = library_service._copy_source_to_stage
+
+    def replace_root_then_copy(*args: object, **kwargs: object) -> str:
+        data_dir.rename(original_root)
+        data_dir.symlink_to(outside, target_is_directory=True)
+        return real_copy(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(library_service, "_copy_source_to_stage", replace_root_then_copy)
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert tuple(outside_book_dir.iterdir()) == ()
+
+
+def test_copy_publish_is_anchored_when_root_changes_immediately_before_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    original_root = tmp_path / "original-library"
+    outside = tmp_path / "outside"
+    fixed_uuid = UUID(int=21)
+    outside_book_dir = outside / "books" / fixed_uuid.hex
+    outside_book_dir.mkdir(parents=True)
+    outside_stage = outside_book_dir / f".source-{fixed_uuid.hex}.tmp"
+    outside_stage.write_bytes(b"competitor-stage")
+    outside_final = outside_book_dir / "source.pdf"
+    library = _initialized_library(data_dir)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    real_link = library_service.os.link
+
+    def replace_root_then_link(*args: object, **kwargs: object) -> None:
+        data_dir.rename(original_root)
+        data_dir.symlink_to(outside, target_is_directory=True)
+        real_link(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(library_service.os, "link", replace_root_then_link)
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert outside_stage.read_bytes() == b"competitor-stage"
+    assert not outside_final.exists()
 
 
 def test_source_change_during_copy_persists_nothing(tmp_path: Path) -> None:
@@ -433,9 +552,15 @@ def test_copy_publish_race_never_overwrites_or_deletes_the_competing_final(
         Path(destination).write_bytes(competitor)
         real_replace(source_path, destination)
 
-    def racing_link(source_path: Path, destination: Path) -> None:
-        Path(destination).write_bytes(competitor)
-        real_link(source_path, destination)
+    def racing_link(source_path: object, destination: object, **kwargs: object) -> None:
+        destination_fd = kwargs.get("dst_dir_fd")
+        flags = library_service.os.O_WRONLY | library_service.os.O_CREAT | library_service.os.O_EXCL
+        fd = library_service.os.open(destination, flags, 0o600, dir_fd=destination_fd)  # type: ignore[arg-type]
+        try:
+            library_service.os.write(fd, competitor)
+        finally:
+            library_service.os.close(fd)
+        real_link(source_path, destination, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(library_service.os, "replace", racing_replace)
     monkeypatch.setattr(library_service.os, "link", racing_link)
@@ -464,6 +589,88 @@ def test_persistence_failure_rolls_back_and_cleans_published_copy(tmp_path: Path
     assert str(data_dir) not in str(exc_info.value)
     assert library.list_books() == ()
     assert not (data_dir / "books").exists() or not tuple((data_dir / "books").rglob("source.pdf"))
+
+
+def test_commit_failure_preserves_a_competitor_that_replaces_the_published_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    fixed_uuid = UUID(int=22)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    database = FailingCommitDatabase(data_dir / "library.sqlite3")
+    library = _initialized_library(data_dir, repository=LibraryRepository(database))
+    final = data_dir / "books" / fixed_uuid.hex / "source.pdf"
+    competitor = b"competitor-replaced-final"
+    real_link = library_service.os.link
+
+    def replace_published_final(*args: object, **kwargs: object) -> None:
+        real_link(*args, **kwargs)  # type: ignore[arg-type]
+        destination = args[1]
+        destination_fd = kwargs.get("dst_dir_fd")
+        library_service.os.unlink(destination, dir_fd=destination_fd)  # type: ignore[arg-type]
+        flags = library_service.os.O_WRONLY | library_service.os.O_CREAT | library_service.os.O_EXCL
+        fd = library_service.os.open(destination, flags, 0o600, dir_fd=destination_fd)  # type: ignore[arg-type]
+        try:
+            library_service.os.write(fd, competitor)
+        finally:
+            library_service.os.close(fd)
+
+    monkeypatch.setattr(library_service.os, "link", replace_published_final)
+    database.fail_before_commit = True
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert final.read_bytes() == competitor
+    assert library.list_books() == ()
+
+
+def test_commit_failure_preserves_a_competitor_that_reoccupies_the_stage_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    fixed_uuid = UUID(int=23)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    database = FailingCommitDatabase(data_dir / "library.sqlite3")
+    library = _initialized_library(data_dir, repository=LibraryRepository(database))
+    book_dir = data_dir / "books" / fixed_uuid.hex
+    stage = book_dir / f".source-{fixed_uuid.hex}.tmp"
+    final = book_dir / "source.pdf"
+    competitor = b"competitor-reoccupied-stage"
+    real_rename = library_service.os.rename
+    replaced = False
+
+    def replace_stage_once(
+        source_name: object,
+        destination_name: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal replaced
+        real_rename(source_name, destination_name, **kwargs)  # type: ignore[arg-type]
+        if replaced or Path(source_name).name != stage.name:
+            return
+        replaced = True
+        directory_fd = kwargs.get("src_dir_fd")
+        flags = library_service.os.O_WRONLY | library_service.os.O_CREAT | library_service.os.O_EXCL
+        fd = library_service.os.open(source_name, flags, 0o600, dir_fd=directory_fd)  # type: ignore[arg-type]
+        try:
+            library_service.os.write(fd, competitor)
+        finally:
+            library_service.os.close(fd)
+
+    monkeypatch.setattr(library_service.os, "rename", replace_stage_once)
+    database.fail_before_commit = True
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert stage.read_bytes() == competitor
+    assert not final.exists()
+    assert library.list_books() == ()
 
 
 @pytest.mark.parametrize("stream_type", [FlushFailingStream, CloseFailingStream])

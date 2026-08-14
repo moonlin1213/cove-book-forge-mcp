@@ -1,6 +1,6 @@
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
@@ -74,11 +74,15 @@ class LibraryDatabase:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._connection: sqlite3.Connection | None = None
 
     def initialize(self) -> None:
         """Create and migrate the database in one explicit transaction."""
+        opened_here = self._connection is None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
+            if opened_here:
+                self._connection = self._open_stable_connection()
             with self.transaction() as connection:
                 version = int(connection.execute("PRAGMA user_version").fetchone()[0])
                 if version > _SCHEMA_VERSION:
@@ -91,23 +95,48 @@ class LibraryDatabase:
                         connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
         except ForgeException:
+            if opened_here:
+                self._close_connection()
             raise
         except (OSError, sqlite3.Error, ValueError) as exc:
+            if opened_here:
+                self._close_connection()
             raise _safe_database_error(exc) from exc
+
+    def _open_stable_connection(self) -> sqlite3.Connection:
+        candidate: sqlite3.Connection | None = None
+        try:
+            candidate = sqlite3.connect(self.path, isolation_level=None)
+            candidate.row_factory = sqlite3.Row
+            candidate.execute("PRAGMA foreign_keys = ON")
+            journal_mode = candidate.execute("PRAGMA journal_mode = MEMORY").fetchone()[0]
+            if str(journal_mode).lower() != "memory":
+                raise sqlite3.OperationalError("memory journal mode unavailable")
+            candidate.execute("PRAGMA temp_store = MEMORY")
+            return candidate
+        except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+            if candidate is not None:
+                with suppress(OSError, sqlite3.Error):
+                    candidate.close()
+            raise _safe_database_error(exc) from exc
+
+    def _close_connection(self) -> None:
+        connection = self._connection
+        self._connection = None
+        if connection is not None:
+            with suppress(OSError, sqlite3.Error):
+                connection.close()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
-        """Open a configured connection; callers own no setup details."""
-        try:
-            connection = sqlite3.connect(self.path, isolation_level=None)
-            connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA foreign_keys = ON")
-        except (OSError, sqlite3.Error, ValueError) as exc:
-            raise _safe_database_error(exc) from exc
-        try:
-            yield connection
-        finally:
-            connection.close()
+        """Yield the connection anchored to the file opened during initialization."""
+        connection = self._connection
+        if connection is None:
+            raise ForgeException(
+                ForgeErrorCode.CONFIG_INVALID,
+                "Library database must be initialized before use.",
+            )
+        yield connection
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

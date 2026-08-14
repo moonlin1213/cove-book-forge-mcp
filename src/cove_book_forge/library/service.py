@@ -4,6 +4,7 @@ import sqlite3
 import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, cast
 from uuid import uuid4
@@ -28,6 +29,21 @@ from cove_book_forge.library.repository import (
 
 _HASH_CHUNK_SIZE = 1024 * 1024
 _BinaryOpener = Callable[[Path, str], BinaryIO]
+_FileIdentity = tuple[int, int]
+
+
+@dataclass
+class _ManagedImportAttempt:
+    books_fd: int
+    book_fd: int
+    book_name: str
+    stage_name: str
+    final_name: str
+    book_identity: _FileIdentity
+    owned_book_dir: bool
+    stage_identity: _FileIdentity | None = None
+    final_identity: _FileIdentity | None = None
+    book_fd_closed: bool = False
 
 
 def _path_not_allowed(cause: BaseException | None = None) -> ForgeException:
@@ -99,29 +115,114 @@ def _directory_identity(path: Path) -> tuple[int, int]:
     return status.st_dev, status.st_ino
 
 
-def _remove_attempt_files(
-    stage: Path | None,
-    final: Path | None,
-    book_dir: Path | None,
-    *,
-    published_final: bool,
-    owned_book_dir: bool,
-) -> None:
-    if stage is not None:
-        try:
-            if stage.is_file() or stage.is_symlink():
-                stage.unlink()
-        except OSError:
-            pass
-    if published_final and final is not None:
-        try:
-            if final.is_file() or final.is_symlink():
-                final.unlink()
-        except OSError:
-            pass
-    if owned_book_dir and book_dir is not None:
+def _status_identity(status: os.stat_result) -> _FileIdentity:
+    return status.st_dev, status.st_ino
+
+
+def _require_secure_directory_primitives() -> None:
+    required = (os.open, os.mkdir, os.stat, os.unlink, os.rmdir, os.link, os.rename)
+    if (
+        not hasattr(os, "O_DIRECTORY")
+        or not hasattr(os, "O_NOFOLLOW")
+        or any(function not in os.supports_dir_fd for function in required)
+    ):
+        raise _path_not_allowed()
+
+
+def _open_directory_at(parent_fd: int, name: str) -> int:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise _path_not_allowed()
+        return descriptor
+    except ForgeException:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+        raise _path_not_allowed(exc) from exc
+
+
+def _matches_identity(parent_fd: int, name: str, identity: _FileIdentity) -> bool:
+    try:
+        return _status_identity(os.stat(name, dir_fd=parent_fd, follow_symlinks=False)) == identity
+    except OSError:
+        return False
+
+
+def _unlink_matching(
+    parent_fd: int,
+    name: str,
+    identity: _FileIdentity | None,
+) -> bool | None:
+    if identity is None:
+        return False
+    quarantine_name = f".cleanup-{uuid4().hex}"
+    quarantine_fd: int | None = None
+    owned_quarantine = False
+    candidate_name = "candidate"
+    try:
+        os.mkdir(quarantine_name, mode=0o700, dir_fd=parent_fd)
+        owned_quarantine = True
+        quarantine_fd = _open_directory_at(parent_fd, quarantine_name)
+        os.rename(
+            name,
+            candidate_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=quarantine_fd,
+        )
+        if _matches_identity(quarantine_fd, candidate_name, identity):
+            os.unlink(candidate_name, dir_fd=quarantine_fd)
+            return True
+        else:
+            try:
+                os.link(
+                    candidate_name,
+                    name,
+                    src_dir_fd=quarantine_fd,
+                    dst_dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                return False
+            os.unlink(candidate_name, dir_fd=quarantine_fd)
+            return False
+    except (ForgeException, OSError):
+        return None
+    finally:
+        if quarantine_fd is not None:
+            with suppress(OSError):
+                os.close(quarantine_fd)
+        if owned_quarantine:
+            with suppress(OSError):
+                os.rmdir(quarantine_name, dir_fd=parent_fd)
+
+
+def _close_book_descriptor(attempt: _ManagedImportAttempt) -> None:
+    if not attempt.book_fd_closed:
+        attempt.book_fd_closed = True
         with suppress(OSError):
-            book_dir.rmdir()
+            os.close(attempt.book_fd)
+
+
+def _remove_attempt_files(attempt: _ManagedImportAttempt) -> None:
+    _unlink_matching(attempt.book_fd, attempt.stage_name, attempt.stage_identity)
+    _unlink_matching(attempt.book_fd, attempt.final_name, attempt.final_identity)
+    _close_book_descriptor(attempt)
+    if attempt.owned_book_dir and _matches_identity(
+        attempt.books_fd, attempt.book_name, attempt.book_identity
+    ):
+        with suppress(OSError):
+            os.rmdir(attempt.book_name, dir_fd=attempt.books_fd)
 
 
 def _copy_source_to_stage(
@@ -208,16 +309,36 @@ class BookLibrary:
             LibraryDatabase(self._data_root / "library.sqlite3")
         )
         self._data_root_identity: tuple[int, int] | None = None
+        self._data_root_fd: int | None = None
+        self._books_fd: int | None = None
         self._initialized = False
 
     def initialize(self) -> None:
         if self._data_root_identity is None:
+            _require_secure_directory_primitives()
             if _validate_data_root(self._data_root) != self._data_root:
                 raise _path_not_allowed()
             _ensure_directory(self._data_root)
             if _validate_data_root(self._data_root) != self._data_root:
                 raise _path_not_allowed()
-            self._data_root_identity = _directory_identity(self._data_root)
+            expected_identity = _directory_identity(self._data_root)
+            try:
+                descriptor = os.open(
+                    self._data_root,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                )
+            except OSError as exc:
+                raise _path_not_allowed(exc) from exc
+            try:
+                actual_identity = _status_identity(os.fstat(descriptor))
+            except OSError as exc:
+                os.close(descriptor)
+                raise _path_not_allowed(exc) from exc
+            if actual_identity != expected_identity:
+                os.close(descriptor)
+                raise _path_not_allowed()
+            self._data_root_identity = actual_identity
+            self._data_root_fd = descriptor
         with self._data_root_guard():
             self._repository.initialize()
         self._initialized = True
@@ -284,36 +405,67 @@ class BookLibrary:
         imported: ImportedBook,
         chapters: tuple[ChapterContent, ...],
     ) -> ImportedBook:
-        book_dir: Path | None = None
-        stage: Path | None = None
-        final: Path | None = None
-        owned_book_dir = False
-        published_final = False
+        attempt: _ManagedImportAttempt | None = None
         try:
-            books_dir = self._managed_books_directory()
-            with self._data_root_guard():
-                book_dir = books_dir / imported.book.book_id
-                try:
-                    book_dir.mkdir()
-                    owned_book_dir = True
-                except FileExistsError:
-                    pass
-                except OSError as exc:
-                    raise _storage_unavailable(exc) from exc
-                if book_dir.is_symlink() or book_dir.resolve(strict=True).parent != books_dir:
-                    raise _path_not_allowed()
+            books_fd = self._managed_books_descriptor()
+            book_name = imported.book.book_id
+            owned_book_dir = False
+            try:
+                os.mkdir(book_name, mode=0o700, dir_fd=books_fd)
+                owned_book_dir = True
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise _storage_unavailable(exc) from exc
+            book_fd = _open_directory_at(books_fd, book_name)
+            try:
+                book_identity = _status_identity(os.fstat(book_fd))
+            except OSError as exc:
+                with suppress(OSError):
+                    os.close(book_fd)
+                raise _storage_unavailable(exc) from exc
             extension = imported.format.value
-            stage = book_dir / f".source-{uuid4().hex}.tmp"
-            final = book_dir / f"source.{extension}"
+            stage_name = f".source-{uuid4().hex}.tmp"
+            final_name = f"source.{extension}"
+            attempt = _ManagedImportAttempt(
+                books_fd=books_fd,
+                book_fd=book_fd,
+                book_name=book_name,
+                stage_name=stage_name,
+                final_name=final_name,
+                book_identity=book_identity,
+                owned_book_dir=owned_book_dir,
+            )
+            stage = self._data_root / "books" / book_name / stage_name
+
+            def open_anchored_stage(_path: Path, mode: str) -> BinaryIO:
+                if mode != "xb" or attempt is None:
+                    raise OSError("invalid managed stage mode")
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                descriptor = os.open(
+                    attempt.stage_name,
+                    flags,
+                    0o600,
+                    dir_fd=attempt.book_fd,
+                )
+                try:
+                    attempt.stage_identity = _status_identity(os.fstat(descriptor))
+                    return cast(BinaryIO, os.fdopen(descriptor, "wb"))
+                except BaseException:
+                    with suppress(OSError):
+                        os.close(descriptor)
+                    raise
+
             with self._data_root_guard():
                 copied_fingerprint = _copy_source_to_stage(
                     source,
                     stage,
                     limits=self._registry.limits,
+                    stage_opener=open_anchored_stage,
                 )
             if copied_fingerprint != imported.source_fingerprint:
                 raise _source_changed()
-            relative_source = final.relative_to(self._data_root).as_posix()
+            relative_source = f"books/{book_name}/{final_name}"
             record = self._repository.new_record(
                 imported,
                 managed_source_path=relative_source,
@@ -321,76 +473,111 @@ class BookLibrary:
             )
 
             def publish() -> None:
-                nonlocal published_final
-                if final is None or stage is None:
+                if attempt is None or attempt.stage_identity is None:
                     raise _path_not_allowed()
                 with self._data_root_guard():
                     try:
-                        os.link(stage, final)
+                        os.link(
+                            attempt.stage_name,
+                            attempt.final_name,
+                            src_dir_fd=attempt.book_fd,
+                            dst_dir_fd=attempt.book_fd,
+                            follow_symlinks=False,
+                        )
                     except FileExistsError as exc:
                         raise _path_not_allowed(exc) from exc
                     except OSError as exc:
                         raise _storage_unavailable(exc) from exc
-                    published_final = True
-                    try:
-                        stage.unlink()
-                    except OSError as exc:
-                        raise _storage_unavailable(exc) from exc
+                    attempt.final_identity = attempt.stage_identity
+                    stage_removal = _unlink_matching(
+                        attempt.book_fd,
+                        attempt.stage_name,
+                        attempt.stage_identity,
+                    )
+                    if stage_removal is None:
+                        raise _storage_unavailable(OSError("managed stage cleanup failed"))
+                    attempt.stage_identity = None
 
             persisted = self._persist(record, chapters, publish=publish)
             if not persisted.created:
-                self._cleanup_import_attempt(
-                    stage,
-                    final,
-                    book_dir,
-                    published_final=published_final,
-                    owned_book_dir=owned_book_dir,
-                )
+                self._cleanup_import_attempt(attempt)
+            else:
+                _close_book_descriptor(attempt)
             return persisted.record.imported
         except BaseException:
-            self._cleanup_import_attempt(
-                stage,
-                final,
-                book_dir,
-                published_final=published_final,
-                owned_book_dir=owned_book_dir,
-            )
+            self._cleanup_import_attempt(attempt)
             raise
 
     def _cleanup_import_attempt(
         self,
-        stage: Path | None,
-        final: Path | None,
-        book_dir: Path | None,
-        *,
-        published_final: bool,
-        owned_book_dir: bool,
+        attempt: _ManagedImportAttempt | None,
     ) -> None:
-        try:
-            with self._data_root_guard():
-                _remove_attempt_files(
-                    stage,
-                    final,
-                    book_dir,
-                    published_final=published_final,
-                    owned_book_dir=owned_book_dir,
-                )
-        except ForgeException:
-            pass
+        if attempt is not None:
+            _remove_attempt_files(attempt)
 
     def _managed_books_directory(self) -> Path:
         with self._data_root_guard():
-            books_dir = self._data_root / "books"
-            if books_dir.is_symlink():
+            root_fd = self._data_root_fd
+            if root_fd is None:
                 raise _path_not_allowed()
-            _ensure_directory(books_dir)
+            if self._books_fd is None:
+                try:
+                    os.mkdir("books", mode=0o700, dir_fd=root_fd)
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise _storage_unavailable(exc) from exc
+                self._books_fd = _open_directory_at(root_fd, "books")
+            return self._data_root / "books"
+
+    def _managed_books_descriptor(self) -> int:
+        self._managed_books_directory()
+        books_fd = self._books_fd
+        if books_fd is None:
+            raise _path_not_allowed()
+        return books_fd
+
+    def _managed_source_fingerprint(self, book_name: str, source_name: str) -> str:
+        books_fd = self._managed_books_descriptor()
+        book_fd = _open_directory_at(books_fd, book_name)
+        source_fd: int | None = None
+        try:
             try:
-                resolved = books_dir.resolve(strict=True)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise _path_not_allowed(exc) from exc
-            if resolved != books_dir or resolved.parent != self._data_root:
-                raise _path_not_allowed()
-            return resolved
+                source_fd = os.open(
+                    source_name,
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=book_fd,
+                )
+                source_status = os.fstat(source_fd)
+                if (
+                    not stat.S_ISREG(source_status.st_mode)
+                    or source_status.st_size > self._registry.limits.max_source_bytes
+                ):
+                    raise _source_changed()
+                digest = hashlib.sha256()
+                bytes_read = 0
+                while True:
+                    chunk = os.read(
+                        source_fd,
+                        min(
+                            _HASH_CHUNK_SIZE,
+                            self._registry.limits.max_source_bytes - bytes_read + 1,
+                        ),
+                    )
+                    if not chunk:
+                        return digest.hexdigest()
+                    bytes_read += len(chunk)
+                    if bytes_read > self._registry.limits.max_source_bytes:
+                        raise _source_changed()
+                    digest.update(chunk)
+            except OSError as exc:
+                raise _source_changed(exc) from exc
+        finally:
+            if source_fd is not None:
+                with suppress(OSError):
+                    os.close(source_fd)
+            with suppress(OSError):
+                os.close(book_fd)
 
     def _persist(
         self,
@@ -427,12 +614,15 @@ class BookLibrary:
                 expected = f"books/{imported.book.book_id}/source.{imported.format.value}"
                 if record.managed_source_path != expected:
                     return False
-                source = self._data_root / expected
                 try:
-                    resolved = source.resolve(strict=True)
-                except (OSError, RuntimeError, ValueError):
-                    return False
-                if self._data_root not in resolved.parents:
+                    return (
+                        self._managed_source_fingerprint(
+                            imported.book.book_id,
+                            f"source.{imported.format.value}",
+                        )
+                        == imported.source_fingerprint
+                    )
+                except ForgeException:
                     return False
             else:
                 if record.reference_source_path is None:
@@ -457,8 +647,19 @@ class BookLibrary:
 
     def _assert_data_root_identity(self) -> None:
         identity = self._data_root_identity
-        if identity is None or _directory_identity(self._data_root) != identity:
+        descriptor = self._data_root_fd
+        if identity is None or descriptor is None:
             raise _path_not_allowed()
+        try:
+            if (
+                _status_identity(os.fstat(descriptor)) != identity
+                or _directory_identity(self._data_root) != identity
+            ):
+                raise _path_not_allowed()
+        except ForgeException:
+            raise
+        except OSError as exc:
+            raise _path_not_allowed(exc) from exc
 
     @contextmanager
     def _data_root_guard(self) -> Iterator[None]:

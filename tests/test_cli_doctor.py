@@ -1,15 +1,23 @@
+from __future__ import annotations
+
 import json
 import sqlite3
 import stat
+from contextlib import closing
 from pathlib import Path
+from types import TracebackType
+from typing import Any
 
 import pytest
 from typer.testing import CliRunner
 
 from cove_book_forge import doctor as doctor_module
 from cove_book_forge.cli import app
+from cove_book_forge.config import load_config
 from cove_book_forge.doctor import CheckStatus, run_doctor
+from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.library import BookLibrary, LibraryDatabase
+from cove_book_forge.library import database as library_database
 
 runner = CliRunner()
 
@@ -40,7 +48,15 @@ def _filesystem_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
             payload = path.readlink().as_posix()
         else:
             payload = None
-        entries.append((relative, stat.S_IFMT(status.st_mode), status.st_size, payload))
+        entries.append(
+            (
+                relative,
+                stat.S_IFMT(status.st_mode),
+                status.st_size,
+                status.st_mtime_ns,
+                payload,
+            )
+        )
     return tuple(entries)
 
 
@@ -48,6 +64,24 @@ def _check(payload: dict[str, object], name: str) -> dict[str, object]:
     checks = payload["checks"]
     assert isinstance(checks, list)
     return next(check for check in checks if check["name"] == name)
+
+
+def _create_library_schema(path: Path, *, version: int) -> None:
+    with closing(sqlite3.connect(path)) as connection, connection:
+        for statement in library_database._SCHEMA_V1:  # noqa: SLF001 - canonical fixture schema
+            connection.execute(statement)
+        if version == 2:
+            connection.execute(
+                "ALTER TABLE chapter_snapshots "
+                "ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
+            )
+        connection.execute(f"PRAGMA user_version = {version}")
+
+
+def _database_check_from_cli(config: Path) -> tuple[object, dict[str, object], str]:
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+    payload = json.loads(result.stdout)
+    return result, _check(payload, "library_database"), result.stdout
 
 
 def test_doctor_reports_valid_local_configuration(tmp_path: Path) -> None:
@@ -213,9 +247,7 @@ def test_doctor_opens_existing_library_database_read_only_without_side_effects(
     data_dir = tmp_path / "library"
     data_dir.mkdir()
     database = data_dir / "library.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.execute("CREATE TABLE readiness_probe (value TEXT NOT NULL)")
-        connection.execute("INSERT INTO readiness_probe VALUES ('unchanged')")
+    _create_library_schema(database, version=2)
     config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
     before = _filesystem_snapshot(tmp_path)
 
@@ -225,6 +257,237 @@ def test_doctor_opens_existing_library_database_read_only_without_side_effects(
     assert database_check.status is CheckStatus.PASS
     assert _filesystem_snapshot(tmp_path) == before
     assert not tuple(data_dir.glob("library.sqlite3-*"))
+
+
+@pytest.mark.parametrize("sidecar_suffix", ["-journal", "-shm"])
+def test_doctor_fails_closed_for_any_existing_sqlite_sidecar_without_writing(
+    tmp_path: Path,
+    sidecar_suffix: str,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    _create_library_schema(database, version=2)
+    sidecar = data_dir / f"library.sqlite3{sidecar_suffix}"
+    sidecar.write_bytes(b"private sidecar payload")
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_snapshot(tmp_path)
+
+    result, database_check, stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert "sidecar" in str(database_check["message"]).lower()
+    assert str(data_dir) not in stdout
+    assert "private sidecar payload" not in stdout
+    assert _filesystem_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("wal_state", ["committed", "truncated"])
+def test_doctor_fails_closed_for_real_wal_state_without_touching_database_files(
+    tmp_path: Path,
+    wal_state: str,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    _create_library_schema(database, version=2)
+    connection = sqlite3.connect(database)
+    try:
+        assert connection.execute("PRAGMA journal_mode = WAL").fetchone()[0] == "wal"
+        connection.execute("PRAGMA wal_autocheckpoint = 0")
+        connection.execute(
+            """
+            INSERT INTO books (
+                book_id, title, author, language, total_chapters,
+                created_at, updated_at
+            ) VALUES ('wal-book', 'Private WAL title', '', '', 0, 'now', 'now')
+            """
+        )
+        connection.commit()
+        wal = data_dir / "library.sqlite3-wal"
+        assert wal.exists()
+        if wal_state == "truncated":
+            payload = wal.read_bytes()
+            wal.write_bytes(payload[: max(32, len(payload) // 2)])
+        config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+        before = _filesystem_snapshot(tmp_path)
+
+        result, database_check, stdout = _database_check_from_cli(config)
+
+        assert result.exit_code == 1
+        assert database_check["status"] == "fail"
+        assert "sidecar" in str(database_check["message"]).lower()
+        assert "Private WAL title" not in stdout
+        assert str(database) not in stdout
+        assert _filesystem_snapshot(tmp_path) == before
+    finally:
+        connection.close()
+
+
+def test_doctor_rechecks_sidecars_after_read_only_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    _create_library_schema(database, version=2)
+    sidecar = data_dir / "library.sqlite3-journal"
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    real_connect = sqlite3.connect
+    opened: list[SidecarAppearingConnection] = []
+
+    class SidecarAppearingConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+            self.closed = False
+
+        def __enter__(self) -> SidecarAppearingConnection:
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+            self._connection.close()
+
+        def execute(self, statement: str, *args: Any) -> sqlite3.Cursor:
+            result = self._connection.execute(statement, *args)
+            if statement == "PRAGMA quick_check(1)":
+                sidecar.write_bytes(b"appeared concurrently")
+            return result
+
+    def connect_with_concurrent_sidecar(*args: Any, **kwargs: Any) -> SidecarAppearingConnection:
+        connection = SidecarAppearingConnection(real_connect(*args, **kwargs))
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(doctor_module.sqlite3, "connect", connect_with_concurrent_sidecar)
+
+    result, database_check, _stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert sidecar.read_bytes() == b"appeared concurrently"
+    assert opened and opened[0].closed is True
+
+
+@pytest.mark.parametrize(
+    "unsafe_kind",
+    ["final_symlink", "symlink_ancestor", "root", "home", "non_directory_ancestor"],
+)
+def test_doctor_and_book_library_share_data_root_rejection_and_skip_database(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_kind: str,
+) -> None:
+    private_target = tmp_path / "private-target"
+    private_target.mkdir()
+    nested_target = private_target / "nested"
+    nested_target.mkdir()
+    target_database = nested_target / "library.sqlite3"
+    _create_library_schema(target_database, version=2)
+
+    if unsafe_kind == "final_symlink":
+        data_dir = tmp_path / "linked-library"
+        data_dir.symlink_to(nested_target, target_is_directory=True)
+    elif unsafe_kind == "symlink_ancestor":
+        linked_parent = tmp_path / "linked-parent"
+        linked_parent.symlink_to(private_target, target_is_directory=True)
+        data_dir = linked_parent / "nested"
+    elif unsafe_kind == "root":
+        data_dir = Path("/")
+    elif unsafe_kind == "home":
+        data_dir = Path.home()
+    else:
+        occupied = tmp_path / "occupied"
+        occupied.write_text("private non-directory ancestor", encoding="utf-8")
+        data_dir = occupied / "nested"
+
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_snapshot(private_target)
+
+    with pytest.raises(ForgeException) as exc_info:
+        BookLibrary(load_config(config))
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+
+    def forbidden_connect(*_args: object, **_kwargs: object) -> sqlite3.Connection:
+        raise AssertionError("doctor must skip database inspection for an unsafe data root")
+
+    monkeypatch.setattr(doctor_module.sqlite3, "connect", forbidden_connect)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert _check(payload, "library_data")["status"] == "fail"
+    assert _check(payload, "library_database")["status"] == "fail"
+    assert "skipped" in str(_check(payload, "library_database")["message"]).lower()
+    assert str(private_target) not in result.stdout
+    assert "private non-directory ancestor" not in result.stdout
+    assert _filesystem_snapshot(private_target) == before
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_status", "expected_fragment"),
+    [
+        ("v1", "warn", "migration"),
+        ("v2", "pass", None),
+        ("future", "fail", None),
+        ("v2_missing_table", "fail", None),
+        ("v2_missing_column", "fail", None),
+        ("v0_unrelated", "fail", None),
+        ("v0_empty", "warn", "uninitialized"),
+    ],
+)
+def test_doctor_validates_library_application_schema_without_writing(
+    tmp_path: Path,
+    case: str,
+    expected_status: str,
+    expected_fragment: str | None,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    if case == "v1":
+        _create_library_schema(database, version=1)
+    elif case == "v2":
+        _create_library_schema(database, version=2)
+    elif case == "future":
+        database.touch()
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("PRAGMA user_version = 999")
+    elif case == "v2_missing_table":
+        _create_library_schema(database, version=2)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("DROP TABLE chapters")
+    elif case == "v2_missing_column":
+        _create_library_schema(database, version=1)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("PRAGMA user_version = 2")
+    elif case == "v0_unrelated":
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("CREATE TABLE private_unrelated (secret TEXT)")
+    else:
+        database.touch()
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_snapshot(tmp_path)
+
+    result, database_check, stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == (1 if expected_status == "fail" else 0)
+    assert database_check["status"] == expected_status
+    if expected_fragment is not None:
+        assert expected_fragment in str(database_check["message"]).lower()
+    assert str(database) not in stdout
+    assert "private_unrelated" not in stdout
+    assert _filesystem_snapshot(tmp_path) == before
 
 
 @pytest.mark.parametrize("kind", ["symlink", "corrupt"])
@@ -237,7 +500,7 @@ def test_doctor_rejects_unsafe_or_invalid_existing_database_without_writing(
     database = data_dir / "library.sqlite3"
     if kind == "symlink":
         target = tmp_path / "outside.sqlite3"
-        with sqlite3.connect(target) as connection:
+        with closing(sqlite3.connect(target)) as connection, connection:
             connection.execute("CREATE TABLE outside_probe (value TEXT)")
         database.symlink_to(target)
     else:

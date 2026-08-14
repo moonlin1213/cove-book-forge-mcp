@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import stat
+from contextlib import closing
 from enum import StrEnum
 from importlib import import_module
 from pathlib import Path
@@ -10,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from cove_book_forge.config import AppConfig, library_data_path, load_config
 from cove_book_forge.config.paths import AuthorizedPathPolicy
 from cove_book_forge.errors import ForgeException
+from cove_book_forge.library.database import _inspect_library_schema, _LibrarySchemaReadiness
+from cove_book_forge.library.service import _validate_data_root
+
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
 class CheckStatus(StrEnum):
@@ -70,9 +75,17 @@ def _nearest_existing_parent(path: Path) -> Path | None:
 
 def _library_directory_check(path: Path, *, enabled: bool) -> DoctorCheck:
     try:
-        status = path.stat(follow_symlinks=False)
+        validated = _validate_data_root(path)
+    except ForgeException:
+        return DoctorCheck(
+            name="library_data",
+            status=CheckStatus.FAIL,
+            message="Directory is not allowed.",
+        )
+    try:
+        status = validated.stat(follow_symlinks=False)
     except FileNotFoundError:
-        parent = _nearest_existing_parent(path)
+        parent = _nearest_existing_parent(validated)
         parent_ready = parent is not None and os.access(parent, os.W_OK | os.X_OK)
         if enabled or not parent_ready:
             return DoctorCheck(
@@ -97,7 +110,7 @@ def _library_directory_check(path: Path, *, enabled: bool) -> DoctorCheck:
             status=CheckStatus.FAIL,
             message="Directory is unavailable.",
         )
-    if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+    if not os.access(validated, os.R_OK | os.W_OK | os.X_OK):
         return DoctorCheck(
             name="library_data",
             status=CheckStatus.FAIL,
@@ -123,6 +136,27 @@ def _dependency_check(name: str, module: str) -> DoctorCheck:
         name=name,
         status=CheckStatus.PASS,
         message="Parser dependency is available.",
+    )
+
+
+def _sqlite_sidecars_absent(database: Path) -> bool:
+    for suffix in _SQLITE_SIDECAR_SUFFIXES:
+        sidecar = database.with_name(f"{database.name}{suffix}")
+        try:
+            sidecar.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        return False
+    return True
+
+
+def _sidecar_failure() -> DoctorCheck:
+    return DoctorCheck(
+        name="library_database",
+        status=CheckStatus.FAIL,
+        message="Database cannot be inspected read-only while SQLite sidecars exist.",
     )
 
 
@@ -156,22 +190,46 @@ def _database_check(data_path: Path, *, enabled: bool) -> DoctorCheck:
             status=CheckStatus.FAIL,
             message="Database is not a regular file.",
         )
+    if not _sqlite_sidecars_absent(database):
+        return _sidecar_failure()
     try:
         uri = f"{database.absolute().as_uri()}?mode=ro&immutable=1"
-        with sqlite3.connect(uri, uri=True, timeout=0.0) as connection:
-            result = connection.execute("PRAGMA quick_check(1)").fetchone()
-        if result is None or result[0] != "ok":
-            raise sqlite3.DatabaseError("integrity check failed")
+        with closing(sqlite3.connect(uri, uri=True, timeout=0.0)) as connection:
+            readiness = _inspect_library_schema(connection)
     except (OSError, sqlite3.Error, ValueError):
+        if not _sqlite_sidecars_absent(database):
+            return _sidecar_failure()
         return DoctorCheck(
             name="library_database",
             status=CheckStatus.FAIL,
             message="Database failed its read-only readiness check.",
         )
+    if not _sqlite_sidecars_absent(database):
+        return _sidecar_failure()
+    if readiness is _LibrarySchemaReadiness.UNINITIALIZED:
+        return DoctorCheck(
+            name="library_database",
+            status=CheckStatus.WARN,
+            message="Database is uninitialized.",
+        )
+    if readiness is _LibrarySchemaReadiness.MIGRATION_PENDING:
+        return DoctorCheck(
+            name="library_database",
+            status=CheckStatus.WARN,
+            message="Database schema migration is pending.",
+        )
     return DoctorCheck(
         name="library_database",
         status=CheckStatus.PASS,
-        message="Database passed its read-only readiness check.",
+        message="Database schema is ready.",
+    )
+
+
+def _skipped_database_check() -> DoctorCheck:
+    return DoctorCheck(
+        name="library_database",
+        status=CheckStatus.FAIL,
+        message="Database check skipped because the library directory is unsafe.",
     )
 
 
@@ -212,8 +270,13 @@ def _checks_for_config(config: AppConfig) -> list[DoctorCheck]:
             )
         )
     data_path = library_data_path(config)
-    checks.append(_library_directory_check(data_path, enabled=config.library.enabled))
-    checks.append(_database_check(data_path, enabled=config.library.enabled))
+    directory_check = _library_directory_check(data_path, enabled=config.library.enabled)
+    checks.append(directory_check)
+    checks.append(
+        _skipped_database_check()
+        if directory_check.status is CheckStatus.FAIL
+        else _database_check(data_path, enabled=config.library.enabled)
+    )
     if config.outputs.obsidian.enabled and config.outputs.obsidian.vault_path is not None:
         checks.append(
             _authorized_directory_check("obsidian_vault", config.outputs.obsidian.vault_path)

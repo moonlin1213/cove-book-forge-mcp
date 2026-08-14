@@ -7,6 +7,7 @@ import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from threading import RLock
 from uuid import uuid4
@@ -82,6 +83,106 @@ CREATE TABLE chapter_snapshots (
     UNIQUE (external_source_id, chapter_index)
 )
 """
+
+_REQUIRED_V1_COLUMNS = {
+    "books": frozenset(
+        {
+            "book_id",
+            "title",
+            "author",
+            "language",
+            "total_chapters",
+            "format",
+            "import_mode",
+            "source_fingerprint",
+            "managed_source_path",
+            "reference_source_path",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "chapters": frozenset({"book_id", "chapter_index", "title", "content", "source_locator"}),
+    "external_sources": frozenset(
+        {
+            "external_source_id",
+            "book_id",
+            "source_system",
+            "external_book_id",
+            "created_at",
+            "updated_at",
+        }
+    ),
+    "chapter_snapshots": frozenset(
+        {
+            "chapter_snapshot_id",
+            "external_source_id",
+            "chapter_index",
+            "snapshot_json",
+            "created_at",
+            "updated_at",
+        }
+    ),
+}
+
+
+class _LibrarySchemaReadiness(StrEnum):
+    UNINITIALIZED = "uninitialized"
+    MIGRATION_PENDING = "migration_pending"
+    READY = "ready"
+
+
+def _inspect_library_schema(connection: sqlite3.Connection) -> _LibrarySchemaReadiness:
+    """Inspect the application schema through an already read-only connection."""
+    quick_check = connection.execute("PRAGMA quick_check(1)").fetchone()
+    if quick_check is None or quick_check[0] != "ok":
+        raise sqlite3.DatabaseError("integrity check failed")
+
+    version_row = connection.execute("PRAGMA user_version").fetchone()
+    if version_row is None:
+        raise sqlite3.DatabaseError("schema version unavailable")
+    version = int(version_row[0])
+    table_names = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT name
+            FROM sqlite_schema
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+            """
+        ).fetchall()
+    }
+    if version == 0:
+        if table_names:
+            raise sqlite3.DatabaseError("unrecognized unversioned schema")
+        return _LibrarySchemaReadiness.UNINITIALIZED
+    if version not in {1, _SCHEMA_VERSION}:
+        raise sqlite3.DatabaseError("unsupported schema version")
+
+    required_columns = {
+        table: columns
+        | (
+            {"content_fingerprint"}
+            if version == _SCHEMA_VERSION and table == "chapter_snapshots"
+            else set()
+        )
+        for table, columns in _REQUIRED_V1_COLUMNS.items()
+    }
+    if not required_columns.keys() <= table_names:
+        raise sqlite3.DatabaseError("required application table is missing")
+    for table, expected_columns in required_columns.items():
+        actual_columns = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM pragma_table_info(?)",
+                (table,),
+            ).fetchall()
+        }
+        if not expected_columns <= actual_columns:
+            raise sqlite3.DatabaseError("required application column is missing")
+
+    if version == 1:
+        return _LibrarySchemaReadiness.MIGRATION_PENDING
+    return _LibrarySchemaReadiness.READY
 
 
 @dataclass(frozen=True, slots=True)

@@ -112,8 +112,19 @@ def _validate_data_root(path: Path) -> Path:
             raise _path_not_allowed()
         if expanded.is_symlink():
             raise _path_not_allowed()
-        if expanded.exists() and not expanded.is_dir():
-            raise _path_not_allowed()
+        existing = lexical
+        while True:
+            try:
+                existing_status = existing.stat(follow_symlinks=False)
+            except FileNotFoundError as exc:
+                parent = existing.parent
+                if parent == existing:
+                    raise _path_not_allowed() from exc
+                existing = parent
+                continue
+            if not stat.S_ISDIR(existing_status.st_mode):
+                raise _path_not_allowed()
+            break
         return resolved
     except ForgeException:
         raise

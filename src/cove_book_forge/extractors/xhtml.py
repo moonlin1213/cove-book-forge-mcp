@@ -26,6 +26,7 @@ _BLOCK_TAGS = frozenset(
 _REMOVED_TAGS = ("script", "style", "form", "noscript", "svg")
 _WHITESPACE = re.compile(r"[\t\r\n ]+")
 _EXCESS_BLANK_LINES = re.compile(r"\n{3,}")
+_MAX_DOM_DEPTH = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,15 @@ class XhtmlContent:
 
 def _clean_inline(value: str) -> str:
     return _WHITESPACE.sub(" ", value).strip()
+
+
+def _ensure_safe_dom_depth(root: Tag) -> None:
+    stack: list[tuple[Tag, int]] = [(root, 0)]
+    while stack:
+        tag, depth = stack.pop()
+        if depth > _MAX_DOM_DEPTH:
+            raise ValueError("XHTML DOM exceeds the safe depth limit")
+        stack.extend((child, depth + 1) for child in tag.children if isinstance(child, Tag))
 
 
 def _attribute_with_local_name(tag: Tag, local_name: str) -> str:
@@ -163,6 +173,7 @@ def _render_block(tag: Tag, footnote_labels: dict[str, str]) -> str:
 
 def extract_xhtml(payload: bytes) -> XhtmlContent:
     soup = BeautifulSoup(payload, "html.parser")
+    _ensure_safe_dom_depth(soup)
     for tag in soup.find_all(_REMOVED_TAGS):
         tag.decompose()
 

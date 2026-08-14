@@ -17,7 +17,57 @@ from cove_book_forge.extractors.security import ExtractionLimits
 from cove_book_forge.extractors.xhtml import extract_xhtml
 
 _CONTAINER_MEMBER = "META-INF/container.xml"
-_NESTED_ARCHIVE_SUFFIXES = frozenset({".cbz", ".epub", ".jar", ".zip"})
+_CONTAINER_NAMESPACE = "urn:oasis:names:tc:opendocument:xmlns:container"
+_DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
+_EPUB_NAMESPACE = "http://www.idpf.org/2007/ops"
+_NCX_NAMESPACE = "http://www.daisy.org/z3986/2005/ncx/"
+_OPF_NAMESPACE = "http://www.idpf.org/2007/opf"
+_XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml"
+_ARCHIVE_MAGIC_BYTES = 512
+_ARCHIVE_MAGIC_PREFIXES = (
+    b"PK\x03\x04",
+    b"PK\x05\x06",
+    b"PK\x07\x08",
+    b"7z\xbc\xaf\x27\x1c",
+    b"Rar!\x1a\x07",
+    b"\x1f\x8b",
+    b"BZh",
+    b"\xfd7zXZ\x00",
+    b"\x28\xb5\x2f\xfd",
+    b"!<arch>\n",
+    b"MSCF",
+    b"xar!",
+)
+_NESTED_ARCHIVE_SUFFIXES = frozenset(
+    {
+        ".7z",
+        ".apk",
+        ".bz2",
+        ".cab",
+        ".cbz",
+        ".deb",
+        ".docx",
+        ".epub",
+        ".gz",
+        ".ipa",
+        ".jar",
+        ".odp",
+        ".ods",
+        ".odt",
+        ".pptx",
+        ".rar",
+        ".rpm",
+        ".tar",
+        ".tgz",
+        ".txz",
+        ".whl",
+        ".xlsx",
+        ".xpi",
+        ".xz",
+        ".zip",
+        ".zst",
+    }
+)
 _XHTML_MEDIA_TYPE = "application/xhtml+xml"
 _NCX_MEDIA_TYPE = "application/x-dtbncx+xml"
 
@@ -33,8 +83,8 @@ def _failure(code: ForgeErrorCode = ForgeErrorCode.EXTRACTION_FAILED) -> ForgeEx
     return ForgeException(code, "EPUB extraction failed.")
 
 
-def _local_name(value: str) -> str:
-    return value.rsplit("}", 1)[-1]
+def _qname(namespace: str, local_name: str) -> str:
+    return f"{{{namespace}}}{local_name}"
 
 
 def _normalized_member_name(name: str) -> str:
@@ -76,18 +126,36 @@ def _preflight(archive: zipfile.ZipFile, limits: ExtractionLimits) -> dict[str, 
         if member in members:
             raise _failure()
         members[member] = info
+    _reject_nested_archive_magic(archive, members)
     return members
 
 
+def _reject_nested_archive_magic(
+    archive: zipfile.ZipFile, members: dict[str, zipfile.ZipInfo]
+) -> None:
+    for info in members.values():
+        if info.is_dir() or info.file_size == 0:
+            continue
+        try:
+            with archive.open(info) as stream:
+                prefix = stream.read(_ARCHIVE_MAGIC_BYTES)
+        except RuntimeError as exc:
+            raise _failure() from exc
+        if prefix.startswith(_ARCHIVE_MAGIC_PREFIXES) or (
+            len(prefix) >= 262 and prefix[257:262] == b"ustar"
+        ):
+            raise _failure()
+
+
 def _resolve_reference(base_member: str, reference: str) -> str:
-    split = urlsplit(reference)
+    split = urlsplit(unquote(reference))
     if split.scheme or split.netloc:
         raise _failure()
-    decoded = unquote(split.path)
-    if not decoded or "\\" in decoded or decoded.startswith("/"):
+    path = split.path
+    if not path or "\\" in path or path.startswith("/"):
         raise _failure()
     base_directory = posixpath.dirname(base_member) if base_member else ""
-    candidate = posixpath.normpath(posixpath.join(base_directory, decoded))
+    candidate = posixpath.normpath(posixpath.join(base_directory, path))
     if candidate in {"", ".", ".."} or candidate.startswith("../") or candidate.startswith("/"):
         raise _failure()
     return _normalized_member_name(candidate)
@@ -112,63 +180,82 @@ def _parse_xml(payload: bytes) -> Element:
     return element
 
 
-def _first_descendant_text(root: Element, name: str) -> str:
-    for element in root.iter():
-        if _local_name(element.tag) == name:
-            value = sanitize_text(" ".join("".join(element.itertext()).split()))
-            if value:
-                return value
+def _first_direct_text(parent: Element, tag: str) -> str:
+    for element in parent:
+        if element.tag != tag:
+            continue
+        value = sanitize_text(" ".join("".join(element.itertext()).split()))
+        if value:
+            return value
     return ""
+
+
+def _required_direct_child(parent: Element, tag: str) -> Element:
+    matches = [element for element in parent if element.tag == tag]
+    if len(matches) != 1:
+        raise _failure()
+    return matches[0]
 
 
 def _parse_container(payload: bytes) -> str:
     root = _parse_xml(payload)
-    for element in root.iter():
-        if _local_name(element.tag) == "rootfile":
-            full_path = element.get("full-path", "")
-            return _resolve_reference("", full_path)
-    raise _failure()
+    if root.tag != _qname(_CONTAINER_NAMESPACE, "container"):
+        raise _failure()
+    rootfiles = _required_direct_child(root, _qname(_CONTAINER_NAMESPACE, "rootfiles"))
+    rootfile = next(
+        (
+            element
+            for element in rootfiles
+            if element.tag == _qname(_CONTAINER_NAMESPACE, "rootfile")
+        ),
+        None,
+    )
+    if rootfile is None:
+        raise _failure()
+    return _resolve_reference("", rootfile.get("full-path", ""))
 
 
 def _parse_package(
     payload: bytes, opf_member: str
 ) -> tuple[BookMetadata, dict[str, _ManifestItem], list[tuple[str, bool]], str]:
     root = _parse_xml(payload)
-    if _local_name(root.tag) != "package":
+    if root.tag != _qname(_OPF_NAMESPACE, "package"):
         raise _failure()
-    title = _first_descendant_text(root, "title")
+    metadata_node = _required_direct_child(root, _qname(_OPF_NAMESPACE, "metadata"))
+    manifest_node = _required_direct_child(root, _qname(_OPF_NAMESPACE, "manifest"))
+    spine_node = _required_direct_child(root, _qname(_OPF_NAMESPACE, "spine"))
+    title = _first_direct_text(metadata_node, _qname(_DC_NAMESPACE, "title"))
     if not title:
         raise _failure()
     metadata = BookMetadata(
         title=title,
-        author=_first_descendant_text(root, "creator"),
-        language=_first_descendant_text(root, "language"),
+        author=_first_direct_text(metadata_node, _qname(_DC_NAMESPACE, "creator")),
+        language=_first_direct_text(metadata_node, _qname(_DC_NAMESPACE, "language")),
     )
     manifest: dict[str, _ManifestItem] = {}
     spine: list[tuple[str, bool]] = []
-    toc_id = ""
-    for element in root.iter():
-        name = _local_name(element.tag)
-        if name == "item":
-            item_id = element.get("id", "")
-            href = element.get("href", "")
-            if not item_id or not href or item_id in manifest:
-                raise _failure()
-            manifest[item_id] = _ManifestItem(
-                member=_resolve_reference(opf_member, href),
-                media_type=element.get("media-type", ""),
-                properties=frozenset(element.get("properties", "").split()),
-            )
-        elif name == "spine":
-            toc_id = element.get("toc", "")
-        elif name == "itemref":
-            idref = element.get("idref", "")
-            if not idref:
-                raise _failure()
-            spine.append((idref, element.get("linear", "yes").lower() != "no"))
+    for element in manifest_node:
+        if element.tag != _qname(_OPF_NAMESPACE, "item"):
+            continue
+        item_id = element.get("id", "")
+        href = element.get("href", "")
+        if not item_id or not href or item_id in manifest:
+            raise _failure()
+        manifest[item_id] = _ManifestItem(
+            member=_resolve_reference(opf_member, href),
+            media_type=element.get("media-type", ""),
+            properties=frozenset(element.get("properties", "").split()),
+        )
+    for element in spine_node:
+        if element.tag != _qname(_OPF_NAMESPACE, "itemref"):
+            continue
+        idref = element.get("idref", "")
+        if not idref:
+            raise _failure()
+        spine.append((idref, element.get("linear", "yes").lower() != "no"))
     if not manifest or not spine:
         raise _failure()
-    return metadata, manifest, spine, toc_id
+    return metadata, manifest, spine, spine_node.get("toc", "")
 
 
 def _navigation_labels(
@@ -194,25 +281,17 @@ def _navigation_labels(
     return {}
 
 
-def _attribute_by_local_name(element: Element, name: str) -> str:
-    for attribute, value in element.attrib.items():
-        if _local_name(attribute) == name:
-            return value
-    return ""
-
-
 def _epub3_navigation_labels(root: Element, nav_member: str) -> dict[str, str]:
+    if root.tag != _qname(_XHTML_NAMESPACE, "html"):
+        raise _failure()
     labels: dict[str, str] = {}
     toc_nodes = [
         element
-        for element in root.iter()
-        if _local_name(element.tag) == "nav"
-        and "toc" in _attribute_by_local_name(element, "type").split()
+        for element in root.iter(_qname(_XHTML_NAMESPACE, "nav"))
+        if "toc" in element.get(_qname(_EPUB_NAMESPACE, "type"), "").split()
     ]
     for toc in toc_nodes:
-        for anchor in toc.iter():
-            if _local_name(anchor.tag) != "a":
-                continue
+        for anchor in toc.iter(_qname(_XHTML_NAMESPACE, "a")):
             href = anchor.get("href", "")
             label = sanitize_text(" ".join("".join(anchor.itertext()).split()))
             if href and label:
@@ -221,17 +300,33 @@ def _epub3_navigation_labels(root: Element, nav_member: str) -> dict[str, str]:
 
 
 def _ncx_navigation_labels(root: Element, ncx_member: str) -> dict[str, str]:
+    if root.tag != _qname(_NCX_NAMESPACE, "ncx"):
+        raise _failure()
+    nav_map = _required_direct_child(root, _qname(_NCX_NAMESPACE, "navMap"))
     labels: dict[str, str] = {}
-    for point in root.iter():
-        if _local_name(point.tag) != "navPoint":
-            continue
-        label = ""
-        source = ""
-        for child in point.iter():
-            if _local_name(child.tag) == "text" and not label:
-                label = sanitize_text(" ".join("".join(child.itertext()).split()))
-            elif _local_name(child.tag) == "content" and not source:
-                source = child.get("src", "")
+    for point in nav_map.iter(_qname(_NCX_NAMESPACE, "navPoint")):
+        nav_label = next(
+            (child for child in point if child.tag == _qname(_NCX_NAMESPACE, "navLabel")),
+            None,
+        )
+        content = next(
+            (child for child in point if child.tag == _qname(_NCX_NAMESPACE, "content")),
+            None,
+        )
+        label_node = (
+            next(
+                (child for child in nav_label if child.tag == _qname(_NCX_NAMESPACE, "text")),
+                None,
+            )
+            if nav_label is not None
+            else None
+        )
+        label = (
+            sanitize_text(" ".join("".join(label_node.itertext()).split()))
+            if label_node is not None
+            else ""
+        )
+        source = content.get("src", "") if content is not None else ""
         if source and label:
             labels.setdefault(_resolve_reference(ncx_member, source), label)
     return labels
@@ -285,5 +380,5 @@ class EpubExtractor:
                 )
         except ForgeException:
             raise
-        except (OSError, ParseError, ValueError, zipfile.BadZipFile) as exc:
+        except (OSError, ParseError, RecursionError, ValueError, zipfile.BadZipFile) as exc:
             raise _failure() from exc

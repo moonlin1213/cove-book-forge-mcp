@@ -27,7 +27,7 @@ class SourceSnapshot:
     @classmethod
     def capture(cls, source: Path, *, limits: ExtractionLimits | None = None) -> "SourceSnapshot":
         validate_source(source, limits=limits)
-        return cls(fingerprint=fingerprint_source(source))
+        return cls(fingerprint=fingerprint_source(source, limits=limits))
 
 
 def _source_error(code: ForgeErrorCode) -> ForgeException:
@@ -50,11 +50,16 @@ def validate_source(source: Path, *, limits: ExtractionLimits | None = None) -> 
         raise _source_error(ForgeErrorCode.EXTRACTION_FAILED)
 
 
-def fingerprint_source(source: Path) -> str:
+def fingerprint_source(source: Path, *, limits: ExtractionLimits | None = None) -> str:
+    limits = limits or ExtractionLimits()
     digest = hashlib.sha256()
+    bytes_read = 0
     try:
         with source.open("rb") as stream:
-            while chunk := stream.read(_HASH_CHUNK_SIZE):
+            while chunk := stream.read(min(_HASH_CHUNK_SIZE, limits.max_source_bytes - bytes_read + 1)):
+                bytes_read += len(chunk)
+                if bytes_read > limits.max_source_bytes:
+                    raise _source_error(ForgeErrorCode.EXTRACTION_FAILED)
                 digest.update(chunk)
     except OSError as exc:
         raise _source_error(ForgeErrorCode.SOURCE_NOT_FOUND) from exc
@@ -77,7 +82,13 @@ def detect_book_format(source: Path) -> BookFormat:
     raise _source_error(ForgeErrorCode.UNSUPPORTED_FORMAT)
 
 
-def ensure_source_unchanged(source: Path, snapshot: SourceSnapshot) -> None:
-    validate_source(source)
-    if fingerprint_source(source) != snapshot.fingerprint:
+def ensure_source_unchanged(
+    source: Path, snapshot: SourceSnapshot, *, limits: ExtractionLimits | None = None
+) -> None:
+    try:
+        validate_source(source, limits=limits)
+        fingerprint = fingerprint_source(source, limits=limits)
+    except ForgeException as exc:
+        raise _source_error(ForgeErrorCode.SOURCE_CHANGED) from exc
+    if fingerprint != snapshot.fingerprint:
         raise _source_error(ForgeErrorCode.SOURCE_CHANGED)

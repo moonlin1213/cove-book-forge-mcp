@@ -5,6 +5,7 @@ from typing import Protocol
 from cove_book_forge.contracts.ingestion import BookFormat, ExtractedBook
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.extractors.security import (
+    ExtractionLimits,
     SourceSnapshot,
     detect_book_format,
     ensure_source_unchanged,
@@ -16,17 +17,25 @@ class BookExtractor(Protocol):
 
 
 class BookExtractorRegistry:
-    def __init__(self, extractors: Mapping[BookFormat, BookExtractor] | None = None) -> None:
+    def __init__(
+        self,
+        extractors: Mapping[BookFormat, BookExtractor] | None = None,
+        *,
+        limits: ExtractionLimits | None = None,
+    ) -> None:
         self._extractors = dict(extractors or {})
+        self._limits = limits or ExtractionLimits()
 
     def get_for_source(self, source: Path) -> BookExtractor | None:
         return self._extractors.get(detect_book_format(source))
 
     def extract(self, source: Path) -> ExtractedBook:
-        snapshot = SourceSnapshot.capture(source)
+        snapshot = SourceSnapshot.capture(source, limits=self._limits)
         extractor = self.get_for_source(source)
         if extractor is None:
             raise ForgeException(ForgeErrorCode.UNSUPPORTED_FORMAT, "No extractor is registered.")
         extracted = extractor.extract(source, snapshot.fingerprint)
-        ensure_source_unchanged(source, snapshot)
+        ensure_source_unchanged(source, snapshot, limits=self._limits)
+        if extracted.source_fingerprint != snapshot.fingerprint:
+            raise ForgeException(ForgeErrorCode.EXTRACTION_FAILED, "Extractor returned invalid provenance.")
         return extracted

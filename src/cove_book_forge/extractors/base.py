@@ -27,8 +27,12 @@ class BookExtractorRegistry:
         self._extractors: dict[BookFormat, BookExtractor]
         if extractors is None:
             from cove_book_forge.extractors.epub import EpubExtractor
+            from cove_book_forge.extractors.pdf import PdfExtractor
 
-            self._extractors = {BookFormat.EPUB: EpubExtractor(limits=self._limits)}
+            self._extractors = {
+                BookFormat.EPUB: EpubExtractor(limits=self._limits),
+                BookFormat.PDF: PdfExtractor(limits=self._limits),
+            }
         else:
             self._extractors = dict(extractors)
 
@@ -43,5 +47,7 @@ class BookExtractorRegistry:
         extracted = extractor.extract(source, snapshot.fingerprint)
         ensure_source_unchanged(source, snapshot, limits=self._limits)
         if extracted.source_fingerprint != snapshot.fingerprint:
-            raise ForgeException(ForgeErrorCode.EXTRACTION_FAILED, "Extractor returned invalid provenance.")
+            raise ForgeException(
+                ForgeErrorCode.EXTRACTION_FAILED, "Extractor returned invalid provenance."
+            )
         return extracted

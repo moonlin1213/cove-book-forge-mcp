@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import struct
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 
 def xhtml_document(body: str, *, title: str = "") -> str:
@@ -95,3 +98,57 @@ def basic_epub(path: Path, *, chapter_body: str = "<p>Readable.</p>") -> Path:
         opf=opf,
         members={"OEBPS/chapter.xhtml": xhtml_document(chapter_body)},
     )
+
+
+PdfLine = tuple[float, str]
+
+
+def _pdf_literal(text: str) -> bytes:
+    encoded = text.encode("latin-1")
+    return encoded.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+
+
+def write_pdf(
+    path: Path,
+    *,
+    pages: Sequence[Sequence[PdfLine]],
+    metadata: Mapping[str, str] | None = None,
+    outline: Sequence[tuple[str, int | None]] = (),
+    password: str | None = None,
+) -> Path:
+    """Write an original text-layer PDF fixture entirely at test runtime."""
+    writer = PdfWriter()
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    font_reference = writer._add_object(font)  # noqa: SLF001 - pypdf fixture construction
+    for lines in pages:
+        page = writer.add_blank_page(width=612, height=792)
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_reference})}
+        )
+        operators = []
+        for y_position, line in lines:
+            operators.append(
+                b"BT /F1 12 Tf 72 "
+                + str(y_position).encode("ascii")
+                + b" Td ("
+                + _pdf_literal(line)
+                + b") Tj ET"
+            )
+        stream = DecodedStreamObject()
+        stream.set_data(b"\n".join(operators))
+        page[NameObject("/Contents")] = writer._add_object(stream)  # noqa: SLF001
+    if metadata:
+        writer.add_metadata({f"/{key}": value for key, value in metadata.items()})
+    for title, page_number in outline:
+        writer.add_outline_item(title, page_number)
+    if password is not None:
+        writer.encrypt(password)
+    with path.open("wb") as stream:
+        writer.write(stream)
+    return path

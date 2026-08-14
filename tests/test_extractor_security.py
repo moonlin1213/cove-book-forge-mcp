@@ -4,6 +4,7 @@ import pytest
 
 from cove_book_forge.contracts import BookFormat, BookMetadata, ChapterContent, ExtractedBook
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
+from cove_book_forge.extractors import EpubExtractor
 from cove_book_forge.extractors.base import BookExtractorRegistry
 from cove_book_forge.extractors.security import (
     ExtractionLimits,
@@ -19,10 +20,15 @@ def test_fingerprint_source_is_a_lowercase_sha256_digest(tmp_path: Path) -> None
     source = tmp_path / "synthetic.pdf"
     source.write_bytes(b"%PDF-1.7\nsynthetic")
 
-    assert fingerprint_source(source) == "5aea7a7a5e33d66d021fd52802ceb64ac5b8f377b2be55fddca8607f093ce3ce"
+    assert (
+        fingerprint_source(source)
+        == "5aea7a7a5e33d66d021fd52802ceb64ac5b8f377b2be55fddca8607f093ce3ce"
+    )
 
 
-def test_fingerprint_source_enforces_the_supplied_size_limit_while_streaming(tmp_path: Path) -> None:
+def test_fingerprint_source_enforces_the_supplied_size_limit_while_streaming(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "synthetic.pdf"
     source.write_bytes(b"%PDF-oversized")
 
@@ -93,7 +99,7 @@ def test_post_snapshot_validation_failures_map_to_source_changed(tmp_path: Path)
 def test_registry_dispatches_only_the_detected_format(tmp_path: Path) -> None:
     source = tmp_path / "synthetic.pdf"
     source.write_bytes(b"%PDF-1.7\nsynthetic")
-    registry = BookExtractorRegistry()
+    registry = BookExtractorRegistry({BookFormat.EPUB: EpubExtractor()})
 
     assert registry.get_for_source(source) is None
 

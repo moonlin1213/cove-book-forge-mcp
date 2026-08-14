@@ -1,18 +1,10 @@
 from enum import StrEnum
+from re import Pattern, compile
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-_PUBLIC_DETAIL_KEYS = frozenset({"field", "path"})
-_SENSITIVE_MESSAGE_MARKERS = (
-    "authorization",
-    "bearer",
-    "api key",
-    "api_key",
-    "apikey",
-    "request",
-    "source body",
-)
 _GENERIC_PUBLIC_MESSAGE = "An internal error occurred."
+_PUBLIC_FIELD_PATTERN: Pattern[str] = compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*")
 
 
 class ForgeErrorCode(StrEnum):
@@ -38,6 +30,11 @@ class ForgeErrorCode(StrEnum):
     JOB_CANCELLED = "JOB_CANCELLED"
 
 
+_PUBLIC_MESSAGES = {
+    ForgeErrorCode.CONFIG_INVALID: "Configuration is invalid.",
+}
+
+
 class ForgeErrorDetail(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -57,7 +54,7 @@ class ForgeException(RuntimeError):
         details: dict[str, JsonValue] | None = None,
         cause: BaseException | None = None,
     ) -> None:
-        super().__init__(message)
+        super().__init__(_PUBLIC_MESSAGES.get(code, _GENERIC_PUBLIC_MESSAGE))
         self.code = code
         self.retryable = retryable
         self.details = details or {}
@@ -66,21 +63,14 @@ class ForgeException(RuntimeError):
     def as_result(self) -> dict[str, object]:
         detail = ForgeErrorDetail(
             code=self.code,
-            message=self._public_message(),
+            message=str(self),
             retryable=self.retryable,
             details=self._public_details(),
         )
         return {"ok": False, "error": detail.model_dump(mode="json")}
 
-    def _public_message(self) -> str:
-        message = str(self)
-        if any(marker in message.lower() for marker in _SENSITIVE_MESSAGE_MARKERS):
-            return _GENERIC_PUBLIC_MESSAGE
-        return message
-
     def _public_details(self) -> dict[str, JsonValue]:
-        return {
-            key: value
-            for key, value in self.details.items()
-            if key in _PUBLIC_DETAIL_KEYS and isinstance(value, str)
-        }
+        field = self.details.get("field")
+        if isinstance(field, str) and _PUBLIC_FIELD_PATTERN.fullmatch(field):
+            return {"field": field}
+        return {}

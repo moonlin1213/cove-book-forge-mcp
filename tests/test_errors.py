@@ -1,3 +1,5 @@
+import pytest
+
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 
 
@@ -42,8 +44,41 @@ def test_forge_exception_redacts_sensitive_message_and_details() -> None:
             "code": "MODEL_AUTH_FAILED",
             "message": "An internal error occurred.",
             "retryable": False,
-            "details": {"field": "model.provider", "path": "/books/example.pdf"},
+            "details": {"field": "model.provider"},
         },
     }
     assert "secret" not in str(exc.as_result())
     assert "source body" not in str(exc.as_result())
+
+
+@pytest.mark.parametrize(
+    ("message", "details"),
+    [
+        ("Unmarked source body content: private chapter text.", {}),
+        ("Upstream header X-API-Key: secret-key", {}),
+        ("Your request is invalid.", {}),
+        ("Configuration is invalid.", {"field": "Authorization: Bearer secret"}),
+    ],
+)
+def test_forge_exception_uses_code_owned_message_and_safe_field_only(
+    message: str, details: dict[str, str]
+) -> None:
+    exc = ForgeException(ForgeErrorCode.CONFIG_INVALID, message, details=details)
+
+    assert str(exc) == "Configuration is invalid."
+    assert exc.as_result()["error"] == {
+        "code": "CONFIG_INVALID",
+        "message": "Configuration is invalid.",
+        "retryable": False,
+        "details": {},
+    }
+
+
+def test_forge_exception_keeps_safe_dotted_field_identifier() -> None:
+    exc = ForgeException(
+        ForgeErrorCode.CONFIG_INVALID,
+        "Untrusted caller text.",
+        details={"field": "model.provider"},
+    )
+
+    assert exc.as_result()["error"]["details"] == {"field": "model.provider"}

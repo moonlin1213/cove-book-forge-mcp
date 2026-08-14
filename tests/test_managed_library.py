@@ -1,4 +1,5 @@
 import io
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -710,6 +711,117 @@ def test_book_directory_created_before_open_failure_is_removed(
 
     assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
     assert not (data_dir / "books" / fixed_uuid.hex).exists()
+    assert library.list_books() == ()
+
+
+def test_book_directory_created_before_initial_identity_failure_is_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    fixed_uuid = UUID(int=26)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    library = _initialized_library(data_dir)
+    real_stat = library_service.os.stat
+    injected = False
+
+    def fail_initial_book_identity(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal injected
+        if (
+            not injected
+            and path == fixed_uuid.hex
+            and kwargs.get("dir_fd") == library._books_fd
+            and kwargs.get("follow_symlinks") is False
+        ):
+            injected = True
+            raise OSError("private initial book identity failed")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(library_service.os, "stat", fail_initial_book_identity)
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    books_dir = data_dir / "books"
+    assert injected is True
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert "private initial book identity failed" not in str(exc_info.value)
+    assert tuple(books_dir.iterdir()) == ()
+    assert library.list_books() == ()
+
+
+def test_initial_identity_failure_cleanup_preserves_same_name_competitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    fixed_uuid = UUID(int=27)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    library = _initialized_library(data_dir)
+    real_stat = library_service.os.stat
+    real_rename = library_service.os.rename
+    identity_failure_injected = False
+    competitor_injected = False
+    competitor_identity: tuple[int, int] | None = None
+    detached_owned = data_dir / "books" / "detached-owned"
+
+    def fail_initial_book_identity(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal competitor_identity, competitor_injected, identity_failure_injected
+        if (
+            not identity_failure_injected
+            and path == fixed_uuid.hex
+            and kwargs.get("dir_fd") == library._books_fd
+            and kwargs.get("follow_symlinks") is False
+        ):
+            identity_failure_injected = True
+            competitor_injected = True
+            books_fd = kwargs.get("dir_fd")
+            real_rename(
+                path,
+                detached_owned.name,
+                src_dir_fd=books_fd,
+                dst_dir_fd=books_fd,
+            )  # type: ignore[arg-type]
+            library_service.os.mkdir(
+                fixed_uuid.hex,
+                mode=0o700,
+                dir_fd=library._books_fd,
+            )
+            competitor_status = real_stat(
+                fixed_uuid.hex,
+                dir_fd=library._books_fd,
+                follow_symlinks=False,
+            )
+            competitor_identity = competitor_status.st_dev, competitor_status.st_ino
+            raise OSError("private initial book identity failed")
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(library_service.os, "stat", fail_initial_book_identity)
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    assert competitor_identity is not None
+    surviving_competitors = tuple(
+        path
+        for path in (data_dir / "books").rglob("*")
+        if path.is_dir()
+        and (path.stat(follow_symlinks=False).st_dev, path.stat(follow_symlinks=False).st_ino)
+        == competitor_identity
+    )
+    assert identity_failure_injected is True
+    assert competitor_injected is True
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert len(surviving_competitors) == 1
+    assert detached_owned.is_dir()
     assert library.list_books() == ()
 
 

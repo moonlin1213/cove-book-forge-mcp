@@ -39,7 +39,7 @@ class _ManagedImportAttempt:
     book_name: str
     stage_name: str
     final_name: str
-    book_identity: _FileIdentity
+    book_identity: _FileIdentity | None
     owned_book_dir: bool
     stage_identity: _FileIdentity | None = None
     final_identity: _FileIdentity | None = None
@@ -129,7 +129,10 @@ def _require_secure_directory_primitives() -> None:
         raise _path_not_allowed()
 
 
-def _open_directory_at(parent_fd: int, name: str) -> int:
+def _open_directory_capability_at(
+    parent_fd: int,
+    name: str,
+) -> tuple[int, _FileIdentity]:
     descriptor: int | None = None
     try:
         descriptor = os.open(
@@ -137,9 +140,10 @@ def _open_directory_at(parent_fd: int, name: str) -> int:
             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
             dir_fd=parent_fd,
         )
-        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        status = os.fstat(descriptor)
+        if not stat.S_ISDIR(status.st_mode):
             raise _path_not_allowed()
-        return descriptor
+        return descriptor, _status_identity(status)
     except ForgeException:
         if descriptor is not None:
             with suppress(OSError):
@@ -150,6 +154,11 @@ def _open_directory_at(parent_fd: int, name: str) -> int:
             with suppress(OSError):
                 os.close(descriptor)
         raise _path_not_allowed(exc) from exc
+
+
+def _open_directory_at(parent_fd: int, name: str) -> int:
+    descriptor, _identity = _open_directory_capability_at(parent_fd, name)
+    return descriptor
 
 
 def _matches_identity(parent_fd: int, name: str, identity: _FileIdentity) -> bool:
@@ -217,14 +226,17 @@ def _close_book_descriptor(attempt: _ManagedImportAttempt) -> None:
 def _remove_owned_book_directory(
     books_fd: int,
     book_name: str,
-    identity: _FileIdentity,
+    identity: _FileIdentity | None,
 ) -> None:
     quarantine_name = f".cleanup-book-{uuid4().hex}"
+    source_fd: int | None = None
     quarantine_fd: int | None = None
     candidate_fd: int | None = None
     owned_quarantine = False
     candidate_name = "candidate"
     try:
+        if identity is None:
+            source_fd, identity = _open_directory_capability_at(books_fd, book_name)
         os.mkdir(quarantine_name, mode=0o700, dir_fd=books_fd)
         owned_quarantine = True
         quarantine_fd = _open_directory_at(books_fd, quarantine_name)
@@ -246,6 +258,9 @@ def _remove_owned_book_directory(
         if candidate_fd is not None:
             with suppress(OSError):
                 os.close(candidate_fd)
+        if source_fd is not None:
+            with suppress(OSError):
+                os.close(source_fd)
         if quarantine_fd is not None:
             with suppress(OSError):
                 os.close(quarantine_fd)
@@ -468,26 +483,25 @@ class BookLibrary:
                 pass
             except OSError as exc:
                 raise _storage_unavailable(exc) from exc
-            try:
-                book_status = os.stat(book_name, dir_fd=books_fd, follow_symlinks=False)
-                if not stat.S_ISDIR(book_status.st_mode):
-                    raise _path_not_allowed()
-                book_identity = _status_identity(book_status)
-            except OSError as exc:
-                raise _storage_unavailable(exc) from exc
             attempt = _ManagedImportAttempt(
                 books_fd=books_fd,
                 book_fd=None,
                 book_name=book_name,
                 stage_name=stage_name,
                 final_name=final_name,
-                book_identity=book_identity,
+                book_identity=None,
                 owned_book_dir=owned_book_dir,
             )
             book_fd = _open_directory_at(books_fd, book_name)
             attempt.book_fd = book_fd
             try:
-                if _status_identity(os.fstat(book_fd)) != book_identity:
+                book_identity = _status_identity(os.fstat(book_fd))
+                attempt.book_identity = book_identity
+                book_status = os.stat(book_name, dir_fd=books_fd, follow_symlinks=False)
+                if (
+                    not stat.S_ISDIR(book_status.st_mode)
+                    or _status_identity(book_status) != book_identity
+                ):
                     raise _path_not_allowed()
             except OSError as exc:
                 raise _storage_unavailable(exc) from exc

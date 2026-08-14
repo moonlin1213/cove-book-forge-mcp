@@ -198,7 +198,17 @@ def test_pdf_accepts_a_genuinely_short_text_layer(tmp_path: Path) -> None:
     assert extracted.chapters[0].content == "Short note."
 
 
-@pytest.mark.parametrize("page_number", ["Page 1 of 2", "1 / 2", "- 1 -"])
+@pytest.mark.parametrize(
+    "page_number",
+    [
+        "Page 1 of 2",
+        "1 / 2",
+        "- 1 -",
+        "- Page 1 -",
+        "Page 1 of 2.",
+        "( Page 1 of 2 )",
+    ],
+)
 def test_pdf_requires_ocr_for_common_page_number_only_documents(
     tmp_path: Path, page_number: str
 ) -> None:
@@ -216,6 +226,16 @@ def test_pdf_accepts_a_two_letter_text_layer(tmp_path: Path) -> None:
     extracted = PdfExtractor().extract(source, FINGERPRINT)
 
     assert extracted.chapters[0].content == "Hi."
+
+
+@pytest.mark.parametrize("formula", ["x = 1 + 2", "2 + 2 = 4"])
+def test_pdf_accepts_and_preserves_a_single_short_formula(tmp_path: Path, formula: str) -> None:
+    source = write_pdf(tmp_path / "short-formula.pdf", pages=[[(400, formula)]])
+
+    extracted = PdfExtractor().extract(source, FINGERPRINT)
+
+    assert extracted.chapters[0].content == formula
+    assert extracted.pdf_profile is PdfProfile.TEXT
 
 
 def test_pdf_marks_structurally_technical_content(tmp_path: Path) -> None:

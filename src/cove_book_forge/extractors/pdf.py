@@ -25,7 +25,11 @@ _REPEATED_EDGE_MIN_PAGES = 3
 _FALLBACK_BLOCK_PAGES = 20
 _MIN_MEANINGFUL_LETTERS = 2
 _PAGE_NUMBER = re.compile(r"(?i)(?:page\s+)?(?:\d{1,6}|[ivxlcdm]{1,12})")
-_PAGINATION_LINE = re.compile(r"(?i)(?:page\s+)?\d{1,6}\s*(?:of|/)\s*\d{1,6}")
+_PAGINATION_LINE = re.compile(
+    r"(?i)\s*(?:[-–—]\s*)?(?:[(\[{]\s*)?"
+    r"(?:page\s+\d{1,6}(?:\s*(?:of|/)\s*\d{1,6})?|\d{1,6}\s*(?:of|/)\s*\d{1,6})"
+    r"\s*[.!?]?\s*(?:[)\]}]\s*)?(?:[-–—]\s*)?"
+)
 _DEFINITION_LINE = re.compile(
     r"^(?:(?:async\s+)?(?:def|function)\s+[A-Za-z_]\w*\s*\([^)]*\)\s*(?::|\{)"
     r"|class\s+[A-Za-z_]\w*(?:\s*\([^)]*\))?\s*(?::|\{))$"
@@ -42,6 +46,11 @@ _INDENTED_OPERATOR_LINE = re.compile(
     r"|[A-Za-z_]\w*(?:(?:\.[A-Za-z_]\w*)|(?:\[[^]]+\]))*\s*(?:[+*/-]?=|:=)\s*\S)"
 )
 _FORMULA_LINE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*\s*=\s*[^=].*[+*/^−-]")
+_EQUATION_ATOM = r"(?:[^\W\d_]\w*|\d+(?:\.\d+)?)"
+_EQUATION_EXPRESSION = rf"{_EQUATION_ATOM}(?:\s*[+*/^×÷−-]\s*{_EQUATION_ATOM})*"
+_SHORT_EQUATION = re.compile(
+    rf"{_EQUATION_EXPRESSION}\s*(?:=|==|≈|≠|<=|>=|≤|≥)\s*{_EQUATION_EXPRESSION}"
+)
 
 
 class LayoutPdfExtractor(Protocol):
@@ -156,27 +165,23 @@ def _clean_page(
 
 
 def _has_meaningful_text(page_texts: Sequence[str]) -> bool:
-    # Two Unicode letters outside complete pagination and numeric/punctuation-only
-    # lines reject scan noise while accepting genuinely tiny prose such as "Hi".
-    candidate_lines = (
-        line
-        for text in page_texts
-        for line in text.splitlines()
-        if not _is_meaningless_text_line(line)
-    )
-    return sum(character.isalpha() for line in candidate_lines for character in line) >= (
-        _MIN_MEANINGFUL_LETTERS
-    )
+    # A complete small equation or two Unicode letters outside pagination is
+    # meaningful. Numeric/punctuation-only scan noise contributes neither signal.
+    letter_count = 0
+    for line in (line for text in page_texts for line in text.splitlines()):
+        stripped = line.strip()
+        if not stripped or _is_pagination_line(stripped):
+            continue
+        if _SHORT_EQUATION.fullmatch(stripped):
+            return True
+        letter_count += sum(character.isalpha() for character in stripped)
+        if letter_count >= _MIN_MEANINGFUL_LETTERS:
+            return True
+    return False
 
 
-def _is_meaningless_text_line(line: str) -> bool:
-    stripped = line.strip()
-    return bool(
-        not stripped
-        or _PAGE_NUMBER.fullmatch(stripped)
-        or _PAGINATION_LINE.fullmatch(stripped)
-        or not any(character.isalpha() for character in stripped)
-    )
+def _is_pagination_line(line: str) -> bool:
+    return bool(_PAGE_NUMBER.fullmatch(line) or _PAGINATION_LINE.fullmatch(line))
 
 
 def _flatten_outline(items: Iterable[Any]) -> Iterable[Any]:

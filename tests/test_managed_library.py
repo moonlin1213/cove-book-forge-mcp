@@ -20,6 +20,7 @@ from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.extractors import BookExtractorRegistry
 from cove_book_forge.extractors.security import ExtractionLimits
 from cove_book_forge.library import BookLibrary, LibraryDatabase, LibraryRepository
+from cove_book_forge.library import database as library_database
 from cove_book_forge.library import service as library_service
 
 
@@ -399,6 +400,50 @@ def test_database_operation_is_anchored_when_root_changes_after_the_guard(
     assert tuple(outside.iterdir()) == ()
 
 
+def test_first_database_open_is_anchored_when_root_changes_immediately_before_connect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    original_root = tmp_path / "original-library"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    database = LibraryDatabase(data_dir / "library.sqlite3")
+    library = BookLibrary(
+        _config(data_dir),
+        registry=_registry(),
+        repository=LibraryRepository(database),
+    )
+    real_connect = library_database.sqlite3.connect
+    replaced = False
+
+    def replace_root_then_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            data_dir.rename(original_root)
+            data_dir.symlink_to(outside, target_is_directory=True)
+        return real_connect(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(library_database.sqlite3, "connect", replace_root_then_connect)
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.initialize()
+
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert tuple(outside.iterdir()) == ()
+    assert not (original_root / "library.sqlite3").exists()
+
+    data_dir.unlink()
+    original_root.rename(data_dir)
+    library.initialize()
+    library.initialize()
+
+    assert library.list_books() == ()
+    with database.connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
 def test_data_root_replacement_before_managed_book_directory_write_creates_nothing_outside(
     tmp_path: Path,
 ) -> None:
@@ -589,6 +634,83 @@ def test_persistence_failure_rolls_back_and_cleans_published_copy(tmp_path: Path
     assert str(data_dir) not in str(exc_info.value)
     assert library.list_books() == ()
     assert not (data_dir / "books").exists() or not tuple((data_dir / "books").rglob("source.pdf"))
+
+
+def test_book_directory_cleanup_preserves_a_competitor_created_before_rmdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    fixed_uuid = UUID(int=24)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    database = FailingCommitDatabase(data_dir / "library.sqlite3")
+    library = _initialized_library(data_dir, repository=LibraryRepository(database))
+    book_dir = data_dir / "books" / fixed_uuid.hex
+    detached_owned = data_dir / "books" / "detached-owned"
+    real_rmdir = library_service.os.rmdir
+    injected = False
+
+    def replace_book_before_rmdir(
+        name: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal injected
+        if not injected and Path(name).name == fixed_uuid.hex:
+            injected = True
+            books_fd = kwargs.get("dir_fd")
+            library_service.os.rename(
+                name,
+                detached_owned.name,
+                src_dir_fd=books_fd,
+                dst_dir_fd=books_fd,
+            )
+            library_service.os.mkdir(name, mode=0o700, dir_fd=books_fd)
+        elif not injected and Path(name).name == "candidate":
+            injected = True
+            books_fd = library._books_fd
+            assert books_fd is not None
+            library_service.os.mkdir(fixed_uuid.hex, mode=0o700, dir_fd=books_fd)
+        real_rmdir(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(library_service.os, "rmdir", replace_book_before_rmdir)
+    database.fail_before_commit = True
+
+    with pytest.raises(ForgeException):
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    assert book_dir.is_dir()
+    assert not detached_owned.exists()
+    assert library.list_books() == ()
+
+
+def test_book_directory_created_before_open_failure_is_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    fixed_uuid = UUID(int=25)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    library = _initialized_library(data_dir)
+    real_open_directory = library_service._open_directory_at
+
+    def fail_book_directory_open(parent_fd: int, name: str) -> int:
+        if name == fixed_uuid.hex:
+            raise ForgeException(
+                ForgeErrorCode.PATH_NOT_ALLOWED,
+                "Library path is not allowed.",
+                cause=OSError("private book open failed"),
+            )
+        return real_open_directory(parent_fd, name)
+
+    monkeypatch.setattr(library_service, "_open_directory_at", fail_book_directory_open)
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert not (data_dir / "books" / fixed_uuid.hex).exists()
+    assert library.list_books() == ()
 
 
 def test_commit_failure_preserves_a_competitor_that_replaces_the_published_final(

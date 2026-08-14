@@ -35,7 +35,7 @@ _FileIdentity = tuple[int, int]
 @dataclass
 class _ManagedImportAttempt:
     books_fd: int
-    book_fd: int
+    book_fd: int | None
     book_name: str
     stage_name: str
     final_name: str
@@ -208,21 +208,68 @@ def _unlink_matching(
 
 
 def _close_book_descriptor(attempt: _ManagedImportAttempt) -> None:
-    if not attempt.book_fd_closed:
+    if not attempt.book_fd_closed and attempt.book_fd is not None:
         attempt.book_fd_closed = True
         with suppress(OSError):
             os.close(attempt.book_fd)
 
 
+def _remove_owned_book_directory(
+    books_fd: int,
+    book_name: str,
+    identity: _FileIdentity,
+) -> None:
+    quarantine_name = f".cleanup-book-{uuid4().hex}"
+    quarantine_fd: int | None = None
+    candidate_fd: int | None = None
+    owned_quarantine = False
+    candidate_name = "candidate"
+    try:
+        os.mkdir(quarantine_name, mode=0o700, dir_fd=books_fd)
+        owned_quarantine = True
+        quarantine_fd = _open_directory_at(books_fd, quarantine_name)
+        os.rename(
+            book_name,
+            candidate_name,
+            src_dir_fd=books_fd,
+            dst_dir_fd=quarantine_fd,
+        )
+        candidate_fd = _open_directory_at(quarantine_fd, candidate_name)
+        if _status_identity(os.fstat(candidate_fd)) != identity:
+            return
+        os.close(candidate_fd)
+        candidate_fd = None
+        os.rmdir(candidate_name, dir_fd=quarantine_fd)
+    except (ForgeException, OSError):
+        pass
+    finally:
+        if candidate_fd is not None:
+            with suppress(OSError):
+                os.close(candidate_fd)
+        if quarantine_fd is not None:
+            with suppress(OSError):
+                os.close(quarantine_fd)
+        if owned_quarantine:
+            with suppress(OSError):
+                os.rmdir(quarantine_name, dir_fd=books_fd)
+
+
 def _remove_attempt_files(attempt: _ManagedImportAttempt) -> None:
-    _unlink_matching(attempt.book_fd, attempt.stage_name, attempt.stage_identity)
-    _unlink_matching(attempt.book_fd, attempt.final_name, attempt.final_identity)
+    remove_book_directory = attempt.owned_book_dir
+    if attempt.book_fd is not None:
+        _unlink_matching(attempt.book_fd, attempt.stage_name, attempt.stage_identity)
+        _unlink_matching(attempt.book_fd, attempt.final_name, attempt.final_identity)
+        try:
+            remove_book_directory = remove_book_directory and not os.listdir(attempt.book_fd)
+        except OSError:
+            remove_book_directory = False
     _close_book_descriptor(attempt)
-    if attempt.owned_book_dir and _matches_identity(
-        attempt.books_fd, attempt.book_name, attempt.book_identity
-    ):
-        with suppress(OSError):
-            os.rmdir(attempt.book_name, dir_fd=attempt.books_fd)
+    if remove_book_directory:
+        _remove_owned_book_directory(
+            attempt.books_fd,
+            attempt.book_name,
+            attempt.book_identity,
+        )
 
 
 def _copy_source_to_stage(
@@ -339,6 +386,7 @@ class BookLibrary:
                 raise _path_not_allowed()
             self._data_root_identity = actual_identity
             self._data_root_fd = descriptor
+            self._repository.bind_database_anchor(descriptor, self._assert_data_root_identity)
         with self._data_root_guard():
             self._repository.initialize()
         self._initialized = True
@@ -409,6 +457,9 @@ class BookLibrary:
         try:
             books_fd = self._managed_books_descriptor()
             book_name = imported.book.book_id
+            extension = imported.format.value
+            stage_name = f".source-{uuid4().hex}.tmp"
+            final_name = f"source.{extension}"
             owned_book_dir = False
             try:
                 os.mkdir(book_name, mode=0o700, dir_fd=books_fd)
@@ -417,30 +468,36 @@ class BookLibrary:
                 pass
             except OSError as exc:
                 raise _storage_unavailable(exc) from exc
-            book_fd = _open_directory_at(books_fd, book_name)
             try:
-                book_identity = _status_identity(os.fstat(book_fd))
+                book_status = os.stat(book_name, dir_fd=books_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(book_status.st_mode):
+                    raise _path_not_allowed()
+                book_identity = _status_identity(book_status)
             except OSError as exc:
-                with suppress(OSError):
-                    os.close(book_fd)
                 raise _storage_unavailable(exc) from exc
-            extension = imported.format.value
-            stage_name = f".source-{uuid4().hex}.tmp"
-            final_name = f"source.{extension}"
             attempt = _ManagedImportAttempt(
                 books_fd=books_fd,
-                book_fd=book_fd,
+                book_fd=None,
                 book_name=book_name,
                 stage_name=stage_name,
                 final_name=final_name,
                 book_identity=book_identity,
                 owned_book_dir=owned_book_dir,
             )
+            book_fd = _open_directory_at(books_fd, book_name)
+            attempt.book_fd = book_fd
+            try:
+                if _status_identity(os.fstat(book_fd)) != book_identity:
+                    raise _path_not_allowed()
+            except OSError as exc:
+                raise _storage_unavailable(exc) from exc
             stage = self._data_root / "books" / book_name / stage_name
 
             def open_anchored_stage(_path: Path, mode: str) -> BinaryIO:
                 if mode != "xb" or attempt is None:
                     raise OSError("invalid managed stage mode")
+                if attempt.book_fd is None:
+                    raise OSError("managed book directory is unavailable")
                 flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
                 descriptor = os.open(
                     attempt.stage_name,
@@ -473,7 +530,7 @@ class BookLibrary:
             )
 
             def publish() -> None:
-                if attempt is None or attempt.stage_identity is None:
+                if attempt is None or attempt.book_fd is None or attempt.stage_identity is None:
                     raise _path_not_allowed()
                 with self._data_root_guard():
                     try:

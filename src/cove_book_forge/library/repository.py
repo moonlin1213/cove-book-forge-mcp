@@ -51,6 +51,13 @@ class LibraryRepository:
     def __init__(self, database: LibraryDatabase) -> None:
         self._database = database
 
+    def bind_database_anchor(
+        self,
+        directory_fd: int,
+        validate: Callable[[], None],
+    ) -> None:
+        self._database.bind_file_anchor(directory_fd, "library.sqlite3", validate)
+
     def initialize(self) -> None:
         self._database.initialize()
 

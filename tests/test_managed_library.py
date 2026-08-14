@@ -1,7 +1,9 @@
+import io
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -18,6 +20,7 @@ from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.extractors import BookExtractorRegistry
 from cove_book_forge.extractors.security import ExtractionLimits
 from cove_book_forge.library import BookLibrary, LibraryDatabase, LibraryRepository
+from cove_book_forge.library import service as library_service
 
 
 class SyntheticPdfExtractor:
@@ -50,6 +53,33 @@ class FailingCommitDatabase(LibraryDatabase):
             yield connection
             if self.fail_before_commit:
                 raise sqlite3.OperationalError("INSERT private SQL failed before commit")
+
+
+class FlushFailingStream(io.BytesIO):
+    def flush(self) -> None:
+        raise OSError("flush failed at /private/stage.pdf")
+
+
+class CloseFailingStream(io.BytesIO):
+    def close(self) -> None:
+        if not self.closed:
+            super().close()
+            raise OSError("close failed at /private/stage.pdf")
+
+
+class ReadAndCloseFailingStream(io.BytesIO):
+    def __init__(self, initial_bytes: bytes) -> None:
+        super().__init__(initial_bytes)
+        self.read_error = OSError("read failed at /private/source.pdf")
+        self.close_error = OSError("close failed at /private/source.pdf")
+
+    def read(self, size: int = -1) -> bytes:
+        raise self.read_error
+
+    def close(self) -> None:
+        if not self.closed:
+            super().close()
+            raise self.close_error
 
 
 def _config(
@@ -280,6 +310,66 @@ def test_unsafe_data_roots_and_managed_tree_symlinks_are_rejected(tmp_path: Path
     assert tuple(outside.iterdir()) == ()
 
 
+@pytest.mark.parametrize("operation", ["list", "get", "reference_import"])
+def test_initialized_data_root_identity_is_required_for_every_database_operation(
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    data_dir = tmp_path / "library"
+    library = _initialized_library(data_dir)
+    imported = library.import_book(_source(tmp_path / "first.pdf"), ImportMode.REFERENCE)
+
+    original_root = tmp_path / "original-library"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    data_dir.rename(original_root)
+    data_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ForgeException) as exc_info:
+        if operation == "list":
+            library.list_books()
+        elif operation == "get":
+            library.get_book(imported.book)
+        else:
+            library.import_book(
+                _source(tmp_path / "second.pdf", b"%PDF-1.7\nsecond"),
+                ImportMode.REFERENCE,
+            )
+
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert tuple(outside.iterdir()) == ()
+
+
+def test_data_root_replacement_before_managed_book_directory_write_creates_nothing_outside(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "library"
+    original_root = tmp_path / "original-library"
+    outside = tmp_path / "outside"
+    outside_books = outside / "books"
+    outside_books.mkdir(parents=True)
+
+    class ReplaceRootAfterBooksLookupLibrary(BookLibrary):
+        armed = False
+
+        def _managed_books_directory(self) -> Path:
+            books_dir = super()._managed_books_directory()
+            if self.armed:
+                data_dir.rename(original_root)
+                data_dir.symlink_to(outside, target_is_directory=True)
+            return books_dir
+
+    library = ReplaceRootAfterBooksLookupLibrary(_config(data_dir), registry=_registry())
+    library.initialize()
+    library.armed = True
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert tuple(outside_books.iterdir()) == ()
+
+
 def test_source_change_during_copy_persists_nothing(tmp_path: Path) -> None:
     source = _source(tmp_path / "book.pdf")
     data_dir = tmp_path / "library"
@@ -301,6 +391,63 @@ def test_source_change_during_copy_persists_nothing(tmp_path: Path) -> None:
     assert not (data_dir / "books").exists() or not tuple((data_dir / "books").rglob("source.pdf"))
 
 
+def test_copy_publish_preserves_a_preexisting_final_and_book_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    source = _source(tmp_path / "book.pdf")
+    library = _initialized_library(data_dir)
+    fixed_uuid = UUID(int=1)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    book_dir = data_dir / "books" / fixed_uuid.hex
+    book_dir.mkdir(parents=True)
+    final = book_dir / "source.pdf"
+    competitor = b"competitor-owned"
+    final.write_bytes(competitor)
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(source, ImportMode.COPY)
+
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert final.read_bytes() == competitor
+    assert book_dir.is_dir()
+    assert library.list_books() == ()
+
+
+def test_copy_publish_race_never_overwrites_or_deletes_the_competing_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    source = _source(tmp_path / "book.pdf")
+    library = _initialized_library(data_dir)
+    fixed_uuid = UUID(int=2)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    final = data_dir / "books" / fixed_uuid.hex / "source.pdf"
+    competitor = b"racing-competitor"
+    real_replace = library_service.os.replace
+    real_link = library_service.os.link
+
+    def racing_replace(source_path: Path, destination: Path) -> None:
+        Path(destination).write_bytes(competitor)
+        real_replace(source_path, destination)
+
+    def racing_link(source_path: Path, destination: Path) -> None:
+        Path(destination).write_bytes(competitor)
+        real_link(source_path, destination)
+
+    monkeypatch.setattr(library_service.os, "replace", racing_replace)
+    monkeypatch.setattr(library_service.os, "link", racing_link)
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(source, ImportMode.COPY)
+
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert final.read_bytes() == competitor
+    assert library.list_books() == ()
+
+
 def test_persistence_failure_rolls_back_and_cleans_published_copy(tmp_path: Path) -> None:
     data_dir = tmp_path / "library"
     source = _source(tmp_path / "book.pdf")
@@ -317,3 +464,52 @@ def test_persistence_failure_rolls_back_and_cleans_published_copy(tmp_path: Path
     assert str(data_dir) not in str(exc_info.value)
     assert library.list_books() == ()
     assert not (data_dir / "books").exists() or not tuple((data_dir / "books").rglob("source.pdf"))
+
+
+@pytest.mark.parametrize("stream_type", [FlushFailingStream, CloseFailingStream])
+def test_copy_stage_flush_and_close_failures_are_safe_storage_errors(
+    tmp_path: Path,
+    stream_type: type[io.BytesIO],
+) -> None:
+    source = _source(tmp_path / "book.pdf")
+    stage = tmp_path / "private-stage.tmp"
+    target_stream = stream_type()
+
+    def stage_opener(path: Path, mode: str) -> io.BytesIO:
+        assert (path, mode) == (stage, "xb")
+        return target_stream
+
+    with pytest.raises(ForgeException) as exc_info:
+        library_service._copy_source_to_stage(
+            source,
+            stage,
+            limits=ExtractionLimits(max_source_bytes=64),
+            stage_opener=stage_opener,
+        )
+
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert "/private" not in str(exc_info.value)
+
+
+def test_source_close_failure_does_not_override_a_safe_read_error(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "private-source.pdf"
+    stage = tmp_path / "stage.tmp"
+    source_stream = ReadAndCloseFailingStream(b"unread")
+
+    def source_opener(path: Path, mode: str) -> io.BytesIO:
+        assert (path, mode) == (source, "rb")
+        return source_stream
+
+    with pytest.raises(ForgeException) as exc_info:
+        library_service._copy_source_to_stage(
+            source,
+            stage,
+            limits=ExtractionLimits(max_source_bytes=64),
+            source_opener=source_opener,
+        )
+
+    assert exc_info.value.code is ForgeErrorCode.SOURCE_CHANGED
+    assert "/private" not in str(exc_info.value)
+    assert exc_info.value.__cause__ is source_stream.read_error

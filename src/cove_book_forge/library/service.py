@@ -2,9 +2,10 @@ import hashlib
 import os
 import sqlite3
 import stat
-from collections.abc import Callable
-from contextlib import suppress
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, suppress
 from pathlib import Path
+from typing import BinaryIO, cast
 from uuid import uuid4
 
 from cove_book_forge.config import AppConfig, library_data_path
@@ -26,6 +27,7 @@ from cove_book_forge.library.repository import (
 )
 
 _HASH_CHUNK_SIZE = 1024 * 1024
+_BinaryOpener = Callable[[Path, str], BinaryIO]
 
 
 def _path_not_allowed(cause: BaseException | None = None) -> ForgeException:
@@ -50,6 +52,10 @@ def _source_changed(cause: BaseException | None = None) -> ForgeException:
         "Source changed while it was copied.",
         cause=cause,
     )
+
+
+def _open_binary(path: Path, mode: str) -> BinaryIO:
+    return cast(BinaryIO, path.open(mode))
 
 
 def _validate_data_root(path: Path) -> Path:
@@ -83,20 +89,39 @@ def _ensure_directory(path: Path) -> None:
         raise _storage_unavailable(exc) from exc
 
 
-def _remove_attempt_files(stage: Path | None, final: Path | None, book_dir: Path | None) -> None:
-    for path in (stage, final):
-        if path is None:
-            continue
+def _directory_identity(path: Path) -> tuple[int, int]:
+    try:
+        status = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise _path_not_allowed(exc) from exc
+    if not stat.S_ISDIR(status.st_mode):
+        raise _path_not_allowed()
+    return status.st_dev, status.st_ino
+
+
+def _remove_attempt_files(
+    stage: Path | None,
+    final: Path | None,
+    book_dir: Path | None,
+    *,
+    published_final: bool,
+    owned_book_dir: bool,
+) -> None:
+    if stage is not None:
         try:
-            if path.is_file() or path.is_symlink():
-                path.unlink()
+            if stage.is_file() or stage.is_symlink():
+                stage.unlink()
         except OSError:
             pass
-    if book_dir is not None:
+    if published_final and final is not None:
+        try:
+            if final.is_file() or final.is_symlink():
+                final.unlink()
+        except OSError:
+            pass
+    if owned_book_dir and book_dir is not None:
         with suppress(OSError):
             book_dir.rmdir()
-        with suppress(OSError):
-            book_dir.parent.rmdir()
 
 
 def _copy_source_to_stage(
@@ -104,39 +129,66 @@ def _copy_source_to_stage(
     stage: Path,
     *,
     limits: ExtractionLimits,
+    source_opener: _BinaryOpener = _open_binary,
+    stage_opener: _BinaryOpener = _open_binary,
 ) -> str:
     digest = hashlib.sha256()
     bytes_read = 0
-    try:
-        source_stream = source.open("rb")
-    except OSError as exc:
-        raise _source_changed(exc) from exc
+    source_stream: BinaryIO | None = None
+    target_stream: BinaryIO | None = None
+    failure: BaseException | None = None
+    fingerprint: str | None = None
     try:
         try:
-            target_stream = stage.open("xb")
+            source_stream = source_opener(source, "rb")
+        except OSError as exc:
+            raise _source_changed(exc) from exc
+        try:
+            target_stream = stage_opener(stage, "xb")
         except OSError as exc:
             raise _storage_unavailable(exc) from exc
-        with target_stream:
-            while True:
-                try:
-                    chunk = source_stream.read(
-                        min(_HASH_CHUNK_SIZE, limits.max_source_bytes - bytes_read + 1)
-                    )
-                except OSError as exc:
-                    raise _source_changed(exc) from exc
-                if not chunk:
-                    break
-                bytes_read += len(chunk)
-                if bytes_read > limits.max_source_bytes:
-                    raise _source_changed()
-                digest.update(chunk)
-                try:
-                    target_stream.write(chunk)
-                except OSError as exc:
-                    raise _storage_unavailable(exc) from exc
+        while True:
+            try:
+                chunk = source_stream.read(
+                    min(_HASH_CHUNK_SIZE, limits.max_source_bytes - bytes_read + 1)
+                )
+            except OSError as exc:
+                raise _source_changed(exc) from exc
+            if not chunk:
+                break
+            bytes_read += len(chunk)
+            if bytes_read > limits.max_source_bytes:
+                raise _source_changed()
+            digest.update(chunk)
+            try:
+                target_stream.write(chunk)
+            except OSError as exc:
+                raise _storage_unavailable(exc) from exc
+        try:
+            target_stream.flush()
+        except OSError as exc:
+            raise _storage_unavailable(exc) from exc
+        fingerprint = digest.hexdigest()
+    except BaseException as exc:
+        failure = exc
     finally:
-        source_stream.close()
-    return digest.hexdigest()
+        if target_stream is not None:
+            try:
+                target_stream.close()
+            except OSError as exc:
+                if failure is None:
+                    failure = _storage_unavailable(exc)
+        if source_stream is not None:
+            try:
+                source_stream.close()
+            except OSError as exc:
+                if failure is None:
+                    failure = _source_changed(exc)
+    if failure is not None:
+        raise failure
+    if fingerprint is None:
+        raise _source_changed()
+    return fingerprint
 
 
 class BookLibrary:
@@ -155,15 +207,19 @@ class BookLibrary:
         self._repository = repository or LibraryRepository(
             LibraryDatabase(self._data_root / "library.sqlite3")
         )
+        self._data_root_identity: tuple[int, int] | None = None
         self._initialized = False
 
     def initialize(self) -> None:
-        if _validate_data_root(self._data_root) != self._data_root:
-            raise _path_not_allowed()
-        _ensure_directory(self._data_root)
-        if _validate_data_root(self._data_root) != self._data_root:
-            raise _path_not_allowed()
-        self._repository.initialize()
+        if self._data_root_identity is None:
+            if _validate_data_root(self._data_root) != self._data_root:
+                raise _path_not_allowed()
+            _ensure_directory(self._data_root)
+            if _validate_data_root(self._data_root) != self._data_root:
+                raise _path_not_allowed()
+            self._data_root_identity = _directory_identity(self._data_root)
+        with self._data_root_guard():
+            self._repository.initialize()
         self._initialized = True
 
     def import_book(self, source: Path, mode: ImportMode | None = None) -> ImportedBook:
@@ -173,49 +229,54 @@ class BookLibrary:
                 "Managed library is disabled.",
             )
         self._require_initialized()
-        selected_mode = mode or (
-            ImportMode.COPY if self._config.library.copy_imports else ImportMode.REFERENCE
-        )
-        extracted = self._registry.extract(source)
-        existing = self._repository.find_managed_book(
-            extracted.format,
-            extracted.source_fingerprint,
-        )
-        if existing is not None:
-            return existing.imported
-
-        imported = ImportedBook(
-            book=BookRef(book_id=uuid4().hex),
-            metadata=extracted.metadata,
-            format=extracted.format,
-            import_mode=selected_mode,
-            source_fingerprint=extracted.source_fingerprint,
-        )
-        if selected_mode is ImportMode.REFERENCE:
-            try:
-                reference_source = source.resolve(strict=True)
-            except (OSError, RuntimeError, ValueError) as exc:
-                raise _source_changed(exc) from exc
-            record = self._repository.new_record(
-                imported,
-                managed_source_path=None,
-                reference_source_path=reference_source,
+        with self._data_root_guard():
+            selected_mode = mode or (
+                ImportMode.COPY if self._config.library.copy_imports else ImportMode.REFERENCE
             )
-            return self._persist(record, extracted.chapters).record.imported
+            extracted = self._registry.extract(source)
+            with self._data_root_guard():
+                existing = self._repository.find_managed_book(
+                    extracted.format,
+                    extracted.source_fingerprint,
+                )
+            if existing is not None:
+                return existing.imported
 
-        return self._import_copy(source, imported, extracted.chapters)
+            imported = ImportedBook(
+                book=BookRef(book_id=uuid4().hex),
+                metadata=extracted.metadata,
+                format=extracted.format,
+                import_mode=selected_mode,
+                source_fingerprint=extracted.source_fingerprint,
+            )
+            if selected_mode is ImportMode.REFERENCE:
+                try:
+                    reference_source = source.resolve(strict=True)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    raise _source_changed(exc) from exc
+                record = self._repository.new_record(
+                    imported,
+                    managed_source_path=None,
+                    reference_source_path=reference_source,
+                )
+                return self._persist(record, extracted.chapters).record.imported
+
+            return self._import_copy(source, imported, extracted.chapters)
 
     def list_books(self) -> tuple[StoredBook, ...]:
         self._require_initialized()
-        return tuple(self._to_stored(record) for record in self._repository.list_books())
+        with self._data_root_guard():
+            return tuple(self._to_stored(record) for record in self._repository.list_books())
 
     def get_book(self, book: BookRef) -> StoredBook:
         self._require_initialized()
-        return self._to_stored(self._repository.get_book(book))
+        with self._data_root_guard():
+            return self._to_stored(self._repository.get_book(book))
 
     def get_chapter(self, book: BookRef, index: int) -> ChapterContent:
         self._require_initialized()
-        return self._repository.get_chapter(book, index)
+        with self._data_root_guard():
+            return self._repository.get_chapter(book, index)
 
     def _import_copy(
         self,
@@ -226,20 +287,30 @@ class BookLibrary:
         book_dir: Path | None = None
         stage: Path | None = None
         final: Path | None = None
+        owned_book_dir = False
+        published_final = False
         try:
             books_dir = self._managed_books_directory()
-            book_dir = books_dir / imported.book.book_id
-            _ensure_directory(book_dir)
-            if book_dir.is_symlink() or book_dir.resolve(strict=True).parent != books_dir:
-                raise _path_not_allowed()
+            with self._data_root_guard():
+                book_dir = books_dir / imported.book.book_id
+                try:
+                    book_dir.mkdir()
+                    owned_book_dir = True
+                except FileExistsError:
+                    pass
+                except OSError as exc:
+                    raise _storage_unavailable(exc) from exc
+                if book_dir.is_symlink() or book_dir.resolve(strict=True).parent != books_dir:
+                    raise _path_not_allowed()
             extension = imported.format.value
             stage = book_dir / f".source-{uuid4().hex}.tmp"
             final = book_dir / f"source.{extension}"
-            copied_fingerprint = _copy_source_to_stage(
-                source,
-                stage,
-                limits=self._registry.limits,
-            )
+            with self._data_root_guard():
+                copied_fingerprint = _copy_source_to_stage(
+                    source,
+                    stage,
+                    limits=self._registry.limits,
+                )
             if copied_fingerprint != imported.source_fingerprint:
                 raise _source_changed()
             relative_source = final.relative_to(self._data_root).as_posix()
@@ -250,33 +321,76 @@ class BookLibrary:
             )
 
             def publish() -> None:
-                if final is None or stage is None or final.exists() or final.is_symlink():
+                nonlocal published_final
+                if final is None or stage is None:
                     raise _path_not_allowed()
-                try:
-                    os.replace(stage, final)
-                except OSError as exc:
-                    raise _storage_unavailable(exc) from exc
+                with self._data_root_guard():
+                    try:
+                        os.link(stage, final)
+                    except FileExistsError as exc:
+                        raise _path_not_allowed(exc) from exc
+                    except OSError as exc:
+                        raise _storage_unavailable(exc) from exc
+                    published_final = True
+                    try:
+                        stage.unlink()
+                    except OSError as exc:
+                        raise _storage_unavailable(exc) from exc
 
             persisted = self._persist(record, chapters, publish=publish)
             if not persisted.created:
-                _remove_attempt_files(stage, final, book_dir)
+                self._cleanup_import_attempt(
+                    stage,
+                    final,
+                    book_dir,
+                    published_final=published_final,
+                    owned_book_dir=owned_book_dir,
+                )
             return persisted.record.imported
         except BaseException:
-            _remove_attempt_files(stage, final, book_dir)
+            self._cleanup_import_attempt(
+                stage,
+                final,
+                book_dir,
+                published_final=published_final,
+                owned_book_dir=owned_book_dir,
+            )
             raise
 
-    def _managed_books_directory(self) -> Path:
-        books_dir = self._data_root / "books"
-        if books_dir.is_symlink():
-            raise _path_not_allowed()
-        _ensure_directory(books_dir)
+    def _cleanup_import_attempt(
+        self,
+        stage: Path | None,
+        final: Path | None,
+        book_dir: Path | None,
+        *,
+        published_final: bool,
+        owned_book_dir: bool,
+    ) -> None:
         try:
-            resolved = books_dir.resolve(strict=True)
-        except (OSError, RuntimeError, ValueError) as exc:
-            raise _path_not_allowed(exc) from exc
-        if resolved != books_dir or resolved.parent != self._data_root:
-            raise _path_not_allowed()
-        return resolved
+            with self._data_root_guard():
+                _remove_attempt_files(
+                    stage,
+                    final,
+                    book_dir,
+                    published_final=published_final,
+                    owned_book_dir=owned_book_dir,
+                )
+        except ForgeException:
+            pass
+
+    def _managed_books_directory(self) -> Path:
+        with self._data_root_guard():
+            books_dir = self._data_root / "books"
+            if books_dir.is_symlink():
+                raise _path_not_allowed()
+            _ensure_directory(books_dir)
+            try:
+                resolved = books_dir.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise _path_not_allowed(exc) from exc
+            if resolved != books_dir or resolved.parent != self._data_root:
+                raise _path_not_allowed()
+            return resolved
 
     def _persist(
         self,
@@ -286,7 +400,8 @@ class BookLibrary:
         publish: Callable[[], None] | None = None,
     ) -> PersistedBook:
         try:
-            return self._repository.persist_book(record, chapters, publish=publish)
+            with self._data_root_guard():
+                return self._repository.persist_book(record, chapters, publish=publish)
         except ForgeException:
             raise
         except (OSError, sqlite3.Error) as exc:
@@ -306,30 +421,31 @@ class BookLibrary:
         )
 
     def _source_available(self, record: LibraryBookRecord) -> bool:
-        imported = record.imported
-        if imported.import_mode is ImportMode.COPY:
-            expected = f"books/{imported.book.book_id}/source.{imported.format.value}"
-            if record.managed_source_path != expected:
-                return False
-            source = self._data_root / expected
+        with self._data_root_guard():
+            imported = record.imported
+            if imported.import_mode is ImportMode.COPY:
+                expected = f"books/{imported.book.book_id}/source.{imported.format.value}"
+                if record.managed_source_path != expected:
+                    return False
+                source = self._data_root / expected
+                try:
+                    resolved = source.resolve(strict=True)
+                except (OSError, RuntimeError, ValueError):
+                    return False
+                if self._data_root not in resolved.parents:
+                    return False
+            else:
+                if record.reference_source_path is None:
+                    return False
+                source = record.reference_source_path
             try:
-                resolved = source.resolve(strict=True)
-            except (OSError, RuntimeError, ValueError):
+                return (
+                    stat.S_ISREG(source.stat(follow_symlinks=False).st_mode)
+                    and fingerprint_source(source, limits=self._registry.limits)
+                    == imported.source_fingerprint
+                )
+            except (ForgeException, OSError, RuntimeError, ValueError):
                 return False
-            if self._data_root not in resolved.parents:
-                return False
-        else:
-            if record.reference_source_path is None:
-                return False
-            source = record.reference_source_path
-        try:
-            return (
-                stat.S_ISREG(source.stat(follow_symlinks=False).st_mode)
-                and fingerprint_source(source, limits=self._registry.limits)
-                == imported.source_fingerprint
-            )
-        except (ForgeException, OSError, RuntimeError, ValueError):
-            return False
 
     def _require_initialized(self) -> None:
         if not self._initialized:
@@ -337,6 +453,20 @@ class BookLibrary:
                 ForgeErrorCode.CONFIG_INVALID,
                 "Library must be initialized before use.",
             )
+        self._assert_data_root_identity()
+
+    def _assert_data_root_identity(self) -> None:
+        identity = self._data_root_identity
+        if identity is None or _directory_identity(self._data_root) != identity:
+            raise _path_not_allowed()
+
+    @contextmanager
+    def _data_root_guard(self) -> Iterator[None]:
+        self._assert_data_root_identity()
+        try:
+            yield
+        finally:
+            self._assert_data_root_identity()
 
 
 def create_book_library(

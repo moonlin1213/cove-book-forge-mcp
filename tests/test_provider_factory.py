@@ -1,8 +1,10 @@
+import asyncio
 from collections.abc import Mapping
+from pathlib import Path
 
 import pytest
 
-from cove_book_forge.config.models import ModelConfig
+from cove_book_forge.config import ModelConfig
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.providers import (
     JsonGeneration,
@@ -144,3 +146,33 @@ def test_configured_missing_or_empty_api_key_is_a_safe_auth_error(
     assert "MISSING_MODEL_KEY" not in rendered
     if value:
         assert value not in rendered
+
+
+def test_public_custom_provider_example_can_be_registered_and_used_without_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(Path(__file__).parent.parent)
+    from examples.custom_provider import custom_provider_factory
+
+    config = ModelConfig(provider="deterministic-local", model="example-reader")
+    provider = ProviderRegistry({"deterministic-local": custom_provider_factory}).create(config)
+
+    text = asyncio.run(provider.generate_text("system", "chapter text", max_output_tokens=100))
+    structured = asyncio.run(
+        provider.generate_json(
+            "system",
+            "chapter text",
+            max_output_tokens=100,
+            json_schema={"type": "object"},
+        )
+    )
+    asyncio.run(provider.healthcheck())
+
+    assert text.text == "chapter text"
+    assert text.model == "example-reader"
+    assert structured.value == {"text": "chapter text"}
+    assert structured.model == "example-reader"
+    assert provider.usage.request_count == 2
+    assert provider.usage.total_tokens == (
+        provider.usage.input_tokens + provider.usage.output_tokens
+    )

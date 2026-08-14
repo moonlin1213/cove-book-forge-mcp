@@ -12,6 +12,7 @@ license = { text = "MIT" }
 dependencies = [
   "beautifulsoup4>=4.13,<5",
   "defusedxml>=0.7,<1",
+  "httpx>=0.28,<1",
   "platformdirs>=4.3,<5",
   "pydantic>=2.11,<3",
   "pypdf>=5,<7",

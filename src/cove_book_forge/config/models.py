@@ -27,6 +27,8 @@ class ModelConfig(ConfigModel):
     api_key_env: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     max_concurrency: int = Field(default=2, ge=1, le=16)
     requests_per_minute: int = Field(default=20, ge=1, le=10_000)
+    request_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    default_max_output_tokens: int = Field(default=4_096, ge=1, le=131_072)
 
 
 class ObsidianOutputConfig(ConfigModel):

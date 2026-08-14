@@ -19,6 +19,20 @@ optional managed library will serve users who do not already have one.
 - API-key values come from environment variables and are never stored in YAML;
 - all output roots require explicit configuration.
 
+## Installation and diagnostics
+
+Install the development dependencies, then run the read-only diagnostic command
+against an explicit configuration file:
+
+```bash
+uv sync --group dev
+uv run cove-book-forge doctor --config /absolute/path/config.yaml
+```
+
+The foundation `doctor` command only validates local configuration, environment
+variable presence, and configured directories. Parser, provider, and MCP checks
+arrive with their corresponding implementation phases.
+
 ## Acknowledgements
 
 `cove-book-forge-mcp` is inspired by and builds upon ideas and tooling from

@@ -155,7 +155,9 @@ def _render_block(tag: Tag, footnote_labels: dict[str, str]) -> str:
         return _render_list(tag)
     if tag.name == "pre":
         value = tag.get_text().strip("\n")
-        return f"```\n{value}\n```" if value.strip() else ""
+        longest_backtick_run = max((len(run) for run in re.findall(r"`+", value)), default=0)
+        fence = "`" * max(3, longest_backtick_run + 1)
+        return f"{fence}\n{value}\n{fence}" if value.strip() else ""
     if tag.name == "table":
         return _render_table(tag)
     if tag.name == "blockquote":

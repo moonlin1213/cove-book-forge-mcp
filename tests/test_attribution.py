@@ -4,8 +4,8 @@ ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM_URL = "https://github.com/virgiliojr94/book-to-skill"
 
 
-def test_readme_and_acknowledgements_credit_book_to_skill() -> None:
-    for name in ("README.md", "ACKNOWLEDGEMENTS.md"):
+def test_public_history_and_acknowledgements_credit_book_to_skill() -> None:
+    for name in ("README.md", "ACKNOWLEDGEMENTS.md", "CHANGELOG.md"):
         text = (ROOT / name).read_text(encoding="utf-8")
         assert "Virgilio Jr." in text
         assert UPSTREAM_URL in text

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import stat
 import struct
 import zipfile
@@ -441,6 +442,30 @@ def test_xhtml_conversion_keeps_readable_structures_and_local_footnotes(tmp_path
     assert "> Quoted thought." in content
     assert "Claim[1]." in content and "[1] Footnote detail." in content
     assert "steal" not in content and "hidden" not in content and "secret" not in content
+
+
+@pytest.mark.parametrize(
+    ("code", "expected_fence"),
+    [
+        ("before\n```\n# still code\n```\nafter", "````"),
+        ("before\n``````\n# still code\n``````\nafter", "```````"),
+    ],
+)
+def test_xhtml_pre_uses_a_balanced_fence_longer_than_internal_backticks(
+    tmp_path: Path,
+    code: str,
+    expected_fence: str,
+) -> None:
+    source = basic_epub(tmp_path / "backticks.epub", chapter_body=f"<pre>{code}</pre>")
+
+    content = EpubExtractor().extract(source, FINGERPRINT).chapters[0].content
+
+    opening, *inner_lines, closing = content.splitlines()
+    inner = "\n".join(inner_lines)
+    assert opening == closing == expected_fence
+    assert all(len(run) < len(opening) for run in re.findall(r"`+", inner))
+    assert inner == code
+    assert content == f"{expected_fence}\n{code}\n{expected_fence}"
 
 
 def test_epub_fails_when_no_readable_spine_content_remains(tmp_path: Path) -> None:

@@ -33,6 +33,18 @@ The foundation `doctor` command only validates local configuration, environment
 variable presence, and configured directories. Parser, provider, and MCP checks
 arrive with their corresponding implementation phases.
 
+## Contributor verification
+
+Run the complete local verification sequence before submitting a change:
+
+```bash
+uv sync --group dev
+uv run pytest --cov=cove_book_forge --cov-report=term-missing
+uv run ruff check .
+uv run mypy src
+uv build
+```
+
 ## Acknowledgements
 
 `cove-book-forge-mcp` is inspired by and builds upon ideas and tooling from

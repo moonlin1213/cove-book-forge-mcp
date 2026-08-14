@@ -1,5 +1,8 @@
 import os
+import sqlite3
+import stat
 from enum import StrEnum
+from importlib import import_module
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -34,11 +37,142 @@ class DoctorReport(BaseModel):
 
 
 def _directory_check(name: str, path: Path) -> DoctorCheck:
-    if not path.exists() or not path.is_dir():
+    try:
+        status = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
         return DoctorCheck(name=name, status=CheckStatus.FAIL, message="Directory is missing.")
-    if not os.access(path, os.W_OK):
+    except OSError:
+        return DoctorCheck(name=name, status=CheckStatus.FAIL, message="Directory is unavailable.")
+    if not stat.S_ISDIR(status.st_mode):
+        return DoctorCheck(name=name, status=CheckStatus.FAIL, message="Directory is unavailable.")
+    if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
         return DoctorCheck(name=name, status=CheckStatus.FAIL, message="Directory is not writable.")
     return DoctorCheck(name=name, status=CheckStatus.PASS, message="Directory is ready.")
+
+
+def _nearest_existing_parent(path: Path) -> Path | None:
+    candidate = path.parent
+    while True:
+        try:
+            status = candidate.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            parent = candidate.parent
+            if parent == candidate:
+                return None
+            candidate = parent
+            continue
+        except OSError:
+            return None
+        if not stat.S_ISDIR(status.st_mode):
+            return None
+        return candidate
+
+
+def _library_directory_check(path: Path, *, enabled: bool) -> DoctorCheck:
+    try:
+        status = path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        parent = _nearest_existing_parent(path)
+        parent_ready = parent is not None and os.access(parent, os.W_OK | os.X_OK)
+        if enabled or not parent_ready:
+            return DoctorCheck(
+                name="library_data",
+                status=CheckStatus.FAIL,
+                message="Directory is missing.",
+            )
+        return DoctorCheck(
+            name="library_data",
+            status=CheckStatus.WARN,
+            message="Optional library directory does not exist; its parent is ready.",
+        )
+    except OSError:
+        return DoctorCheck(
+            name="library_data",
+            status=CheckStatus.FAIL,
+            message="Directory is unavailable.",
+        )
+    if not stat.S_ISDIR(status.st_mode):
+        return DoctorCheck(
+            name="library_data",
+            status=CheckStatus.FAIL,
+            message="Directory is unavailable.",
+        )
+    if not os.access(path, os.R_OK | os.W_OK | os.X_OK):
+        return DoctorCheck(
+            name="library_data",
+            status=CheckStatus.FAIL,
+            message="Directory is not writable.",
+        )
+    return DoctorCheck(
+        name="library_data",
+        status=CheckStatus.PASS,
+        message="Directory is ready.",
+    )
+
+
+def _dependency_check(name: str, module: str) -> DoctorCheck:
+    try:
+        import_module(module)
+    except Exception:
+        return DoctorCheck(
+            name=name,
+            status=CheckStatus.FAIL,
+            message="Parser dependency is unavailable.",
+        )
+    return DoctorCheck(
+        name=name,
+        status=CheckStatus.PASS,
+        message="Parser dependency is available.",
+    )
+
+
+def _database_check(data_path: Path, *, enabled: bool) -> DoctorCheck:
+    database = data_path / "library.sqlite3"
+    try:
+        status = database.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        if enabled and _library_directory_check(data_path, enabled=True).status is CheckStatus.PASS:
+            return DoctorCheck(
+                name="library_database",
+                status=CheckStatus.PASS,
+                message="Database is ready to initialize.",
+            )
+        return DoctorCheck(
+            name="library_database",
+            status=CheckStatus.WARN if not enabled else CheckStatus.FAIL,
+            message="Optional database does not exist."
+            if not enabled
+            else "Database is unavailable.",
+        )
+    except OSError:
+        return DoctorCheck(
+            name="library_database",
+            status=CheckStatus.FAIL,
+            message="Database is unavailable.",
+        )
+    if not stat.S_ISREG(status.st_mode):
+        return DoctorCheck(
+            name="library_database",
+            status=CheckStatus.FAIL,
+            message="Database is not a regular file.",
+        )
+    try:
+        uri = f"{database.absolute().as_uri()}?mode=ro&immutable=1"
+        with sqlite3.connect(uri, uri=True, timeout=0.0) as connection:
+            result = connection.execute("PRAGMA quick_check(1)").fetchone()
+        if result is None or result[0] != "ok":
+            raise sqlite3.DatabaseError("integrity check failed")
+    except (OSError, sqlite3.Error, ValueError):
+        return DoctorCheck(
+            name="library_database",
+            status=CheckStatus.FAIL,
+            message="Database failed its read-only readiness check.",
+        )
+    return DoctorCheck(
+        name="library_database",
+        status=CheckStatus.PASS,
+        message="Database passed its read-only readiness check.",
+    )
 
 
 def _authorized_directory_check(name: str, path: Path) -> DoctorCheck:
@@ -60,6 +194,13 @@ def _checks_for_config(config: AppConfig) -> list[DoctorCheck]:
             message="Configuration loaded.",
         )
     ]
+    checks.extend(
+        (
+            _dependency_check("beautifulsoup4", "bs4"),
+            _dependency_check("defusedxml", "defusedxml"),
+            _dependency_check("pypdf", "pypdf"),
+        )
+    )
     key_name = config.model.api_key_env
     if key_name:
         is_set = bool(os.environ.get(key_name))
@@ -70,14 +211,17 @@ def _checks_for_config(config: AppConfig) -> list[DoctorCheck]:
                 message=f"Environment variable is {'set' if is_set else 'missing'}: {key_name}",
             )
         )
-    if config.library.enabled:
-        checks.append(_directory_check("library_data", library_data_path(config)))
+    data_path = library_data_path(config)
+    checks.append(_library_directory_check(data_path, enabled=config.library.enabled))
+    checks.append(_database_check(data_path, enabled=config.library.enabled))
     if config.outputs.obsidian.enabled and config.outputs.obsidian.vault_path is not None:
         checks.append(
             _authorized_directory_check("obsidian_vault", config.outputs.obsidian.vault_path)
         )
     if config.outputs.skills.enabled and config.outputs.skills.canonical_path is not None:
-        checks.append(_authorized_directory_check("skill_root", config.outputs.skills.canonical_path))
+        checks.append(
+            _authorized_directory_check("skill_root", config.outputs.skills.canonical_path)
+        )
     return checks
 
 

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from pydantic import JsonValue
 
@@ -54,6 +56,48 @@ def test_direct_error_detail_normalizes_untrusted_public_fields() -> None:
         "retryable": False,
         "details": {"field": "model.provider"},
     }
+
+
+def test_error_detail_serialization_recloses_details_after_mutation() -> None:
+    detail = ForgeErrorDetail(
+        code=ForgeErrorCode.MODEL_AUTH_FAILED,
+        message="Caller-controlled message",
+        details={"field": "model.provider"},
+    )
+    detail.details.update(
+        {
+            "api_key": "sk-injected-key",
+            "request": {"messages": ["injected private source"]},
+            "source_content": "injected private source",
+        }
+    )
+    job = ForgeJob(
+        job_id="job-mutated-error",
+        book_id="book-1",
+        target=ForgeTarget.SKILL,
+        status=ForgeJobStatus.FAILED,
+        error=detail,
+    )
+    expected_error = {
+        "code": "MODEL_AUTH_FAILED",
+        "message": "Model provider authentication failed.",
+        "retryable": False,
+        "details": {"field": "model.provider"},
+    }
+
+    assert detail.model_dump(mode="json") == expected_error
+    assert job.model_dump(mode="json")["error"] == expected_error
+    assert json.loads(job.model_dump_json())["error"] == expected_error
+
+    for payload in (str(job.model_dump(mode="json")), job.model_dump_json()):
+        for private_value in (
+            "api_key",
+            "sk-injected-key",
+            "request",
+            "source_content",
+            "injected private source",
+        ):
+            assert private_value not in payload
 
 
 def test_job_error_serialization_cannot_expose_provider_failure_payload() -> None:

@@ -2,7 +2,7 @@ from collections.abc import Mapping
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_serializer, model_validator
 
 _PUBLIC_FIELD_VALUES = frozenset({"model.provider"})
 
@@ -72,7 +72,7 @@ class ForgeErrorDetail(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def enforce_public_representation(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
+        if not isinstance(data, Mapping):
             return data
         normalized = dict(data)
         raw_code = normalized.get("code")
@@ -84,8 +84,12 @@ class ForgeErrorDetail(BaseModel):
             return data
         normalized["message"] = _PUBLIC_MESSAGES[code]
         details = normalized.get("details")
-        normalized["details"] = _public_details(details) if isinstance(details, dict) else {}
+        normalized["details"] = _public_details(details) if isinstance(details, Mapping) else {}
         return normalized
+
+    @field_serializer("details")
+    def serialize_public_details(self, details: Mapping[str, object]) -> dict[str, JsonValue]:
+        return _public_details(details)
 
 
 class ForgeException(RuntimeError):

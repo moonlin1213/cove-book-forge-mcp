@@ -14,9 +14,11 @@ from cove_book_forge.config.models import (
     OutputsConfig,
     SkillOutputConfig,
 )
+from cove_book_forge.config.paths import AuthorizedPathPolicy
 
 __all__ = [
     "AppConfig",
+    "AuthorizedPathPolicy",
     "FullBookForgeConfig",
     "LibraryConfig",
     "ModelConfig",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fixtures import write_pdf
@@ -9,10 +10,38 @@ from fixtures import write_pdf
 from cove_book_forge.contracts import BookFormat, ExtractedBook, PdfProfile
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.extractors import LayoutPdfExtractor, PdfExtractor
+from cove_book_forge.extractors import pdf as pdf_module
 from cove_book_forge.extractors.base import BookExtractorRegistry
 from cove_book_forge.extractors.security import ExtractionLimits
 
 FINGERPRINT = "d" * 64
+
+
+class _ReaderWithPage:
+    is_encrypted = False
+    metadata = None
+    outline: list[object] = []
+
+    def __init__(self, page: object) -> None:
+        self.pages = (page,)
+
+
+class _VisitorFailurePage:
+    mediabox = SimpleNamespace(height=792)
+
+    def __init__(self, *, fallback_text: str | None) -> None:
+        self._fallback_text = fallback_text
+        self._visitor_attempted = False
+
+    def extract_text(self, *, visitor_text: object | None = None) -> str:
+        if visitor_text is not None:
+            self._visitor_attempted = True
+            raise RuntimeError("private visitor-coordinate failure")
+        if not self._visitor_attempted:
+            raise AssertionError("ordinary extraction ran before positional extraction")
+        if self._fallback_text is None:
+            raise ValueError("private fallback extraction failure")
+        return self._fallback_text
 
 
 def _body(page_number: int) -> list[tuple[float, str]]:
@@ -101,6 +130,36 @@ def test_pdf_maps_corruption_to_a_safe_public_error(tmp_path: Path) -> None:
     assert "cross-reference" not in public_payload
 
 
+def test_pdf_retries_without_a_visitor_and_preserves_fallback_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = _VisitorFailurePage(fallback_text="Fallback body.\n    total += 1")
+    reader = _ReaderWithPage(page)
+    monkeypatch.setattr(pdf_module, "PdfReader", lambda source, strict: reader)
+
+    extracted = PdfExtractor().extract(tmp_path / "fallback.pdf", FINGERPRINT)
+
+    assert extracted.chapters[0].content == "Fallback body.\n    total += 1"
+
+
+def test_pdf_maps_both_page_extraction_failures_to_a_safe_public_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = _VisitorFailurePage(fallback_text=None)
+    reader = _ReaderWithPage(page)
+    monkeypatch.setattr(pdf_module, "PdfReader", lambda source, strict: reader)
+    source = tmp_path / "private-fallback.pdf"
+
+    with pytest.raises(ForgeException) as exc_info:
+        PdfExtractor().extract(source, FINGERPRINT)
+
+    assert exc_info.value.code is ForgeErrorCode.EXTRACTION_FAILED
+    public_payload = json.dumps(exc_info.value.as_result())
+    assert str(source) not in public_payload
+    assert "visitor-coordinate" not in public_payload
+    assert "fallback extraction" not in public_payload
+
+
 def test_pdf_enforces_the_injected_page_limit(tmp_path: Path) -> None:
     source = write_pdf(
         tmp_path / "too-many-pages.pdf",
@@ -139,6 +198,26 @@ def test_pdf_accepts_a_genuinely_short_text_layer(tmp_path: Path) -> None:
     assert extracted.chapters[0].content == "Short note."
 
 
+@pytest.mark.parametrize("page_number", ["Page 1 of 2", "1 / 2", "- 1 -"])
+def test_pdf_requires_ocr_for_common_page_number_only_documents(
+    tmp_path: Path, page_number: str
+) -> None:
+    source = write_pdf(tmp_path / "page-number-only.pdf", pages=[[(400, page_number)]])
+
+    with pytest.raises(ForgeException) as exc_info:
+        PdfExtractor().extract(source, FINGERPRINT)
+
+    assert exc_info.value.code is ForgeErrorCode.OCR_REQUIRED
+
+
+def test_pdf_accepts_a_two_letter_text_layer(tmp_path: Path) -> None:
+    source = write_pdf(tmp_path / "tiny.pdf", pages=[[(400, "Hi.")]])
+
+    extracted = PdfExtractor().extract(source, FINGERPRINT)
+
+    assert extracted.chapters[0].content == "Hi."
+
+
 def test_pdf_marks_structurally_technical_content(tmp_path: Path) -> None:
     source = write_pdf(
         tmp_path / "technical.pdf",
@@ -156,6 +235,23 @@ def test_pdf_marks_structurally_technical_content(tmp_path: Path) -> None:
 
     assert extracted.pdf_profile is PdfProfile.TECHNICAL
     assert "    return value + 1" in extracted.chapters[0].content
+
+
+def test_pdf_keeps_ordinary_conditional_prose_as_text(tmp_path: Path) -> None:
+    source = write_pdf(
+        tmp_path / "ordinary-prose.pdf",
+        pages=[
+            [
+                (700, "For example, the garden opens at dawn."),
+                (680, "If visitors arrive early, they hear the birds."),
+                (660, "The guide then leads everyone along the quiet path."),
+            ]
+        ],
+    )
+
+    extracted = PdfExtractor().extract(source, FINGERPRINT)
+
+    assert extracted.pdf_profile is PdfProfile.TEXT
 
 
 def test_pdf_uses_valid_increasing_outline_destinations_as_ranges(tmp_path: Path) -> None:

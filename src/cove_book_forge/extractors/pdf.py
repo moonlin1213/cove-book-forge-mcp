@@ -23,10 +23,23 @@ from cove_book_forge.extractors.security import ExtractionLimits
 _EDGE_FRACTION = 0.12
 _REPEATED_EDGE_MIN_PAGES = 3
 _FALLBACK_BLOCK_PAGES = 20
-_MIN_MEANINGFUL_ALPHANUMERICS = 4
+_MIN_MEANINGFUL_LETTERS = 2
 _PAGE_NUMBER = re.compile(r"(?i)(?:page\s+)?(?:\d{1,6}|[ivxlcdm]{1,12})")
-_CODE_LINE = re.compile(
-    r"(?i)^(?:def|class|function|interface|import|from|return|if|else|for|while|switch)\b"
+_PAGINATION_LINE = re.compile(r"(?i)(?:page\s+)?\d{1,6}\s*(?:of|/)\s*\d{1,6}")
+_DEFINITION_LINE = re.compile(
+    r"^(?:(?:async\s+)?(?:def|function)\s+[A-Za-z_]\w*\s*\([^)]*\)\s*(?::|\{)"
+    r"|class\s+[A-Za-z_]\w*(?:\s*\([^)]*\))?\s*(?::|\{))$"
+)
+_CONTROL_LINE = re.compile(
+    r"^(?:(?:if|elif|while|for|with)\s+(?:\([^)]*\)|.+):|(?:if|while|for|switch)\s*\([^)]*\)\s*\{)$"
+)
+_IMPORT_LINE = re.compile(
+    r"^(?:import\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:\s+as\s+[A-Za-z_]\w*)?"
+    r"|from\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s+import\s+(?:[A-Za-z_*]\w*|\*))$"
+)
+_INDENTED_OPERATOR_LINE = re.compile(
+    r"^[ \t]{2,}(?:(?:return|yield)\b.*(?:[+*/^−-]|==|!=|<=|>=|:=)"
+    r"|[A-Za-z_]\w*(?:(?:\.[A-Za-z_]\w*)|(?:\[[^]]+\]))*\s*(?:[+*/-]?=|:=)\s*\S)"
 )
 _FORMULA_LINE = re.compile(r"\b[A-Za-z][A-Za-z0-9_]*\s*=\s*[^=].*[+*/^−-]")
 
@@ -143,16 +156,26 @@ def _clean_page(
 
 
 def _has_meaningful_text(page_texts: Sequence[str]) -> bool:
-    # Four post-cleanup Unicode alphanumerics outside standalone page-number lines
-    # rejects blank/number-only scans while accepting a short word such as "Note".
+    # Two Unicode letters outside complete pagination and numeric/punctuation-only
+    # lines reject scan noise while accepting genuinely tiny prose such as "Hi".
     candidate_lines = (
         line
         for text in page_texts
         for line in text.splitlines()
-        if not _PAGE_NUMBER.fullmatch(line.strip())
+        if not _is_meaningless_text_line(line)
     )
-    return sum(character.isalnum() for line in candidate_lines for character in line) >= (
-        _MIN_MEANINGFUL_ALPHANUMERICS
+    return sum(character.isalpha() for line in candidate_lines for character in line) >= (
+        _MIN_MEANINGFUL_LETTERS
+    )
+
+
+def _is_meaningless_text_line(line: str) -> bool:
+    stripped = line.strip()
+    return bool(
+        not stripped
+        or _PAGE_NUMBER.fullmatch(stripped)
+        or _PAGINATION_LINE.fullmatch(stripped)
+        or not any(character.isalpha() for character in stripped)
     )
 
 
@@ -241,14 +264,25 @@ def _fallback_chapters(page_texts: Sequence[str]) -> list[ChapterContent]:
 def _pdf_profile(chapters: Sequence[ChapterContent]) -> PdfProfile:
     """Require two code, pipe-table, or assignment/formula lines for TECHNICAL."""
     signals = 0
-    for line in (line.strip() for chapter in chapters for line in chapter.content.splitlines()):
-        if not line:
+    for line in (line for chapter in chapters for line in chapter.content.splitlines()):
+        stripped = line.strip()
+        if not stripped:
             continue
-        if _CODE_LINE.search(line) or line.count("|") >= 2 or _FORMULA_LINE.search(line):
+        if _is_code_line(line) or stripped.count("|") >= 2 or _FORMULA_LINE.search(stripped):
             signals += 1
         if signals >= 2:
             return PdfProfile.TECHNICAL
     return PdfProfile.TEXT
+
+
+def _is_code_line(line: str) -> bool:
+    stripped = line.strip()
+    return bool(
+        _DEFINITION_LINE.fullmatch(stripped)
+        or _CONTROL_LINE.fullmatch(stripped)
+        or _IMPORT_LINE.fullmatch(stripped)
+        or _INDENTED_OPERATOR_LINE.search(line)
+    )
 
 
 def _metadata(reader: PdfReader, source: Path) -> BookMetadata:

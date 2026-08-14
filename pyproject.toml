@@ -30,6 +30,40 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/cove_book_forge"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  "/scripts",
+  "/pyproject.toml",
+  "/uv.lock",
+  "/README.md",
+  "/LICENSE",
+  "/ACKNOWLEDGEMENTS.md",
+  "/THIRD_PARTY_NOTICES.md",
+  "/CHANGELOG.md",
+]
+exclude = [
+  "/.coverage*",
+  "/.env*",
+  "/.git",
+  "/.mypy_cache",
+  "/.nox",
+  "/.pytest_cache",
+  "/.ruff_cache",
+  "/.superpowers",
+  "/.tox",
+  "/.venv",
+  "/.worktrees",
+  "/build",
+  "/config.yaml",
+  "/data",
+  "/dist",
+  "/generated-skills",
+  "/htmlcov",
+  "/imports",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"

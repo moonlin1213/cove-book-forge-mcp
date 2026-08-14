@@ -685,7 +685,7 @@ def test_book_directory_cleanup_preserves_a_competitor_created_before_rmdir(
     assert library.list_books() == ()
 
 
-def test_book_directory_created_before_open_failure_is_removed(
+def test_book_directory_created_before_capability_failure_is_left_unclaimed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -693,9 +693,12 @@ def test_book_directory_created_before_open_failure_is_removed(
     fixed_uuid = UUID(int=25)
     monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
     library = _initialized_library(data_dir)
-    real_open_directory = library_service._open_directory_at
+    real_open_directory = library_service._open_directory_capability_at
 
-    def fail_book_directory_open(parent_fd: int, name: str) -> int:
+    def fail_book_directory_open(
+        parent_fd: int,
+        name: str,
+    ) -> tuple[int, tuple[int, int]]:
         if name == fixed_uuid.hex:
             raise ForgeException(
                 ForgeErrorCode.PATH_NOT_ALLOWED,
@@ -704,13 +707,91 @@ def test_book_directory_created_before_open_failure_is_removed(
             )
         return real_open_directory(parent_fd, name)
 
-    monkeypatch.setattr(library_service, "_open_directory_at", fail_book_directory_open)
+    monkeypatch.setattr(
+        library_service,
+        "_open_directory_capability_at",
+        fail_book_directory_open,
+    )
 
     with pytest.raises(ForgeException) as exc_info:
         library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
 
     assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
-    assert not (data_dir / "books" / fixed_uuid.hex).exists()
+    assert "private book open failed" not in str(exc_info.value)
+    assert (data_dir / "books" / fixed_uuid.hex).is_dir()
+    assert library.list_books() == ()
+
+
+def test_first_book_capability_failure_does_not_claim_same_name_competitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    fixed_uuid = UUID(int=28)
+    monkeypatch.setattr(library_service, "uuid4", lambda: fixed_uuid)
+    library = _initialized_library(data_dir)
+    real_open = library_service.os.open
+    real_fstat = library_service.os.fstat
+    real_stat = library_service.os.stat
+    real_rename = library_service.os.rename
+    first_book_fd: int | None = None
+    book_open_count = 0
+    failure_injected = False
+    competitor_identity: tuple[int, int] | None = None
+    detached_owned = data_dir / "books" / "detached-unproven"
+
+    def track_book_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal book_open_count, first_book_fd
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path == fixed_uuid.hex and dir_fd == library._books_fd:
+            book_open_count += 1
+            if book_open_count == 1:
+                first_book_fd = descriptor
+        return descriptor
+
+    def fail_first_book_fstat(descriptor: int) -> os.stat_result:
+        nonlocal competitor_identity, failure_injected
+        if not failure_injected and descriptor == first_book_fd:
+            failure_injected = True
+            books_fd = library._books_fd
+            assert books_fd is not None
+            real_rename(
+                fixed_uuid.hex,
+                detached_owned.name,
+                src_dir_fd=books_fd,
+                dst_dir_fd=books_fd,
+            )
+            library_service.os.mkdir(fixed_uuid.hex, mode=0o700, dir_fd=books_fd)
+            competitor_status = real_stat(
+                fixed_uuid.hex,
+                dir_fd=books_fd,
+                follow_symlinks=False,
+            )
+            competitor_identity = competitor_status.st_dev, competitor_status.st_ino
+            raise OSError("private first book capability fstat failed")
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(library_service.os, "open", track_book_open)
+    monkeypatch.setattr(library_service.os, "fstat", fail_first_book_fstat)
+
+    with pytest.raises(ForgeException) as exc_info:
+        library.import_book(_source(tmp_path / "book.pdf"), ImportMode.COPY)
+
+    competitor = data_dir / "books" / fixed_uuid.hex
+    assert failure_injected is True
+    assert exc_info.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert "private first book capability fstat failed" not in str(exc_info.value)
+    assert competitor_identity is not None
+    competitor_status = competitor.stat(follow_symlinks=False)
+    assert (competitor_status.st_dev, competitor_status.st_ino) == competitor_identity
+    assert book_open_count == 1
+    assert detached_owned.is_dir()
     assert library.list_books() == ()
 
 

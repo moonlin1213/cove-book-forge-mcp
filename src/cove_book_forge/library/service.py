@@ -228,15 +228,14 @@ def _remove_owned_book_directory(
     book_name: str,
     identity: _FileIdentity | None,
 ) -> None:
+    if identity is None:
+        return
     quarantine_name = f".cleanup-book-{uuid4().hex}"
-    source_fd: int | None = None
     quarantine_fd: int | None = None
     candidate_fd: int | None = None
     owned_quarantine = False
     candidate_name = "candidate"
     try:
-        if identity is None:
-            source_fd, identity = _open_directory_capability_at(books_fd, book_name)
         os.mkdir(quarantine_name, mode=0o700, dir_fd=books_fd)
         owned_quarantine = True
         quarantine_fd = _open_directory_at(books_fd, quarantine_name)
@@ -258,9 +257,6 @@ def _remove_owned_book_directory(
         if candidate_fd is not None:
             with suppress(OSError):
                 os.close(candidate_fd)
-        if source_fd is not None:
-            with suppress(OSError):
-                os.close(source_fd)
         if quarantine_fd is not None:
             with suppress(OSError):
                 os.close(quarantine_fd)
@@ -492,15 +488,15 @@ class BookLibrary:
                 book_identity=None,
                 owned_book_dir=owned_book_dir,
             )
-            book_fd = _open_directory_at(books_fd, book_name)
-            attempt.book_fd = book_fd
+            attempt.book_fd, attempt.book_identity = _open_directory_capability_at(
+                books_fd,
+                book_name,
+            )
             try:
-                book_identity = _status_identity(os.fstat(book_fd))
-                attempt.book_identity = book_identity
                 book_status = os.stat(book_name, dir_fd=books_fd, follow_symlinks=False)
                 if (
                     not stat.S_ISDIR(book_status.st_mode)
-                    or _status_identity(book_status) != book_identity
+                    or _status_identity(book_status) != attempt.book_identity
                 ):
                     raise _path_not_allowed()
             except OSError as exc:

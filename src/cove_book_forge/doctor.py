@@ -1,7 +1,8 @@
 import os
 import sqlite3
 import stat
-from contextlib import closing
+from contextlib import closing, suppress
+from dataclasses import dataclass
 from enum import StrEnum
 from importlib import import_module
 from pathlib import Path
@@ -15,6 +16,30 @@ from cove_book_forge.library.database import _inspect_library_schema, _LibrarySc
 from cove_book_forge.library.service import _validate_data_root
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_LIBRARY_DATABASE_FILENAME = "library.sqlite3"
+_DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_DATABASE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
+
+
+@dataclass(frozen=True, slots=True)
+class _FileStatus:
+    device: int
+    inode: int
+    mode: int
+    size: int
+    modified_ns: int
+    changed_ns: int
+
+    @classmethod
+    def capture(cls, status: os.stat_result) -> "_FileStatus":
+        return cls(
+            device=status.st_dev,
+            inode=status.st_ino,
+            mode=status.st_mode,
+            size=status.st_size,
+            modified_ns=status.st_mtime_ns,
+            changed_ns=status.st_ctime_ns,
+        )
 
 
 class CheckStatus(StrEnum):
@@ -139,11 +164,14 @@ def _dependency_check(name: str, module: str) -> DoctorCheck:
     )
 
 
-def _sqlite_sidecars_absent(database: Path) -> bool:
+def _sqlite_sidecars_absent(directory_fd: int) -> bool:
     for suffix in _SQLITE_SIDECAR_SUFFIXES:
-        sidecar = database.with_name(f"{database.name}{suffix}")
         try:
-            sidecar.stat(follow_symlinks=False)
+            os.stat(
+                f"{_LIBRARY_DATABASE_FILENAME}{suffix}",
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
             continue
         except OSError:
@@ -160,17 +188,112 @@ def _sidecar_failure() -> DoctorCheck:
     )
 
 
-def _database_check(data_path: Path, *, enabled: bool) -> DoctorCheck:
-    database = data_path / "library.sqlite3"
+def _root_is_stable(
+    data_path: Path,
+    validated: Path,
+    directory_fd: int,
+    expected: _FileStatus,
+) -> bool:
     try:
-        status = database.stat(follow_symlinks=False)
+        if _validate_data_root(data_path) != validated:
+            return False
+        held_status = os.fstat(directory_fd)
+        public_status = validated.stat(follow_symlinks=False)
+    except (ForgeException, OSError):
+        return False
+    return (
+        stat.S_ISDIR(held_status.st_mode)
+        and stat.S_ISDIR(public_status.st_mode)
+        and _FileStatus.capture(held_status) == expected
+        and _FileStatus.capture(public_status) == expected
+    )
+
+
+def _database_is_stable(
+    directory_fd: int,
+    database_fd: int,
+    expected: _FileStatus,
+) -> bool:
+    try:
+        held_status = os.fstat(database_fd)
+        relative_status = os.stat(
+            _LIBRARY_DATABASE_FILENAME,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(held_status.st_mode)
+        and stat.S_ISREG(relative_status.st_mode)
+        and _FileStatus.capture(held_status) == expected
+        and _FileStatus.capture(relative_status) == expected
+    )
+
+
+def _missing_database_is_stable(
+    data_path: Path,
+    validated: Path,
+    directory_fd: int,
+    root_status: _FileStatus,
+) -> bool:
+    if not _sqlite_sidecars_absent(directory_fd):
+        return False
+    try:
+        os.stat(
+            _LIBRARY_DATABASE_FILENAME,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
-        if enabled and _library_directory_check(data_path, enabled=True).status is CheckStatus.PASS:
-            return DoctorCheck(
-                name="library_database",
-                status=CheckStatus.PASS,
-                message="Database is ready to initialize.",
-            )
+        return _root_is_stable(data_path, validated, directory_fd, root_status)
+    except OSError:
+        return False
+    return False
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _open_validated_data_root(data_path: Path) -> tuple[Path, int, _FileStatus]:
+    validated = _validate_data_root(data_path)
+    directory_fd = os.open(validated, _DIRECTORY_OPEN_FLAGS)
+    try:
+        status = os.fstat(directory_fd)
+        if not stat.S_ISDIR(status.st_mode):
+            raise OSError("library data root is not a directory")
+    except BaseException:
+        with suppress(OSError):
+            os.close(directory_fd)
+        raise
+    return validated, directory_fd, _FileStatus.capture(status)
+
+
+def _inspect_database_snapshot(payload: bytes) -> _LibrarySchemaReadiness:
+    with closing(sqlite3.connect(":memory:")) as connection:
+        if payload:
+            connection.deserialize(payload)
+        return _inspect_library_schema(connection)
+
+
+def _database_unavailable() -> DoctorCheck:
+    return DoctorCheck(
+        name="library_database",
+        status=CheckStatus.FAIL,
+        message="Database is unavailable.",
+    )
+
+
+def _database_check(data_path: Path, *, enabled: bool) -> DoctorCheck:
+    directory_fd: int | None = None
+    database_fd: int | None = None
+    try:
+        validated, directory_fd, root_status = _open_validated_data_root(data_path)
+    except FileNotFoundError:
         return DoctorCheck(
             name="library_database",
             status=CheckStatus.WARN if not enabled else CheckStatus.FAIL,
@@ -178,51 +301,93 @@ def _database_check(data_path: Path, *, enabled: bool) -> DoctorCheck:
             if not enabled
             else "Database is unavailable.",
         )
-    except OSError:
-        return DoctorCheck(
-            name="library_database",
-            status=CheckStatus.FAIL,
-            message="Database is unavailable.",
-        )
-    if not stat.S_ISREG(status.st_mode):
-        return DoctorCheck(
-            name="library_database",
-            status=CheckStatus.FAIL,
-            message="Database is not a regular file.",
-        )
-    if not _sqlite_sidecars_absent(database):
-        return _sidecar_failure()
+    except (ForgeException, OSError):
+        return _database_unavailable()
+
     try:
-        uri = f"{database.absolute().as_uri()}?mode=ro&immutable=1"
-        with closing(sqlite3.connect(uri, uri=True, timeout=0.0)) as connection:
-            readiness = _inspect_library_schema(connection)
+        if not _sqlite_sidecars_absent(directory_fd):
+            return _sidecar_failure()
+
+        try:
+            relative_status = os.stat(
+                _LIBRARY_DATABASE_FILENAME,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if not _missing_database_is_stable(data_path, validated, directory_fd, root_status):
+                return _database_unavailable()
+            if enabled:
+                return DoctorCheck(
+                    name="library_database",
+                    status=CheckStatus.PASS,
+                    message="Database is ready to initialize.",
+                )
+            return DoctorCheck(
+                name="library_database",
+                status=CheckStatus.WARN,
+                message="Optional database does not exist.",
+            )
+        except OSError:
+            return _database_unavailable()
+
+        if not stat.S_ISREG(relative_status.st_mode):
+            return DoctorCheck(
+                name="library_database",
+                status=CheckStatus.FAIL,
+                message="Database is not a regular file.",
+            )
+        expected_database_status = _FileStatus.capture(relative_status)
+        database_fd = os.open(
+            _LIBRARY_DATABASE_FILENAME,
+            _DATABASE_OPEN_FLAGS,
+            dir_fd=directory_fd,
+        )
+        if not _database_is_stable(directory_fd, database_fd, expected_database_status):
+            return _database_unavailable()
+
+        payload = _read_descriptor(database_fd)
+        readiness = _inspect_database_snapshot(payload)
+
+        if not _sqlite_sidecars_absent(directory_fd):
+            return _sidecar_failure()
+        if not _database_is_stable(directory_fd, database_fd, expected_database_status):
+            return _database_unavailable()
+        if not _root_is_stable(data_path, validated, directory_fd, root_status):
+            return _database_unavailable()
+
+        if readiness is _LibrarySchemaReadiness.UNINITIALIZED:
+            return DoctorCheck(
+                name="library_database",
+                status=CheckStatus.WARN,
+                message="Database is uninitialized.",
+            )
+        if readiness is _LibrarySchemaReadiness.MIGRATION_PENDING:
+            return DoctorCheck(
+                name="library_database",
+                status=CheckStatus.WARN,
+                message="Database schema migration is pending.",
+            )
+        return DoctorCheck(
+            name="library_database",
+            status=CheckStatus.PASS,
+            message="Database schema is ready.",
+        )
     except (OSError, sqlite3.Error, ValueError):
-        if not _sqlite_sidecars_absent(database):
+        if directory_fd is not None and not _sqlite_sidecars_absent(directory_fd):
             return _sidecar_failure()
         return DoctorCheck(
             name="library_database",
             status=CheckStatus.FAIL,
             message="Database failed its read-only readiness check.",
         )
-    if not _sqlite_sidecars_absent(database):
-        return _sidecar_failure()
-    if readiness is _LibrarySchemaReadiness.UNINITIALIZED:
-        return DoctorCheck(
-            name="library_database",
-            status=CheckStatus.WARN,
-            message="Database is uninitialized.",
-        )
-    if readiness is _LibrarySchemaReadiness.MIGRATION_PENDING:
-        return DoctorCheck(
-            name="library_database",
-            status=CheckStatus.WARN,
-            message="Database schema migration is pending.",
-        )
-    return DoctorCheck(
-        name="library_database",
-        status=CheckStatus.PASS,
-        message="Database schema is ready.",
-    )
+    finally:
+        if database_fd is not None:
+            with suppress(OSError):
+                os.close(database_fd)
+        if directory_fd is not None:
+            with suppress(OSError):
+                os.close(directory_fd)
 
 
 def _skipped_database_check() -> DoctorCheck:

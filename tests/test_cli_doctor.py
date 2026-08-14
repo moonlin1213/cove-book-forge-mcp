@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import stat
 from contextlib import closing
@@ -283,6 +284,30 @@ def test_doctor_fails_closed_for_any_existing_sqlite_sidecar_without_writing(
     assert _filesystem_snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm", "-journal"])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_doctor_fails_closed_for_orphan_sqlite_sidecars(
+    tmp_path: Path,
+    sidecar_suffix: str,
+    enabled: bool,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    sidecar = data_dir / f"library.sqlite3{sidecar_suffix}"
+    sidecar.write_bytes(b"orphan private sidecar")
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=enabled)
+    before = _filesystem_snapshot(tmp_path)
+
+    result, database_check, stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert "sidecar" in str(database_check["message"]).lower()
+    assert "orphan private sidecar" not in stdout
+    assert str(data_dir) not in stdout
+    assert _filesystem_snapshot(tmp_path) == before
+
+
 @pytest.mark.parametrize("wal_state", ["committed", "truncated"])
 def test_doctor_fails_closed_for_real_wal_state_without_touching_database_files(
     tmp_path: Path,
@@ -363,6 +388,9 @@ def test_doctor_rechecks_sidecars_after_read_only_inspection(
                 sidecar.write_bytes(b"appeared concurrently")
             return result
 
+        def deserialize(self, data: bytes) -> None:
+            self._connection.deserialize(data)
+
     def connect_with_concurrent_sidecar(*args: Any, **kwargs: Any) -> SidecarAppearingConnection:
         connection = SidecarAppearingConnection(real_connect(*args, **kwargs))
         opened.append(connection)
@@ -376,6 +404,118 @@ def test_doctor_rechecks_sidecars_after_read_only_inspection(
     assert database_check["status"] == "fail"
     assert sidecar.read_bytes() == b"appeared concurrently"
     assert opened and opened[0].closed is True
+
+
+def test_doctor_fails_if_an_external_delete_transaction_changes_the_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    _create_library_schema(database, version=2)
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    journal = data_dir / "library.sqlite3-journal"
+    real_inspect = doctor_module._inspect_library_schema
+    state_after_external_write: list[tuple[tuple[object, ...], ...]] = []
+
+    def inspect_then_change_database(
+        connection: sqlite3.Connection,
+    ) -> library_database._LibrarySchemaReadiness:
+        readiness = real_inspect(connection)
+        with closing(sqlite3.connect(database)) as writer:
+            assert writer.execute("PRAGMA journal_mode = DELETE").fetchone()[0] == "delete"
+            writer.execute("BEGIN IMMEDIATE")
+            writer.execute("PRAGMA user_version = 999")
+            assert journal.exists()
+            writer.commit()
+        assert not journal.exists()
+        state_after_external_write.append(_filesystem_snapshot(tmp_path))
+        return readiness
+
+    monkeypatch.setattr(doctor_module, "_inspect_library_schema", inspect_then_change_database)
+
+    result, database_check, _stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert state_after_external_write
+    assert _filesystem_snapshot(tmp_path) == state_after_external_write[0]
+    with closing(sqlite3.connect(database)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 999
+
+
+def test_doctor_binds_database_inspection_to_the_validated_data_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    displaced_data_dir = tmp_path / "displaced-library"
+    private_data_dir = tmp_path / "private-library"
+    private_data_dir.mkdir()
+    _create_library_schema(private_data_dir / "library.sqlite3", version=2)
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=True)
+    private_before = _filesystem_snapshot(private_data_dir)
+    private_database_status = (private_data_dir / "library.sqlite3").stat()
+    private_database_identity = (private_database_status.st_dev, private_database_status.st_ino)
+    real_open = os.open
+    real_read = os.read
+    real_connect = sqlite3.connect
+    replacement_performed = False
+    private_database_opened = False
+    private_database_read = False
+
+    def open_then_replace_root(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replacement_performed
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if (
+            not replacement_performed
+            and dir_fd is None
+            and os.fspath(path) == os.fspath(data_dir)
+            and flags & os.O_DIRECTORY
+        ):
+            try:
+                data_dir.rename(displaced_data_dir)
+                data_dir.symlink_to(private_data_dir, target_is_directory=True)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            replacement_performed = True
+        return descriptor
+
+    def read_with_private_database_sentinel(descriptor: int, length: int) -> bytes:
+        nonlocal private_database_read
+        status = os.fstat(descriptor)
+        if (status.st_dev, status.st_ino) == private_database_identity:
+            private_database_read = True
+        return real_read(descriptor, length)
+
+    def connect_with_private_database_sentinel(
+        database_arg: object, *args: object, **kwargs: object
+    ) -> sqlite3.Connection:
+        nonlocal private_database_opened
+        if database_arg != ":memory:":
+            private_database_opened = True
+        return real_connect(database_arg, *args, **kwargs)
+
+    monkeypatch.setattr(doctor_module.os, "open", open_then_replace_root)
+    monkeypatch.setattr(doctor_module.os, "read", read_with_private_database_sentinel)
+    monkeypatch.setattr(doctor_module.sqlite3, "connect", connect_with_private_database_sentinel)
+
+    result, database_check, stdout = _database_check_from_cli(config)
+
+    assert replacement_performed is True
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert private_database_opened is False
+    assert private_database_read is False
+    assert str(private_data_dir) not in stdout
+    assert _filesystem_snapshot(private_data_dir) == private_before
 
 
 @pytest.mark.parametrize(
@@ -487,6 +627,28 @@ def test_doctor_validates_library_application_schema_without_writing(
         assert expected_fragment in str(database_check["message"]).lower()
     assert str(database) not in stdout
     assert "private_unrelated" not in stdout
+    assert _filesystem_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("view_name", ["private_unrelated", "books"])
+def test_doctor_rejects_unversioned_view_schemas_without_writing(
+    tmp_path: Path,
+    view_name: str,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute(f'CREATE VIEW "{view_name}" AS SELECT 1 AS private_value')
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_snapshot(tmp_path)
+
+    result, database_check, stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert view_name not in stdout
+    assert str(database) not in stdout
     assert _filesystem_snapshot(tmp_path) == before
 
 

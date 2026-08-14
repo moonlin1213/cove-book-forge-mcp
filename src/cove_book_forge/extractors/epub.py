@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import lzma
 import posixpath
+import re
 import stat
 import zipfile
+import zlib
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
@@ -70,6 +73,7 @@ _NESTED_ARCHIVE_SUFFIXES = frozenset(
 )
 _XHTML_MEDIA_TYPE = "application/xhtml+xml"
 _NCX_MEDIA_TYPE = "application/x-dtbncx+xml"
+_SCHEME_PREFIX = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,7 +143,14 @@ def _reject_nested_archive_magic(
         try:
             with archive.open(info) as stream:
                 prefix = stream.read(_ARCHIVE_MAGIC_BYTES)
-        except RuntimeError as exc:
+        except (
+            EOFError,
+            OSError,
+            RuntimeError,
+            lzma.LZMAError,
+            zipfile.BadZipFile,
+            zlib.error,
+        ) as exc:
             raise _failure() from exc
         if prefix.startswith(_ARCHIVE_MAGIC_PREFIXES) or (
             len(prefix) >= 262 and prefix[257:262] == b"ustar"
@@ -148,11 +159,17 @@ def _reject_nested_archive_magic(
 
 
 def _resolve_reference(base_member: str, reference: str) -> str:
-    split = urlsplit(unquote(reference))
+    split = urlsplit(reference)
     if split.scheme or split.netloc:
         raise _failure()
-    path = split.path
-    if not path or "\\" in path or path.startswith("/"):
+    path = unquote(split.path)
+    if (
+        not path
+        or "\\" in path
+        or path.startswith("/")
+        or path.startswith("//")
+        or _SCHEME_PREFIX.match(path)
+    ):
         raise _failure()
     base_directory = posixpath.dirname(base_member) if base_member else ""
     candidate = posixpath.normpath(posixpath.join(base_directory, path))
@@ -380,5 +397,14 @@ class EpubExtractor:
                 )
         except ForgeException:
             raise
-        except (OSError, ParseError, RecursionError, ValueError, zipfile.BadZipFile) as exc:
+        except (
+            EOFError,
+            OSError,
+            ParseError,
+            RecursionError,
+            ValueError,
+            lzma.LZMAError,
+            zipfile.BadZipFile,
+            zlib.error,
+        ) as exc:
             raise _failure() from exc

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import stat
+import struct
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -28,6 +29,16 @@ def _nested_zip_payload() -> bytes:
     with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("inside.txt", "nested")
     return stream.getvalue()
+
+
+def _corrupt_compressed_member(path: Path, member: str) -> None:
+    with zipfile.ZipFile(path) as archive:
+        info = archive.getinfo(member)
+    payload = bytearray(path.read_bytes())
+    filename_length, extra_length = struct.unpack_from("<HH", payload, info.header_offset + 26)
+    compressed_offset = info.header_offset + 30 + filename_length + extra_length
+    payload[compressed_offset] ^= 0xFF
+    path.write_bytes(payload)
 
 
 def _unsafe_reference_epub(tmp_path: Path, *, location: str, reference: str) -> Path:
@@ -264,6 +275,32 @@ def test_epub_without_navigation_uses_heading_then_deterministic_fallback(tmp_pa
         "Document Heading",
         "Chapter 2",
     ]
+
+
+@pytest.mark.parametrize(
+    ("encoded_name", "archive_name"),
+    [
+        ("chapter%231.xhtml", "chapter#1.xhtml"),
+        ("chapter%3Fpart.xhtml", "chapter?part.xhtml"),
+    ],
+)
+def test_epub_resolves_encoded_fragment_and_query_characters_inside_member_names(
+    tmp_path: Path, encoded_name: str, archive_name: str
+) -> None:
+    opf = opf_document(
+        manifest=(f'<item id="c" href="{encoded_name}" media-type="application/xhtml+xml"/>'),
+        spine='<itemref idref="c"/>',
+    )
+    source = write_epub(
+        tmp_path / "encoded-delimiter.epub",
+        opf=opf,
+        members={f"OEBPS/{archive_name}": xhtml_document("<p>Encoded member.</p>")},
+    )
+
+    extracted = EpubExtractor().extract(source, FINGERPRINT)
+
+    assert extracted.chapters[0].content == "Encoded member."
+    assert extracted.chapters[0].source_locator == f"epub:OEBPS/{archive_name}"
 
 
 def test_epub_two_ncx_labels_are_used_for_epub2_titles(tmp_path: Path) -> None:
@@ -545,6 +582,23 @@ def test_epub_rejects_nested_packages_by_extended_suffix_or_bounded_magic(
 
     assert exc_info.value.code is ForgeErrorCode.EXTRACTION_FAILED
     assert nested_name not in str(exc_info.value)
+
+
+def test_epub_maps_corrupt_unreferenced_deflate_member_to_safe_failure(tmp_path: Path) -> None:
+    source = basic_epub(tmp_path / "corrupt-auxiliary.epub")
+    member = "OEBPS/private-unreferenced.dat"
+    private_content = b"private auxiliary content" * 100
+    with zipfile.ZipFile(source, "a", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(member, private_content, compress_type=zipfile.ZIP_DEFLATED)
+    _corrupt_compressed_member(source, member)
+
+    with pytest.raises(ForgeException) as exc_info:
+        EpubExtractor().extract(source, FINGERPRINT)
+
+    assert exc_info.value.code is ForgeErrorCode.EXTRACTION_FAILED
+    assert member not in str(exc_info.value)
+    assert str(source) not in str(exc_info.value)
+    assert private_content.decode() not in str(exc_info.value)
 
 
 def test_epub_rejects_member_count_before_reading_content(tmp_path: Path) -> None:

@@ -1,7 +1,95 @@
 import pytest
 from pydantic import JsonValue
 
-from cove_book_forge.errors import ForgeErrorCode, ForgeException
+from cove_book_forge.contracts.jobs import ForgeJob, ForgeJobStatus, ForgeTarget
+from cove_book_forge.errors import ForgeErrorCode, ForgeErrorDetail, ForgeException
+
+PUBLIC_MESSAGES = {
+    ForgeErrorCode.CONFIG_INVALID: "Configuration is invalid.",
+    ForgeErrorCode.MODEL_UNAVAILABLE: "Model provider is unavailable.",
+    ForgeErrorCode.MODEL_AUTH_FAILED: "Model provider authentication failed.",
+    ForgeErrorCode.MODEL_RATE_LIMITED: "Model provider rate limit was reached.",
+    ForgeErrorCode.MODEL_OUTPUT_INVALID: "Model provider returned invalid output.",
+    ForgeErrorCode.SOURCE_NOT_FOUND: "Source was not found.",
+    ForgeErrorCode.SOURCE_CHANGED: "Source changed since the operation began.",
+    ForgeErrorCode.UNSUPPORTED_FORMAT: "Source format is not supported.",
+    ForgeErrorCode.ENCRYPTED_DOCUMENT: "Encrypted documents are not supported.",
+    ForgeErrorCode.OCR_REQUIRED: "Source requires OCR before processing.",
+    ForgeErrorCode.EXTRACTION_FAILED: "Source content could not be extracted.",
+    ForgeErrorCode.EXTERNAL_BOOK_INCOMPLETE: "External book snapshot is incomplete.",
+    ForgeErrorCode.OUTPUT_NOT_CONFIGURED: "Output is not configured.",
+    ForgeErrorCode.OUTPUT_PERMISSION_DENIED: "Output location is not writable.",
+    ForgeErrorCode.EXTERNAL_MODIFICATION: "Output changed outside this application.",
+    ForgeErrorCode.INSTALL_CONFLICT: "Skill installation conflicts with an existing installation.",
+    ForgeErrorCode.PATH_NOT_ALLOWED: "Path is outside the authorized locations.",
+    ForgeErrorCode.JOB_CONFLICT: "Another job already controls this book and target.",
+    ForgeErrorCode.JOB_INTERRUPTED: "Job was interrupted and can be resumed.",
+    ForgeErrorCode.JOB_CANCELLED: "Job was cancelled.",
+}
+
+
+@pytest.mark.parametrize(("code", "public_message"), PUBLIC_MESSAGES.items())
+def test_every_error_code_uses_its_actionable_public_message(
+    code: ForgeErrorCode, public_message: str
+) -> None:
+    detail = ForgeException(code, "Caller-controlled failure text.").as_detail()
+
+    assert detail.message == public_message
+
+
+def test_direct_error_detail_normalizes_untrusted_public_fields() -> None:
+    detail = ForgeErrorDetail(
+        code=ForgeErrorCode.MODEL_AUTH_FAILED,
+        message="Authorization: Bearer secret-token",
+        details={
+            "authorization": "Bearer secret-token",
+            "request": {"messages": ["private source body"]},
+            "field": "model.provider",
+        },
+    )
+
+    assert detail.model_dump(mode="json") == {
+        "code": "MODEL_AUTH_FAILED",
+        "message": "Model provider authentication failed.",
+        "retryable": False,
+        "details": {"field": "model.provider"},
+    }
+
+
+def test_job_error_serialization_cannot_expose_provider_failure_payload() -> None:
+    exc = ForgeException(
+        ForgeErrorCode.MODEL_AUTH_FAILED,
+        "Upstream auth failed for sk-private-key",
+        details={
+            "authorization": "Bearer secret-token",
+            "api_key": "sk-private-key",
+            "request": {"messages": ["private source body"]},
+            "source_content": "private source body",
+            "field": "model.provider",
+        },
+        cause=RuntimeError("Provider response included X-API-Key: sk-private-key"),
+    )
+    job = ForgeJob(
+        job_id="job-1",
+        book_id="book-1",
+        target=ForgeTarget.SKILL,
+        status=ForgeJobStatus.FAILED,
+        error=exc.as_detail(),
+    )
+
+    payload = job.model_dump_json()
+    assert '"message":"Model provider authentication failed."' in payload
+    assert '"details":{"field":"model.provider"}' in payload
+    for private_value in (
+        "Upstream auth failed",
+        "RuntimeError",
+        "authorization",
+        "Bearer",
+        "request",
+        "private source body",
+        "sk-private-key",
+    ):
+        assert private_value not in payload
 
 
 def test_forge_exception_serializes_public_error_without_private_cause() -> None:
@@ -43,7 +131,7 @@ def test_forge_exception_redacts_sensitive_message_and_details() -> None:
         "ok": False,
         "error": {
             "code": "MODEL_AUTH_FAILED",
-            "message": "An internal error occurred.",
+            "message": "Model provider authentication failed.",
             "retryable": False,
             "details": {"field": "model.provider"},
         },

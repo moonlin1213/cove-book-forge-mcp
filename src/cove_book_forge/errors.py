@@ -1,10 +1,9 @@
 from enum import StrEnum
-from re import Pattern, compile
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 _GENERIC_PUBLIC_MESSAGE = "An internal error occurred."
-_PUBLIC_FIELD_PATTERN: Pattern[str] = compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*")
+_PUBLIC_FIELD_VALUES = frozenset({"model.provider"})
 
 
 class ForgeErrorCode(StrEnum):
@@ -71,6 +70,6 @@ class ForgeException(RuntimeError):
 
     def _public_details(self) -> dict[str, JsonValue]:
         field = self.details.get("field")
-        if isinstance(field, str) and _PUBLIC_FIELD_PATTERN.fullmatch(field):
+        if field in _PUBLIC_FIELD_VALUES:
             return {"field": field}
         return {}

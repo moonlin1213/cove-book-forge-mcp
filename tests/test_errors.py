@@ -82,3 +82,20 @@ def test_forge_exception_keeps_safe_dotted_field_identifier() -> None:
     )
 
     assert exc.as_result()["error"]["details"] == {"field": "model.provider"}
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "sk_secret_token",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.signature",
+    ],
+)
+def test_forge_exception_drops_identifier_shaped_sensitive_field_values(field: str) -> None:
+    exc = ForgeException(
+        ForgeErrorCode.CONFIG_INVALID,
+        "Untrusted caller text.",
+        details={"field": field},
+    )
+
+    assert exc.as_result()["error"]["details"] == {}

@@ -16,6 +16,13 @@ def _path_error(message: str, path: Path) -> ForgeException:
     )
 
 
+def _resolve_strict(path: Path, error_message: str) -> Path:
+    try:
+        return path.resolve(strict=True)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise _path_error(error_message, path) from exc
+
+
 @dataclass(frozen=True)
 class AuthorizedPathPolicy:
     roots: tuple[Path, ...]
@@ -30,10 +37,7 @@ class AuthorizedPathPolicy:
     def validate_root(path: Path) -> Path:
         if "\x00" in str(path):
             raise _path_error("Authorized root contains an invalid path component.", path)
-        try:
-            root = path.expanduser().resolve(strict=True)
-        except (OSError, ValueError) as exc:
-            raise _path_error("Authorized root does not exist.", path) from exc
+        root = _resolve_strict(path.expanduser(), "Authorized root does not exist.")
         if not root.is_dir():
             raise _path_error("Authorized root must be a directory.", root)
         if root == Path(root.anchor) or root == Path.home().resolve():
@@ -60,10 +64,7 @@ class AuthorizedPathPolicy:
                 raise _path_error("Target contains an invalid path component.", current / part)
             candidate = current / part
             if candidate.exists() or candidate.is_symlink():
-                try:
-                    candidate = candidate.resolve(strict=True)
-                except OSError as exc:
-                    raise _path_error("Target path cannot be resolved.", candidate) from exc
+                candidate = _resolve_strict(candidate, "Target path cannot be resolved.")
                 if not _is_within(candidate, normalized_root):
                     raise _path_error("Target escapes its authorized root.", candidate)
             current = candidate

@@ -62,7 +62,7 @@ def _checks_for_config(config: AppConfig) -> list[DoctorCheck]:
     ]
     key_name = config.model.api_key_env
     if key_name:
-        is_set = key_name in os.environ
+        is_set = bool(os.environ.get(key_name))
         checks.append(
             DoctorCheck(
                 name="model_api_key",

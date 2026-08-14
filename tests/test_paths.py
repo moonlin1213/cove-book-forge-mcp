@@ -40,6 +40,41 @@ def test_resolve_target_rejects_symlink_escape(tmp_path: Path) -> None:
         policy.resolve_target(root, "escape", "file.md")
 
 
+def test_policy_converts_strict_resolution_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+
+    def raise_symlink_loop(_path: Path, *, strict: bool = False) -> Path:
+        assert strict is True
+        raise RuntimeError("Symlink loop from caller-controlled path")
+
+    monkeypatch.setattr(Path, "resolve", raise_symlink_loop)
+
+    with pytest.raises(ForgeException) as caught:
+        AuthorizedPathPolicy((root,))
+
+    assert caught.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert isinstance(caught.value.__cause__, RuntimeError)
+
+
+def test_resolve_target_rejects_real_symlink_loop(tmp_path: Path) -> None:
+    root = tmp_path / "vault"
+    root.mkdir()
+    loop = root / "loop"
+    try:
+        loop.symlink_to("loop")
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+
+    policy = AuthorizedPathPolicy((root,))
+    with pytest.raises(ForgeException) as caught:
+        policy.resolve_target(root, "loop", "file.md")
+
+    assert caught.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+
+
 @pytest.mark.parametrize("broad_root", [Path(Path.cwd().anchor), Path.home()])
 def test_policy_rejects_filesystem_and_home_roots(broad_root: Path) -> None:
     with pytest.raises(ForgeException) as caught:

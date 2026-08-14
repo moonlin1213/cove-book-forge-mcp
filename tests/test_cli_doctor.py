@@ -61,6 +61,31 @@ model:
     assert "Authorization" not in result.stdout
 
 
+def test_doctor_reports_empty_key_environment_as_missing(tmp_path: Path, monkeypatch) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+model:
+  provider: openai-compatible
+  model: cloud-model
+  api_key_env: EMPTY_TEST_KEY
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("EMPTY_TEST_KEY", "")
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is False
+    assert payload["checks"][1] == {
+        "name": "model_api_key",
+        "status": "fail",
+        "message": "Environment variable is missing: EMPTY_TEST_KEY",
+    }
+
+
 def test_doctor_redacts_private_paths_from_directory_failures(tmp_path: Path) -> None:
     missing_data = tmp_path / "private-data"
     config = tmp_path / "config.yaml"

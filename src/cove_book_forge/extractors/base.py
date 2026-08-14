@@ -36,6 +36,11 @@ class BookExtractorRegistry:
         else:
             self._extractors = dict(extractors)
 
+    @property
+    def limits(self) -> ExtractionLimits:
+        """Return the same immutable limits used for provenance validation."""
+        return self._limits
+
     def get_for_source(self, source: Path) -> BookExtractor | None:
         return self._extractors.get(detect_book_format(source))
 

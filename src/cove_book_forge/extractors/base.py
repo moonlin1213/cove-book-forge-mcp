@@ -23,8 +23,14 @@ class BookExtractorRegistry:
         *,
         limits: ExtractionLimits | None = None,
     ) -> None:
-        self._extractors = dict(extractors or {})
         self._limits = limits or ExtractionLimits()
+        self._extractors: dict[BookFormat, BookExtractor]
+        if extractors is None:
+            from cove_book_forge.extractors.epub import EpubExtractor
+
+            self._extractors = {BookFormat.EPUB: EpubExtractor(limits=self._limits)}
+        else:
+            self._extractors = dict(extractors)
 
     def get_for_source(self, source: Path) -> BookExtractor | None:
         return self._extractors.get(detect_book_format(source))

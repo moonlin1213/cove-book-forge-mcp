@@ -122,6 +122,12 @@ class OpenAICompatibleProvider:
     @staticmethod
     def _resolve_base_url(config: ModelConfig) -> str:
         if config.base_url is not None:
+            if config.base_url.query is not None or config.base_url.fragment is not None:
+                raise ForgeException(
+                    ForgeErrorCode.CONFIG_INVALID,
+                    "OpenAI-compatible provider requires a plain API base.",
+                    details={"field": "model.provider"},
+                )
             return str(config.base_url).rstrip("/")
         default = _DEFAULT_BASES.get(config.provider)
         if default is None:
@@ -164,7 +170,12 @@ class OpenAICompatibleProvider:
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
             self._invalid_output()
         choice = choices[0]
-        if choice.get("finish_reason") == "length":
+        finish_reason = choice.get("finish_reason")
+        if (
+            not isinstance(finish_reason, str)
+            or not finish_reason.strip()
+            or finish_reason == "length"
+        ):
             self._invalid_output()
         message = choice.get("message")
         if not isinstance(message, Mapping):

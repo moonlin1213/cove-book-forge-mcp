@@ -273,6 +273,76 @@ def test_openai_compatible_requires_an_explicit_base_url() -> None:
 
 
 @pytest.mark.parametrize(
+    ("finish_reason", "omit_finish_reason"),
+    [
+        pytest.param("unused", True, id="missing"),
+        pytest.param(None, False, id="null"),
+        pytest.param(42, False, id="non-string"),
+        pytest.param("", False, id="empty"),
+        pytest.param("   ", False, id="blank"),
+    ],
+)
+def test_text_generation_rejects_missing_or_invalid_finish_reason_without_mutation(
+    finish_reason: object,
+    omit_finish_reason: bool,
+) -> None:
+    body = response_body(finish_reason=finish_reason)
+    if omit_finish_reason:
+        choice = body["choices"][0]
+        assert isinstance(choice, dict)
+        choice.pop("finish_reason")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    provider = make_provider(ModelConfig(provider="openai", model="reader"), handler)
+
+    with pytest.raises(ForgeException) as caught:
+        run(provider.generate_text("system", "user", max_output_tokens=10))
+
+    assert caught.value.code is ForgeErrorCode.MODEL_OUTPUT_INVALID
+    assert provider.usage == ProviderUsage()
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        pytest.param("https://gateway.example/v1?tenant=private", id="query"),
+        pytest.param("https://gateway.example/v1#private", id="fragment"),
+    ],
+)
+def test_openai_compatible_rejects_query_or_fragment_before_request(base_url: str) -> None:
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json=response_body())
+
+    config = ModelConfig(
+        provider="openai-compatible",
+        model="reader",
+        base_url=base_url,
+    )
+
+    with pytest.raises(ForgeException) as caught:
+        make_provider(config, handler)
+
+    assert caught.value.code is ForgeErrorCode.CONFIG_INVALID
+    assert caught.value.as_result() == {
+        "ok": False,
+        "error": {
+            "code": "CONFIG_INVALID",
+            "message": "Configuration is invalid.",
+            "retryable": False,
+            "details": {"field": "model.provider"},
+        },
+    }
+    assert request_count == 0
+    assert base_url not in repr(caught.value.as_result())
+
+
+@pytest.mark.parametrize(
     "body",
     [
         "not-json",

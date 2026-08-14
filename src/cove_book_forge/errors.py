@@ -2,6 +2,18 @@ from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+_PUBLIC_DETAIL_KEYS = frozenset({"field", "path"})
+_SENSITIVE_MESSAGE_MARKERS = (
+    "authorization",
+    "bearer",
+    "api key",
+    "api_key",
+    "apikey",
+    "request",
+    "source body",
+)
+_GENERIC_PUBLIC_MESSAGE = "An internal error occurred."
+
 
 class ForgeErrorCode(StrEnum):
     CONFIG_INVALID = "CONFIG_INVALID"
@@ -54,8 +66,21 @@ class ForgeException(RuntimeError):
     def as_result(self) -> dict[str, object]:
         detail = ForgeErrorDetail(
             code=self.code,
-            message=str(self),
+            message=self._public_message(),
             retryable=self.retryable,
-            details=self.details,
+            details=self._public_details(),
         )
         return {"ok": False, "error": detail.model_dump(mode="json")}
+
+    def _public_message(self) -> str:
+        message = str(self)
+        if any(marker in message.lower() for marker in _SENSITIVE_MESSAGE_MARKERS):
+            return _GENERIC_PUBLIC_MESSAGE
+        return message
+
+    def _public_details(self) -> dict[str, JsonValue]:
+        return {
+            key: value
+            for key, value in self.details.items()
+            if key in _PUBLIC_DETAIL_KEYS and isinstance(value, str)
+        }

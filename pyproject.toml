@@ -10,8 +10,11 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
+  "beautifulsoup4>=4.13,<5",
+  "defusedxml>=0.7,<1",
   "platformdirs>=4.3,<5",
   "pydantic>=2.11,<3",
+  "pypdf>=5,<7",
   "PyYAML>=6.0,<7",
   "typer>=0.16,<1",
 ]

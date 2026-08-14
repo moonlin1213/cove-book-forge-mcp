@@ -10,6 +10,14 @@ from cove_book_forge.contracts.books import (
     Reflection,
     UserNote,
 )
+from cove_book_forge.contracts.ingestion import (
+    BookFormat,
+    ExtractedBook,
+    ImportedBook,
+    ImportMode,
+    PdfProfile,
+    StoredBook,
+)
 from cove_book_forge.contracts.jobs import (
     CostEstimate,
     ForgeAccepted,
@@ -23,12 +31,14 @@ from cove_book_forge.contracts.jobs import (
 __all__ = [
     "Annotation",
     "BookMetadata",
+    "BookFormat",
     "BookRef",
     "ChapterContent",
     "ChapterSnapshot",
     "CostEstimate",
     "ContractModel",
     "ExternalIdentity",
+    "ExtractedBook",
     "ForgeAccepted",
     "ForgeJob",
     "ForgeJobControl",
@@ -36,6 +46,10 @@ __all__ = [
     "ForgePlan",
     "ForgeTarget",
     "Highlight",
+    "ImportedBook",
+    "ImportMode",
+    "PdfProfile",
     "Reflection",
+    "StoredBook",
     "UserNote",
 ]

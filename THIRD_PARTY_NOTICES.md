@@ -9,6 +9,12 @@ This project is inspired by book-to-skill's document extraction work and
 Agent Skill structure. Any source files copied or modified from the upstream
 project will be listed in this section when they are introduced.
 
+### Concrete reuse
+
+`src/cove_book_forge/extractors/sanitize.py` adapts the upstream text
+sanitization approach to remove invisible and bidirectional control characters
+from extracted document text before it is stored or presented.
+
 MIT License
 
 Copyright (c) 2025 virgiliojr94

@@ -1,4 +1,4 @@
-"""Optional local managed-book library.
+"""Optional local managed-book library and external snapshot cache.
 
 Importing this package does not initialize storage. Call ``initialize`` on a
 library database or service instance explicitly.

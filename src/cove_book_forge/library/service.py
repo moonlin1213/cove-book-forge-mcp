@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -11,8 +12,11 @@ from uuid import uuid4
 
 from cove_book_forge.config import AppConfig, library_data_path
 from cove_book_forge.contracts import (
+    BookMetadata,
     BookRef,
     ChapterContent,
+    ChapterSnapshot,
+    ExternalIdentity,
     ImportedBook,
     ImportMode,
     StoredBook,
@@ -22,7 +26,9 @@ from cove_book_forge.extractors import BookExtractorRegistry
 from cove_book_forge.extractors.security import ExtractionLimits, fingerprint_source
 from cove_book_forge.library.database import LibraryDatabase
 from cove_book_forge.library.repository import (
+    ExternalBookRecord,
     LibraryBookRecord,
+    LibraryRecord,
     LibraryRepository,
     PersistedBook,
 )
@@ -68,6 +74,23 @@ def _source_changed(cause: BaseException | None = None) -> ForgeException:
         "Source changed while it was copied.",
         cause=cause,
     )
+
+
+def _canonical_json(value: object) -> str:
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise _storage_unavailable(exc) from exc
+
+
+def _canonical_fingerprint(payload: str) -> str:
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _open_binary(path: Path, mode: str) -> BinaryIO:
@@ -443,6 +466,36 @@ class BookLibrary:
 
             return self._import_copy(source, imported, extracted.chapters)
 
+    def upsert_external_book(
+        self,
+        identity: ExternalIdentity,
+        metadata: BookMetadata,
+    ) -> BookRef:
+        self._require_initialized()
+        identity_json = _canonical_json(identity.model_dump(mode="json"))
+        with self._data_root_guard():
+            record = self._repository.upsert_external_book(
+                identity,
+                metadata,
+                candidate=BookRef(book_id=uuid4().hex),
+                source_fingerprint=_canonical_fingerprint(identity_json),
+            )
+        return record.book
+
+    def upsert_chapter_snapshot(self, snapshot: ChapterSnapshot) -> BookRef:
+        self._require_initialized()
+        snapshot_json = _canonical_json(snapshot.model_dump(mode="json"))
+        identity_json = _canonical_json(snapshot.external_identity.model_dump(mode="json"))
+        with self._data_root_guard():
+            record = self._repository.upsert_chapter_snapshot(
+                snapshot,
+                candidate=BookRef(book_id=uuid4().hex),
+                book_fingerprint=_canonical_fingerprint(identity_json),
+                snapshot_json=snapshot_json,
+                content_fingerprint=_canonical_fingerprint(snapshot_json),
+            )
+        return record.book
+
     def list_books(self) -> tuple[StoredBook, ...]:
         self._require_initialized()
         with self._data_root_guard():
@@ -661,7 +714,16 @@ class BookLibrary:
         except (OSError, sqlite3.Error) as exc:
             raise _storage_unavailable(exc) from exc
 
-    def _to_stored(self, record: LibraryBookRecord) -> StoredBook:
+    def _to_stored(self, record: LibraryRecord) -> StoredBook:
+        if isinstance(record, ExternalBookRecord):
+            return StoredBook(
+                book=record.book,
+                metadata=record.metadata,
+                source_fingerprint=record.source_fingerprint,
+                source_available=True,
+                created_at=record.created_at,
+                updated_at=record.updated_at,
+            )
         imported = record.imported
         return StoredBook(
             book=imported.book,

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import sqlite3
 import stat
@@ -65,6 +67,20 @@ _SCHEMA_V1 = (
     """,
 )
 
+_SCHEMA_V2_CHAPTER_SNAPSHOTS = """
+CREATE TABLE chapter_snapshots (
+    chapter_snapshot_id INTEGER PRIMARY KEY,
+    external_source_id INTEGER NOT NULL
+        REFERENCES external_sources(external_source_id) ON DELETE CASCADE,
+    chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),
+    snapshot_json TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (external_source_id, chapter_index)
+)
+"""
+
 
 @dataclass(frozen=True, slots=True)
 class _DatabaseFileAnchor:
@@ -121,7 +137,13 @@ class LibraryDatabase:
                 if version == 0:
                     for statement in _SCHEMA_V1:
                         connection.execute(statement)
-                    connection.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+                    connection.execute("PRAGMA user_version = 1")
+                columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(chapter_snapshots)").fetchall()
+                }
+                if "content_fingerprint" not in columns:
+                    self._migrate_snapshot_fingerprints(connection)
         except ForgeException:
             if opened_here:
                 self._close_connection()
@@ -130,6 +152,42 @@ class LibraryDatabase:
             if opened_here:
                 self._close_connection()
             raise _safe_database_error(exc) from exc
+
+    @staticmethod
+    def _migrate_snapshot_fingerprints(connection: sqlite3.Connection) -> None:
+        connection.execute("ALTER TABLE chapter_snapshots RENAME TO chapter_snapshots_v1")
+        connection.execute(_SCHEMA_V2_CHAPTER_SNAPSHOTS)
+        rows = connection.execute(
+            "SELECT * FROM chapter_snapshots_v1 ORDER BY chapter_snapshot_id"
+        ).fetchall()
+        for row in rows:
+            payload = json.loads(str(row["snapshot_json"]))
+            canonical = json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            connection.execute(
+                """
+                INSERT INTO chapter_snapshots (
+                    chapter_snapshot_id, external_source_id, chapter_index,
+                    snapshot_json, content_fingerprint, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["chapter_snapshot_id"],
+                    row["external_source_id"],
+                    row["chapter_index"],
+                    canonical,
+                    fingerprint,
+                    row["created_at"],
+                    row["updated_at"],
+                ),
+            )
+        connection.execute("DROP TABLE chapter_snapshots_v1")
 
     def _open_stable_connection(self) -> sqlite3.Connection:
         if self._file_anchor is not None:

@@ -11,6 +11,8 @@ from cove_book_forge.contracts import (
     BookMetadata,
     BookRef,
     ChapterContent,
+    ChapterSnapshot,
+    ExternalIdentity,
     ImportedBook,
     ImportMode,
 )
@@ -33,6 +35,18 @@ class PersistedBook:
     created: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ExternalBookRecord:
+    book: BookRef
+    metadata: BookMetadata
+    source_fingerprint: str
+    created_at: datetime
+    updated_at: datetime
+
+
+LibraryRecord = LibraryBookRecord | ExternalBookRecord
+
+
 def _storage_error(exc: BaseException) -> ForgeException:
     return ForgeException(
         ForgeErrorCode.OUTPUT_PERMISSION_DENIED,
@@ -45,8 +59,15 @@ def _not_found() -> ForgeException:
     return ForgeException(ForgeErrorCode.SOURCE_NOT_FOUND, "Stored source was not found.")
 
 
+def _external_incomplete() -> ForgeException:
+    return ForgeException(
+        ForgeErrorCode.EXTERNAL_BOOK_INCOMPLETE,
+        "External book snapshot is incomplete.",
+    )
+
+
 class LibraryRepository:
-    """Own managed-library SQL and conversion from rows to typed records."""
+    """Own library SQL and conversion from rows to typed records."""
 
     def __init__(self, database: LibraryDatabase) -> None:
         self._database = database
@@ -75,7 +96,7 @@ class LibraryRepository:
                     """,
                     (book_format.value, source_fingerprint),
                 ).fetchone()
-            return None if row is None else self._map_book(row)
+            return None if row is None else self._map_managed_book(row)
         except ForgeException:
             raise
         except (sqlite3.Error, TypeError, ValueError, ValidationError) as exc:
@@ -100,7 +121,10 @@ class LibraryRepository:
                     (imported.format.value, imported.source_fingerprint),
                 ).fetchone()
                 if existing is not None:
-                    return PersistedBook(record=self._map_book(existing), created=False)
+                    return PersistedBook(
+                        record=self._map_managed_book(existing),
+                        created=False,
+                    )
 
                 metadata = imported.metadata
                 connection.execute(
@@ -154,11 +178,206 @@ class LibraryRepository:
         except sqlite3.Error as exc:
             raise _storage_error(exc) from exc
 
-    def list_books(self) -> tuple[LibraryBookRecord, ...]:
+    def upsert_external_book(
+        self,
+        identity: ExternalIdentity,
+        metadata: BookMetadata,
+        *,
+        candidate: BookRef,
+        source_fingerprint: str,
+    ) -> ExternalBookRecord:
+        try:
+            with self._database.transaction() as connection:
+                _external_source_id, record = self._upsert_external_book(
+                    connection,
+                    identity,
+                    metadata,
+                    candidate=candidate,
+                    source_fingerprint=source_fingerprint,
+                    minimum_total=0,
+                )
+            return record
+        except ForgeException:
+            raise
+        except (sqlite3.Error, TypeError, ValueError, ValidationError) as exc:
+            raise _storage_error(exc) from exc
+
+    def upsert_chapter_snapshot(
+        self,
+        snapshot: ChapterSnapshot,
+        *,
+        candidate: BookRef,
+        book_fingerprint: str,
+        snapshot_json: str,
+        content_fingerprint: str,
+    ) -> ExternalBookRecord:
+        try:
+            with self._database.transaction() as connection:
+                external_source_id, record = self._upsert_external_book(
+                    connection,
+                    snapshot.external_identity,
+                    snapshot.book,
+                    candidate=candidate,
+                    source_fingerprint=book_fingerprint,
+                    minimum_total=snapshot.chapter.index + 1,
+                )
+                now = record.updated_at.isoformat()
+                connection.execute(
+                    """
+                    INSERT INTO chapter_snapshots (
+                        external_source_id, chapter_index, snapshot_json,
+                        content_fingerprint, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (external_source_id, chapter_index) DO UPDATE SET
+                        snapshot_json = excluded.snapshot_json,
+                        content_fingerprint = excluded.content_fingerprint,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        external_source_id,
+                        snapshot.chapter.index,
+                        snapshot_json,
+                        content_fingerprint,
+                        now,
+                        now,
+                    ),
+                )
+                chapter = snapshot.chapter
+                connection.execute(
+                    """
+                    INSERT INTO chapters (
+                        book_id, chapter_index, title, content, source_locator
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT (book_id, chapter_index) DO UPDATE SET
+                        title = excluded.title,
+                        content = excluded.content,
+                        source_locator = excluded.source_locator
+                    """,
+                    (
+                        record.book.book_id,
+                        chapter.index,
+                        chapter.title,
+                        chapter.content,
+                        chapter.source_locator,
+                    ),
+                )
+            return record
+        except ForgeException:
+            raise
+        except (sqlite3.Error, TypeError, ValueError, ValidationError) as exc:
+            raise _storage_error(exc) from exc
+
+    @staticmethod
+    def _upsert_external_book(
+        connection: sqlite3.Connection,
+        identity: ExternalIdentity,
+        metadata: BookMetadata,
+        *,
+        candidate: BookRef,
+        source_fingerprint: str,
+        minimum_total: int,
+    ) -> tuple[int, ExternalBookRecord]:
+        existing = connection.execute(
+            """
+            SELECT es.external_source_id, b.*
+            FROM external_sources AS es
+            JOIN books AS b ON b.book_id = es.book_id
+            WHERE es.source_system = ? AND es.external_book_id = ?
+            """,
+            (identity.source_system, identity.external_book_id),
+        ).fetchone()
+        now = datetime.now(UTC)
+        requested_total = max(metadata.total_chapters, minimum_total)
+        if existing is not None:
+            book = BookRef(book_id=str(existing["book_id"]))
+            created_at = datetime.fromisoformat(str(existing["created_at"]))
+            total_chapters = max(int(existing["total_chapters"]), requested_total)
+            connection.execute(
+                """
+                UPDATE books
+                SET title = ?, author = ?, language = ?, total_chapters = ?,
+                    source_fingerprint = ?, updated_at = ?
+                WHERE book_id = ?
+                """,
+                (
+                    metadata.title,
+                    metadata.author,
+                    metadata.language,
+                    total_chapters,
+                    source_fingerprint,
+                    now.isoformat(),
+                    book.book_id,
+                ),
+            )
+            external_source_id = int(existing["external_source_id"])
+            connection.execute(
+                "UPDATE external_sources SET updated_at = ? WHERE external_source_id = ?",
+                (now.isoformat(), external_source_id),
+            )
+        else:
+            book = candidate
+            created_at = now
+            total_chapters = requested_total
+            connection.execute(
+                """
+                INSERT INTO books (
+                    book_id, title, author, language, total_chapters,
+                    source_fingerprint, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    book.book_id,
+                    metadata.title,
+                    metadata.author,
+                    metadata.language,
+                    total_chapters,
+                    source_fingerprint,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            cursor = connection.execute(
+                """
+                INSERT INTO external_sources (
+                    book_id, source_system, external_book_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    book.book_id,
+                    identity.source_system,
+                    identity.external_book_id,
+                    now.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+            if cursor.lastrowid is None:
+                raise sqlite3.DatabaseError("external source row id was not returned")
+            external_source_id = cursor.lastrowid
+        record = ExternalBookRecord(
+            book=book,
+            metadata=BookMetadata(
+                title=metadata.title,
+                author=metadata.author,
+                language=metadata.language,
+                total_chapters=total_chapters,
+            ),
+            source_fingerprint=source_fingerprint,
+            created_at=created_at,
+            updated_at=now,
+        )
+        return external_source_id, record
+
+    def list_books(self) -> tuple[LibraryRecord, ...]:
         try:
             with self._database.connect() as connection:
                 rows = connection.execute(
-                    "SELECT * FROM books ORDER BY created_at ASC, book_id ASC"
+                    """
+                    SELECT b.*, EXISTS (
+                        SELECT 1 FROM external_sources AS es WHERE es.book_id = b.book_id
+                    ) AS is_external
+                    FROM books AS b
+                    ORDER BY b.created_at ASC, b.book_id ASC
+                    """
                 ).fetchall()
             return tuple(self._map_book(row) for row in rows)
         except ForgeException:
@@ -166,11 +385,17 @@ class LibraryRepository:
         except (sqlite3.Error, TypeError, ValueError, ValidationError) as exc:
             raise _storage_error(exc) from exc
 
-    def get_book(self, book: BookRef) -> LibraryBookRecord:
+    def get_book(self, book: BookRef) -> LibraryRecord:
         try:
             with self._database.connect() as connection:
                 row = connection.execute(
-                    "SELECT * FROM books WHERE book_id = ?",
+                    """
+                    SELECT b.*, EXISTS (
+                        SELECT 1 FROM external_sources AS es WHERE es.book_id = b.book_id
+                    ) AS is_external
+                    FROM books AS b
+                    WHERE b.book_id = ?
+                    """,
                     (book.book_id,),
                 ).fetchone()
             if row is None:
@@ -192,8 +417,14 @@ class LibraryRepository:
                     """,
                     (book.book_id, index),
                 ).fetchone()
-            if row is None:
-                raise _not_found()
+                if row is None:
+                    external = connection.execute(
+                        "SELECT 1 FROM external_sources WHERE book_id = ?",
+                        (book.book_id,),
+                    ).fetchone()
+                    if external is not None:
+                        raise _external_incomplete()
+                    raise _not_found()
             return ChapterContent(
                 index=int(row["chapter_index"]),
                 title=str(row["title"]),
@@ -222,7 +453,13 @@ class LibraryRepository:
         )
 
     @staticmethod
-    def _map_book(row: sqlite3.Row) -> LibraryBookRecord:
+    def _map_book(row: sqlite3.Row) -> LibraryRecord:
+        if bool(row["is_external"]):
+            return LibraryRepository._map_external_book(row)
+        return LibraryRepository._map_managed_book(row)
+
+    @staticmethod
+    def _map_managed_book(row: sqlite3.Row) -> LibraryBookRecord:
         source_fingerprint = row["source_fingerprint"]
         book_format = row["format"]
         import_mode = row["import_mode"]
@@ -248,6 +485,30 @@ class LibraryRepository:
             imported=imported,
             managed_source_path=str(managed_path) if managed_path is not None else None,
             reference_source_path=Path(str(reference_path)) if reference_path is not None else None,
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+            updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        )
+
+    @staticmethod
+    def _map_external_book(row: sqlite3.Row) -> ExternalBookRecord:
+        source_fingerprint = row["source_fingerprint"]
+        if (
+            not isinstance(source_fingerprint, str)
+            or row["format"] is not None
+            or row["import_mode"] is not None
+            or row["managed_source_path"] is not None
+            or row["reference_source_path"] is not None
+        ):
+            raise ValueError("external book provenance is invalid")
+        return ExternalBookRecord(
+            book=BookRef(book_id=str(row["book_id"])),
+            metadata=BookMetadata(
+                title=str(row["title"]),
+                author=str(row["author"]),
+                language=str(row["language"]),
+                total_chapters=int(row["total_chapters"]),
+            ),
+            source_fingerprint=source_fingerprint,
             created_at=datetime.fromisoformat(str(row["created_at"])),
             updated_at=datetime.fromisoformat(str(row["updated_at"])),
         )

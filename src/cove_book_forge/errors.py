@@ -70,6 +70,6 @@ class ForgeException(RuntimeError):
 
     def _public_details(self) -> dict[str, JsonValue]:
         field = self.details.get("field")
-        if field in _PUBLIC_FIELD_VALUES:
+        if isinstance(field, str) and field in _PUBLIC_FIELD_VALUES:
             return {"field": field}
         return {}

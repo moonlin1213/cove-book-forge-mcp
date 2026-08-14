@@ -1,4 +1,5 @@
 import pytest
+from pydantic import JsonValue
 
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 
@@ -92,6 +93,17 @@ def test_forge_exception_keeps_safe_dotted_field_identifier() -> None:
     ],
 )
 def test_forge_exception_drops_identifier_shaped_sensitive_field_values(field: str) -> None:
+    exc = ForgeException(
+        ForgeErrorCode.CONFIG_INVALID,
+        "Untrusted caller text.",
+        details={"field": field},
+    )
+
+    assert exc.as_result()["error"]["details"] == {}
+
+
+@pytest.mark.parametrize("field", [[], {}])
+def test_forge_exception_drops_non_string_field_values(field: JsonValue) -> None:
     exc = ForgeException(
         ForgeErrorCode.CONFIG_INVALID,
         "Untrusted caller text.",

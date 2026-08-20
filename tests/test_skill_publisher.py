@@ -614,6 +614,20 @@ def test_restart_never_adopts_or_deletes_unowned_transaction_debris(tmp_path: Pa
     assert (competitor / "competitor.txt").read_text(encoding="utf-8") == "keep"
 
 
+def test_restart_preserves_an_unowned_delete_slot_without_an_intent(tmp_path: Path) -> None:
+    rendered = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(rendered)
+    competitor = tmp_path / ".cove-book-forge" / "activations" / f".delete-{'f' * 32}"
+    competitor.write_bytes(b"competitor")
+
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(rendered)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert competitor.read_bytes() == b"competitor"
+
+
 def test_transaction_recovery_preserves_a_same_size_wrong_digest(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1030,6 +1044,81 @@ def test_terminal_journal_removal_hard_crash_recovers_the_proven_empty_wrapper(
 
     _run_skill_cleanup_hard_crash(tmp_path, "cleanup:terminal-journal-removed")
     assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+    _publisher(tmp_path).publish(third)
+
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    assert list(quarantine.iterdir()) == []
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "cleanup:stage-created",
+        "cleanup:journal-writing",
+        "cleanup:closing-writing",
+        "cleanup:delete-renamed",
+    ],
+)
+def test_cleanup_transition_hard_crashes_recover_without_visible_debris(
+    tmp_path: Path,
+    checkpoint: str,
+) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+
+    _run_skill_cleanup_hard_crash(tmp_path, checkpoint)
+    management = tmp_path / ".cove-book-forge"
+    quarantine = management / "quarantine"
+    if checkpoint == "cleanup:stage-created":
+        assert list(quarantine.glob("stage-intent-*.json"))
+        assert list(quarantine.glob("stage-ready-*.json"))
+        assert list(quarantine.glob("stage-*"))
+    elif checkpoint == "cleanup:journal-writing":
+        assert list(quarantine.glob("stage-intent-*.json"))
+        assert list(quarantine.glob("stage-*/journal.partial"))
+    elif checkpoint == "cleanup:closing-writing":
+        assert list(quarantine.glob("closing-intent-*.json"))
+        partials = list(quarantine.glob(".closing-*.partial"))
+        assert partials and all(path.stat().st_size > 0 for path in partials)
+    else:
+        assert list(management.rglob("delete-intent-*.json"))
+        assert list(management.rglob(".delete-*"))
+
+    _publisher(tmp_path).publish(third)
+
+    assert list(quarantine.iterdir()) == []
+    assert not [
+        path
+        for path in management.rglob("*")
+        if path.name.startswith((".delete-", "delete-intent-", "retired-"))
+    ]
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+
+def test_stage_creation_crashes_never_exhaust_the_transition_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+
+    for _ in range(128):
+        publisher = _publisher(tmp_path)
+
+        def interrupt(phase: str) -> None:
+            if phase == "cleanup:stage-created":
+                raise SimulatedProcessCrash(phase)
+
+        monkeypatch.setattr(publisher, "_checkpoint", interrupt)
+        with pytest.raises(SimulatedProcessCrash, match="stage-created"):
+            publisher.publish(third)
 
     _publisher(tmp_path).publish(third)
 

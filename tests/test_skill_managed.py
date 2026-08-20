@@ -257,6 +257,27 @@ def test_resigned_managed_markdown_allows_escaped_angle_bracket_text() -> None:
     assert validate_skill_bundle(files).skill_slug == rendered.skill_slug
 
 
+@pytest.mark.parametrize(
+    "raw_html",
+    [
+        b'\\<form action="glossary.md">\n',
+        b"\\\\<!-- hidden navigation -->\n",
+        b"\\\\\\<!DOCTYPE html>\n",
+    ],
+)
+def test_resigned_managed_markdown_rejects_raw_html_after_any_backslashes(
+    raw_html: bytes,
+) -> None:
+    rendered = _render()
+    path = "SKILL.md"
+    files = _resigned_file_mutation(rendered, path, rendered.files[path] + raw_html)
+
+    with pytest.raises(ForgeException) as error:
+        validate_skill_bundle(files)
+
+    assert _error_code(error) is ForgeErrorCode.EXTERNAL_MODIFICATION
+
+
 def test_markdown_navigation_probe_reaches_the_semantic_scanner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

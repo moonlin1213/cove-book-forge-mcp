@@ -55,6 +55,16 @@ _ACTIVATION_NAME = re.compile(r"^activate-([0-9a-f]{32})$")
 _QUARANTINE_NAME = re.compile(r"^q-([0-9a-f]{32})$")
 _QUARANTINE_STAGE_NAME = re.compile(r"^stage-([0-9a-f]{32})$")
 _QUARANTINE_CLOSING_NAME = re.compile(r"^closing-(q-[0-9a-f]{32})\.json$")
+_STAGE_INTENT_NAME = re.compile(r"^stage-intent-([0-9a-f]{32})\.json$")
+_STAGE_READY_NAME = re.compile(r"^stage-ready-([0-9a-f]{32})\.json$")
+_CLOSING_INTENT_NAME = re.compile(r"^closing-intent-(q-[0-9a-f]{32})\.json$")
+_CLOSING_PARTIAL_NAME = re.compile(r"^\.closing-(q-[0-9a-f]{32})\.partial$")
+_DELETE_INTENT_NAME = re.compile(r"^delete-intent-([0-9a-f]{32})\.json$")
+_DELETE_INTENT_TEMP_NAME = re.compile(r"^\.delete-intent-([0-9a-f]{32})\.tmp$")
+_DELETE_SLOT_NAME = re.compile(r"^\.delete-([0-9a-f]{32})$")
+_RETIRED_RECORD_NAME = re.compile(
+    r"^retired-(?:stage-intent|stage-ready|closing-intent|delete-intent)-[a-z0-9-]+\.json$"
+)
 _TARGET = re.compile(r"^\.cove-book-forge/generations/([0-9a-f]{16})/gen-([0-9a-f]{64})/content$")
 _ROOT_OWNER_BYTES: Final = b'{"owner":"cove-book-forge-canonical-skills","schema":1}'
 _SECURE_PRIMITIVES: Final = (
@@ -85,6 +95,27 @@ def _canonical_json(payload: Mapping[str, object]) -> bytes:
         separators=(",", ":"),
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _checksummed_record(payload: Mapping[str, object]) -> bytes:
+    unsigned = dict(payload)
+    if "checksum" in unsigned:
+        raise ValueError("record payload already contains a checksum")
+    checksum = hashlib.sha256(_canonical_json(unsigned)).hexdigest()
+    return _canonical_json({**unsigned, "checksum": checksum})
+
+
+def _load_checksummed_record(data: bytes) -> dict[str, Any]:
+    record = _load_unique_json(data)
+    checksum = record.get("checksum")
+    unsigned = {key: value for key, value in record.items() if key != "checksum"}
+    if (
+        not isinstance(checksum, str)
+        or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
+        or hashlib.sha256(_canonical_json(unsigned)).hexdigest() != checksum
+    ):
+        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+    return record
 
 
 def _load_unique_json(data: bytes, *, max_bytes: int = _MAX_OWNER_BYTES) -> dict[str, Any]:
@@ -522,6 +553,12 @@ class CanonicalSkillPublisher:
         management: _Management | None = None
         try:
             management = self._management(anchor)
+            for directory_fd in (
+                management.transactions,
+                management.activations,
+                management.state,
+            ):
+                self._recover_delete_transitions(directory_fd)
             self._recover_transactions(management)
             self._recover_activations(anchor, management)
             self._recover_quarantines(management)
@@ -1140,18 +1177,394 @@ class CanonicalSkillPublisher:
         _fsync_directory(management.activations)
         return name, _identity(entry)
 
-    def _delete_slot(self, directory_fd: int, name: str) -> str:
-        for _ in range(4):
-            slot = f".delete-{uuid4().hex}"
-            if _rename_noreplace(
-                name,
-                slot,
-                source_fd=directory_fd,
-                destination_fd=directory_fd,
+    def _publish_record(
+        self,
+        directory_fd: int,
+        *,
+        temporary_name: str,
+        record_name: str,
+        payload: bytes,
+    ) -> _Identity:
+        temporary_identity = _write_file(directory_fd, temporary_name, payload)
+        if not _rename_noreplace(
+            temporary_name,
+            record_name,
+            source_fd=directory_fd,
+            destination_fd=directory_fd,
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        _fsync_directory(directory_fd)
+        stored, record_identity = _read_file(directory_fd, record_name, max_bytes=_MAX_OWNER_BYTES)
+        if stored != payload or record_identity != temporary_identity:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return record_identity
+
+    def _retire_record(
+        self,
+        directory_fd: int,
+        *,
+        record_name: str,
+        retired_name: str,
+        payload: bytes,
+        identity: _Identity,
+    ) -> None:
+        if not _rename_noreplace(
+            record_name,
+            retired_name,
+            source_fd=directory_fd,
+            destination_fd=directory_fd,
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        _fsync_directory(directory_fd)
+        stored, retired_identity = _read_file(
+            directory_fd, retired_name, max_bytes=_MAX_OWNER_BYTES
+        )
+        if stored != payload or retired_identity != identity:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        os.unlink(retired_name, dir_fd=directory_fd)
+        _fsync_directory(directory_fd)
+
+    def _recover_retired_records(self, directory_fd: int) -> None:
+        for retired_name in _bounded_names(directory_fd, _MAX_TREE_ENTRIES):
+            if _RETIRED_RECORD_NAME.fullmatch(retired_name) is None:
+                continue
+            payload, identity = _read_file(directory_fd, retired_name, max_bytes=_MAX_OWNER_BYTES)
+            record = _load_checksummed_record(payload)
+            if (
+                record.get("retired_name") != retired_name
+                or not isinstance(record.get("record_name"), str)
+                or _raw_entry(directory_fd, record["record_name"]) is not None
             ):
-                _fsync_directory(directory_fd)
-                return slot
-        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            stored, stored_identity = _read_file(directory_fd, retired_name, max_bytes=len(payload))
+            if stored != payload or stored_identity != identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            os.unlink(retired_name, dir_fd=directory_fd)
+            _fsync_directory(directory_fd)
+
+    def _write_interrupted_file(
+        self,
+        directory_fd: int,
+        *,
+        partial_name: str,
+        final_name: str,
+        payload: bytes,
+        checkpoint: str,
+    ) -> _Identity:
+        descriptor = os.open(partial_name, _CREATE_FLAGS, 0o600, dir_fd=directory_fd)
+        try:
+            split = max(1, len(payload) // 2)
+            written = 0
+            while written < split:
+                count = os.write(descriptor, payload[written:split])
+                if count <= 0:
+                    raise OSError(errno.EIO, "short write")
+                written += count
+            self._checkpoint(checkpoint)
+            while written < len(payload):
+                count = os.write(descriptor, payload[written:])
+                if count <= 0:
+                    raise OSError(errno.EIO, "short write")
+                written += count
+            os.fsync(descriptor)
+            status = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(status.st_mode)
+                or status.st_nlink != 1
+                or status.st_size != len(payload)
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            partial_identity = _identity(status)
+        finally:
+            os.close(descriptor)
+        if not _rename_noreplace(
+            partial_name,
+            final_name,
+            source_fd=directory_fd,
+            destination_fd=directory_fd,
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        _fsync_directory(directory_fd)
+        stored, final_identity = _read_file(directory_fd, final_name, max_bytes=len(payload))
+        if stored != payload or final_identity != partial_identity:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return final_identity
+
+    def _delete_intent_payload(
+        self,
+        *,
+        record_name: str,
+        retired_name: str,
+        source_name: str,
+        destination_name: str,
+        status: os.stat_result,
+        digest: str | None,
+        target: str | None,
+    ) -> bytes:
+        return _checksummed_record(
+            {
+                "destination_name": destination_name,
+                "digest": digest,
+                "entry_dev": status.st_dev,
+                "entry_ino": status.st_ino,
+                "entry_type": stat.S_IFMT(status.st_mode),
+                "nlink": status.st_nlink,
+                "owner": "cove-book-forge-delete-intent",
+                "record_name": record_name,
+                "retired_name": retired_name,
+                "schema": 1,
+                "size": status.st_size,
+                "source_name": source_name,
+                "target": target,
+            }
+        )
+
+    def _parse_delete_intent(
+        self, payload: bytes, *, record_name: str
+    ) -> tuple[str, str, str, _RawEntry, int, int, str | None]:
+        record = _load_checksummed_record(payload)
+        match = _DELETE_INTENT_NAME.fullmatch(record_name)
+        expected_keys = {
+            "checksum",
+            "destination_name",
+            "digest",
+            "entry_dev",
+            "entry_ino",
+            "entry_type",
+            "nlink",
+            "owner",
+            "record_name",
+            "retired_name",
+            "schema",
+            "size",
+            "source_name",
+            "target",
+        }
+        identifier = match.group(1) if match is not None else ""
+        source_name = record.get("source_name")
+        destination_name = record.get("destination_name")
+        retired_name = record.get("retired_name")
+        entry_type = record.get("entry_type")
+        digest = record.get("digest")
+        target = record.get("target")
+        if (
+            match is None
+            or set(record) != expected_keys
+            or record.get("owner") != "cove-book-forge-delete-intent"
+            or record.get("schema") != 1
+            or record.get("record_name") != record_name
+            or retired_name != f"retired-delete-intent-{identifier}.json"
+            or destination_name != f".delete-{identifier}"
+            or not isinstance(source_name, str)
+            or source_name in {"", ".", ".."}
+            or "/" in source_name
+            or "\\" in source_name
+            or entry_type not in {stat.S_IFREG, stat.S_IFDIR, stat.S_IFLNK}
+            or not isinstance(record.get("entry_dev"), int)
+            or not isinstance(record.get("entry_ino"), int)
+            or not isinstance(record.get("nlink"), int)
+            or record["nlink"] < 1
+            or not isinstance(record.get("size"), int)
+            or record["size"] < 0
+            or entry_type == stat.S_IFREG
+            and (
+                record["nlink"] != 1
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or target is not None
+            )
+            or entry_type == stat.S_IFDIR
+            and (digest is not None or target is not None)
+            or entry_type == stat.S_IFLNK
+            and (digest is not None or not isinstance(target, str))
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        assert isinstance(destination_name, str)
+        assert isinstance(retired_name, str)
+        assert isinstance(entry_type, int)
+        return (
+            source_name,
+            destination_name,
+            retired_name,
+            _RawEntry(entry_type, (record["entry_dev"], record["entry_ino"]), target),
+            record["nlink"],
+            record["size"],
+            digest,
+        )
+
+    def _delete_isolated_entry(
+        self,
+        directory_fd: int,
+        name: str,
+        expected: _RawEntry,
+        *,
+        expected_nlink: int,
+        expected_size: int,
+        expected_digest: str | None,
+    ) -> None:
+        moved = _raw_entry(directory_fd, name)
+        if moved != expected:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        if expected.mode_type == stat.S_IFREG:
+            payload, identity = _read_file(directory_fd, name, max_bytes=expected_size)
+            status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                identity != expected.identity
+                or status.st_nlink != expected_nlink
+                or status.st_size != expected_size
+                or expected_digest is None
+                or hashlib.sha256(payload).hexdigest() != expected_digest
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            os.unlink(name, dir_fd=directory_fd)
+        elif expected.mode_type == stat.S_IFLNK:
+            status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if status.st_nlink != expected_nlink or status.st_size != expected_size:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            os.unlink(name, dir_fd=directory_fd)
+        else:
+            child, identity = _open_directory(directory_fd, name)
+            try:
+                status = os.fstat(child)
+                if (
+                    identity != expected.identity
+                    or status.st_nlink != expected_nlink
+                    or status.st_size != expected_size
+                    or _bounded_names(child, 1)
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=directory_fd)
+        _fsync_directory(directory_fd)
+
+    def _recover_delete_transitions(self, directory_fd: int) -> None:
+        self._recover_retired_records(directory_fd)
+        names = _bounded_names(directory_fd, _MAX_TREE_ENTRIES)
+        for record_name in sorted(names):
+            if _DELETE_INTENT_NAME.fullmatch(record_name) is None:
+                continue
+            payload, record_identity = _read_file(
+                directory_fd, record_name, max_bytes=_MAX_OWNER_BYTES
+            )
+            (
+                source_name,
+                destination_name,
+                retired_name,
+                expected,
+                expected_nlink,
+                expected_size,
+                expected_digest,
+            ) = self._parse_delete_intent(payload, record_name=record_name)
+            source = _raw_entry(directory_fd, source_name)
+            destination = _raw_entry(directory_fd, destination_name)
+            if source == expected and destination is None:
+                pass
+            elif source is None and destination == expected:
+                self._delete_isolated_entry(
+                    directory_fd,
+                    destination_name,
+                    expected,
+                    expected_nlink=expected_nlink,
+                    expected_size=expected_size,
+                    expected_digest=expected_digest,
+                )
+            elif source is not None or destination is not None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            self._retire_record(
+                directory_fd,
+                record_name=record_name,
+                retired_name=retired_name,
+                payload=payload,
+                identity=record_identity,
+            )
+        leftovers = _bounded_names(directory_fd, _MAX_TREE_ENTRIES)
+        if any(
+            _DELETE_SLOT_NAME.fullmatch(name) is not None
+            or _DELETE_INTENT_NAME.fullmatch(name) is not None
+            or _DELETE_INTENT_TEMP_NAME.fullmatch(name) is not None
+            for name in leftovers
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+    def _recover_delete_tree(self, root_fd: int) -> None:
+        visited = 0
+
+        def visit(directory_fd: int) -> None:
+            nonlocal visited
+            self._recover_delete_transitions(directory_fd)
+            remaining = _MAX_TREE_ENTRIES + 32 - visited
+            for name in _bounded_names(directory_fd, remaining):
+                visited += 1
+                if visited > _MAX_TREE_ENTRIES + 32:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISDIR(entry.st_mode):
+                    child, _ = _open_directory(directory_fd, name)
+                    try:
+                        visit(child)
+                    finally:
+                        os.close(child)
+
+        visit(root_fd)
+
+    def _delete_slot(
+        self,
+        directory_fd: int,
+        name: str,
+        *,
+        expected: _RawEntry,
+        expected_nlink: int,
+        expected_digest: str | None,
+        expected_size: int,
+    ) -> tuple[str, str, str, bytes, _Identity]:
+        status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            _raw_entry(directory_fd, name) != expected
+            or _identity(status) != expected.identity
+            or status.st_nlink != expected_nlink
+            or status.st_size != expected_size
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        if stat.S_ISREG(status.st_mode):
+            if expected_digest is None or expected_nlink != 1:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            target = None
+        elif stat.S_ISLNK(status.st_mode):
+            target = os.readlink(name, dir_fd=directory_fd)
+        elif stat.S_ISDIR(status.st_mode):
+            target = None
+        else:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        identifier = uuid4().hex
+        slot = f".delete-{identifier}"
+        record_name = f"delete-intent-{identifier}.json"
+        retired_name = f"retired-delete-intent-{identifier}.json"
+        payload = self._delete_intent_payload(
+            record_name=record_name,
+            retired_name=retired_name,
+            source_name=name,
+            destination_name=slot,
+            status=status,
+            digest=expected_digest,
+            target=target,
+        )
+        record_identity = self._publish_record(
+            directory_fd,
+            temporary_name=f".delete-intent-{identifier}.tmp",
+            record_name=record_name,
+            payload=payload,
+        )
+        if not _rename_noreplace(
+            name,
+            slot,
+            source_fd=directory_fd,
+            destination_fd=directory_fd,
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        _fsync_directory(directory_fd)
+        self._checkpoint("cleanup:delete-renamed")
+        return slot, record_name, retired_name, payload, record_identity
 
     def _unlink_identity(
         self,
@@ -1183,37 +1596,61 @@ class CanonicalSkillPublisher:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         elif not stat.S_ISLNK(current.st_mode):
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-        slot = self._delete_slot(directory_fd, name)
-        moved = _raw_entry(directory_fd, slot)
-        if moved != expected or moved is None or moved.identity != identity:
-            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-        if payload is not None:
-            moved_payload, moved_identity = _read_file(directory_fd, slot, max_bytes=len(payload))
-            if (
-                moved_identity != identity
-                or moved_payload != payload
-                or expected_size is not None
-                and len(moved_payload) != expected_size
-                or expected_digest is not None
-                and hashlib.sha256(moved_payload).hexdigest() != expected_digest
-            ):
-                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-        os.unlink(slot, dir_fd=directory_fd)
-        _fsync_directory(directory_fd)
+        assert expected is not None
+        slot, record_name, retired_name, record_payload, record_identity = self._delete_slot(
+            directory_fd,
+            name,
+            expected=expected,
+            expected_nlink=current.st_nlink,
+            expected_digest=expected_digest,
+            expected_size=current.st_size,
+        )
+        self._delete_isolated_entry(
+            directory_fd,
+            slot,
+            expected,
+            expected_nlink=current.st_nlink,
+            expected_size=current.st_size,
+            expected_digest=expected_digest,
+        )
+        self._retire_record(
+            directory_fd,
+            record_name=record_name,
+            retired_name=retired_name,
+            payload=record_payload,
+            identity=record_identity,
+        )
 
     def _rmdir_identity(self, directory_fd: int, name: str, identity: _Identity) -> None:
         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if _identity(current) != identity or not stat.S_ISDIR(current.st_mode):
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-        slot = self._delete_slot(directory_fd, name)
-        moved_fd, moved_identity = _open_directory(directory_fd, slot)
-        try:
-            if moved_identity != identity or _bounded_names(moved_fd, 1):
-                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-        finally:
-            os.close(moved_fd)
-        os.rmdir(slot, dir_fd=directory_fd)
-        _fsync_directory(directory_fd)
+        expected = _raw_entry(directory_fd, name)
+        if expected is None:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        slot, record_name, retired_name, record_payload, record_identity = self._delete_slot(
+            directory_fd,
+            name,
+            expected=expected,
+            expected_nlink=current.st_nlink,
+            expected_digest=None,
+            expected_size=current.st_size,
+        )
+        self._delete_isolated_entry(
+            directory_fd,
+            slot,
+            expected,
+            expected_nlink=current.st_nlink,
+            expected_size=current.st_size,
+            expected_digest=None,
+        )
+        self._retire_record(
+            directory_fd,
+            record_name=record_name,
+            retired_name=retired_name,
+            payload=record_payload,
+            identity=record_identity,
+        )
 
     def _remove_activation_marker(self, management: _Management, name: str) -> None:
         marker_name = f"{name}.json"
@@ -1472,6 +1909,7 @@ class CanonicalSkillPublisher:
                 raise
             return
         try:
+            self._recover_delete_tree(tx_fd)
             names = set(_bounded_names(tx_fd, 3))
             if _OWNER not in names or not names <= {_OWNER, _CONTENT}:
                 if require_owned:
@@ -1727,6 +2165,166 @@ class CanonicalSkillPublisher:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         return (journal["generation_dev"], journal["generation_ino"]), audit
 
+    def _stage_record_payload(
+        self,
+        *,
+        identifier: str,
+        journal_payload: bytes,
+        stage_identity: _Identity | None,
+        intent_checksum: str | None,
+    ) -> bytes:
+        record_kind = "stage-intent" if stage_identity is None else "stage-ready"
+        split = max(1, len(journal_payload) // 2)
+        return _checksummed_record(
+            {
+                "intent_checksum": intent_checksum,
+                "journal_partial_sha256": hashlib.sha256(journal_payload[:split]).hexdigest(),
+                "journal_partial_size": split,
+                "journal_sha256": hashlib.sha256(journal_payload).hexdigest(),
+                "journal_size": len(journal_payload),
+                "owner": f"cove-book-forge-{record_kind}",
+                "quarantine_name": f"q-{identifier}",
+                "record_name": f"{record_kind}-{identifier}.json",
+                "retired_name": f"retired-{record_kind}-{identifier}.json",
+                "schema": 1,
+                "stage_dev": stage_identity[0] if stage_identity is not None else None,
+                "stage_ino": stage_identity[1] if stage_identity is not None else None,
+                "stage_name": f"stage-{identifier}",
+            }
+        )
+
+    def _parse_stage_record(
+        self,
+        payload: bytes,
+        *,
+        record_name: str,
+        ready: bool,
+    ) -> dict[str, Any]:
+        record = _load_checksummed_record(payload)
+        pattern = _STAGE_READY_NAME if ready else _STAGE_INTENT_NAME
+        match = pattern.fullmatch(record_name)
+        identifier = match.group(1) if match is not None else ""
+        record_kind = "stage-ready" if ready else "stage-intent"
+        if (
+            match is None
+            or set(record)
+            != {
+                "checksum",
+                "intent_checksum",
+                "journal_partial_sha256",
+                "journal_partial_size",
+                "journal_sha256",
+                "journal_size",
+                "owner",
+                "quarantine_name",
+                "record_name",
+                "retired_name",
+                "schema",
+                "stage_dev",
+                "stage_ino",
+                "stage_name",
+            }
+            or record.get("owner") != f"cove-book-forge-{record_kind}"
+            or record.get("schema") != 1
+            or record.get("record_name") != record_name
+            or record.get("retired_name") != f"retired-{record_kind}-{identifier}.json"
+            or record.get("stage_name") != f"stage-{identifier}"
+            or record.get("quarantine_name") != f"q-{identifier}"
+            or not isinstance(record.get("journal_size"), int)
+            or not 0 < record["journal_size"] <= _MAX_OWNER_BYTES
+            or not isinstance(record.get("journal_partial_size"), int)
+            or not 0 < record["journal_partial_size"] <= record["journal_size"]
+            or not isinstance(record.get("journal_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", record["journal_sha256"]) is None
+            or not isinstance(record.get("journal_partial_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", record["journal_partial_sha256"]) is None
+            or ready
+            and (
+                not isinstance(record.get("stage_dev"), int)
+                or not isinstance(record.get("stage_ino"), int)
+                or not isinstance(record.get("intent_checksum"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", record["intent_checksum"]) is None
+            )
+            or not ready
+            and (
+                record.get("stage_dev") is not None
+                or record.get("stage_ino") is not None
+                or record.get("intent_checksum") is not None
+            )
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return record
+
+    def _closing_intent_payload(
+        self,
+        *,
+        quarantine_name: str,
+        wrapper_identity: _Identity,
+        closing_payload: bytes,
+    ) -> bytes:
+        split = max(1, len(closing_payload) // 2)
+        return _checksummed_record(
+            {
+                "closing_partial_sha256": hashlib.sha256(closing_payload[:split]).hexdigest(),
+                "closing_partial_size": split,
+                "closing_sha256": hashlib.sha256(closing_payload).hexdigest(),
+                "closing_size": len(closing_payload),
+                "final_name": f"closing-{quarantine_name}.json",
+                "owner": "cove-book-forge-closing-intent",
+                "partial_name": f".closing-{quarantine_name}.partial",
+                "quarantine_name": quarantine_name,
+                "record_name": f"closing-intent-{quarantine_name}.json",
+                "retired_name": f"retired-closing-intent-{quarantine_name}.json",
+                "schema": 1,
+                "wrapper_dev": wrapper_identity[0],
+                "wrapper_ino": wrapper_identity[1],
+            }
+        )
+
+    def _parse_closing_intent(self, payload: bytes, *, record_name: str) -> dict[str, Any]:
+        record = _load_checksummed_record(payload)
+        match = _CLOSING_INTENT_NAME.fullmatch(record_name)
+        quarantine_name = match.group(1) if match is not None else ""
+        if (
+            match is None
+            or set(record)
+            != {
+                "checksum",
+                "closing_partial_sha256",
+                "closing_partial_size",
+                "closing_sha256",
+                "closing_size",
+                "final_name",
+                "owner",
+                "partial_name",
+                "quarantine_name",
+                "record_name",
+                "retired_name",
+                "schema",
+                "wrapper_dev",
+                "wrapper_ino",
+            }
+            or record.get("owner") != "cove-book-forge-closing-intent"
+            or record.get("schema") != 1
+            or record.get("record_name") != record_name
+            or record.get("retired_name") != f"retired-closing-intent-{quarantine_name}.json"
+            or record.get("quarantine_name") != quarantine_name
+            or record.get("final_name") != f"closing-{quarantine_name}.json"
+            or record.get("partial_name") != f".closing-{quarantine_name}.partial"
+            or not isinstance(record.get("wrapper_dev"), int)
+            or not isinstance(record.get("wrapper_ino"), int)
+            or not isinstance(record.get("closing_size"), int)
+            or not 0 < record["closing_size"] <= _MAX_OWNER_BYTES
+            or not isinstance(record.get("closing_partial_size"), int)
+            or not 0 < record["closing_partial_size"] <= record["closing_size"]
+            or not isinstance(record.get("closing_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", record["closing_sha256"]) is None
+            or not isinstance(record.get("closing_partial_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", record["closing_partial_sha256"]) is None
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return record
+
     def _verified_payload(self, journal_payload: bytes) -> bytes:
         return _canonical_json(
             {
@@ -1861,14 +2459,103 @@ class CanonicalSkillPublisher:
             journal_payload=journal_payload,
             verified_payload=verified_payload,
         )
-        closing_identity = _write_file(management.quarantine, closing_name, closing_payload)
-        _fsync_directory(management.quarantine)
+        intent_name = f"closing-intent-{quarantine_name}.json"
+        retired_name = f"retired-closing-intent-{quarantine_name}.json"
+        intent_payload = self._closing_intent_payload(
+            quarantine_name=quarantine_name,
+            wrapper_identity=wrapper_identity,
+            closing_payload=closing_payload,
+        )
+        intent_identity = self._publish_record(
+            management.quarantine,
+            temporary_name=f".closing-intent-{quarantine_name}.tmp",
+            record_name=intent_name,
+            payload=intent_payload,
+        )
+        closing_identity = self._write_interrupted_file(
+            management.quarantine,
+            partial_name=f".closing-{quarantine_name}.partial",
+            final_name=closing_name,
+            payload=closing_payload,
+            checkpoint="cleanup:closing-writing",
+        )
+        self._retire_record(
+            management.quarantine,
+            record_name=intent_name,
+            retired_name=retired_name,
+            payload=intent_payload,
+            identity=intent_identity,
+        )
         self._finish_closing(
             management,
             closing_name=closing_name,
             closing_payload=closing_payload,
             closing_identity=closing_identity,
         )
+
+    def _recover_closing_intents(self, management: _Management, names: tuple[str, ...]) -> None:
+        for intent_name in sorted(names):
+            if _CLOSING_INTENT_NAME.fullmatch(intent_name) is None:
+                continue
+            intent_payload, intent_identity = _read_file(
+                management.quarantine, intent_name, max_bytes=_MAX_OWNER_BYTES
+            )
+            intent = self._parse_closing_intent(intent_payload, record_name=intent_name)
+            quarantine_name = intent["quarantine_name"]
+            expected_wrapper = _RawEntry(
+                stat.S_IFDIR,
+                (intent["wrapper_dev"], intent["wrapper_ino"]),
+                None,
+            )
+            wrapper = _raw_entry(management.quarantine, quarantine_name)
+            if wrapper is not None and wrapper != expected_wrapper:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            partial_name = intent["partial_name"]
+            final_name = intent["final_name"]
+            partial = _raw_entry(management.quarantine, partial_name)
+            final = _raw_entry(management.quarantine, final_name)
+            if partial is not None and final is not None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            if partial is not None:
+                payload, identity = _read_file(
+                    management.quarantine,
+                    partial_name,
+                    max_bytes=intent["closing_size"],
+                )
+                digest = hashlib.sha256(payload).hexdigest()
+                allowed = {
+                    (intent["closing_partial_size"], intent["closing_partial_sha256"]),
+                    (intent["closing_size"], intent["closing_sha256"]),
+                }
+                if identity != partial.identity or (len(payload), digest) not in allowed:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                self._unlink_identity(
+                    management.quarantine,
+                    partial_name,
+                    identity,
+                    expected_digest=digest,
+                    expected_size=len(payload),
+                )
+            if final is not None:
+                payload, identity = _read_file(
+                    management.quarantine,
+                    final_name,
+                    max_bytes=intent["closing_size"],
+                )
+                if (
+                    identity != final.identity
+                    or len(payload) != intent["closing_size"]
+                    or hashlib.sha256(payload).hexdigest() != intent["closing_sha256"]
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                self._parse_closing(payload, closing_name=final_name)
+            self._retire_record(
+                management.quarantine,
+                record_name=intent_name,
+                retired_name=intent["retired_name"],
+                payload=intent_payload,
+                identity=intent_identity,
+            )
 
     def _remove_audited_payload(
         self,
@@ -1994,37 +2681,156 @@ class CanonicalSkillPublisher:
                 closing_identity=closing_identity,
             )
 
-    def _recover_staged_wrappers(self, management: _Management, names: tuple[str, ...]) -> None:
-        for staging_name in sorted(names):
-            match = _QUARANTINE_STAGE_NAME.fullmatch(staging_name)
+    def _recover_stage_intents(self, management: _Management, names: tuple[str, ...]) -> None:
+        recovered_ready: set[str] = set()
+        for intent_name in sorted(names):
+            match = _STAGE_INTENT_NAME.fullmatch(intent_name)
             if match is None:
                 continue
-            wrapper_fd, wrapper_identity = _open_directory(management.quarantine, staging_name)
-            try:
-                if set(_bounded_names(wrapper_fd, 2)) != {"journal.json"}:
+            identifier = match.group(1)
+            intent_payload, intent_identity = _read_file(
+                management.quarantine, intent_name, max_bytes=_MAX_OWNER_BYTES
+            )
+            intent = self._parse_stage_record(intent_payload, record_name=intent_name, ready=False)
+            ready_name = f"stage-ready-{identifier}.json"
+            ready_payload: bytes | None = None
+            ready_identity: _Identity | None = None
+            ready: dict[str, Any] | None = None
+            if _raw_entry(management.quarantine, ready_name) is not None:
+                ready_payload, ready_identity = _read_file(
+                    management.quarantine, ready_name, max_bytes=_MAX_OWNER_BYTES
+                )
+                ready = self._parse_stage_record(ready_payload, record_name=ready_name, ready=True)
+                if ready["intent_checksum"] != intent["checksum"] or any(
+                    ready[key] != intent[key]
+                    for key in (
+                        "journal_partial_sha256",
+                        "journal_partial_size",
+                        "journal_sha256",
+                        "journal_size",
+                        "quarantine_name",
+                        "stage_name",
+                    )
+                ):
                     raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-                journal_payload, journal_identity = _read_file(
-                    wrapper_fd, "journal.json", max_bytes=_MAX_OWNER_BYTES
+                recovered_ready.add(ready_name)
+            stage_name = intent["stage_name"]
+            quarantine_name = intent["quarantine_name"]
+            stage = _raw_entry(management.quarantine, stage_name)
+            quarantine = _raw_entry(management.quarantine, quarantine_name)
+            if stage is not None and quarantine is not None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            if stage is not None:
+                if (
+                    stage.mode_type != stat.S_IFDIR
+                    or ready is not None
+                    and stage.identity
+                    != (
+                        ready["stage_dev"],
+                        ready["stage_ino"],
+                    )
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                wrapper_fd, wrapper_identity = _open_directory(management.quarantine, stage_name)
+                try:
+                    self._recover_delete_tree(wrapper_fd)
+                    wrapper_names = set(_bounded_names(wrapper_fd, 3))
+                    if not wrapper_names <= {"journal.json", "journal.partial"} or (
+                        ready is None and wrapper_names
+                    ):
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    if len(wrapper_names) > 1:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    for journal_name in wrapper_names:
+                        payload, identity = _read_file(
+                            wrapper_fd,
+                            journal_name,
+                            max_bytes=intent["journal_size"],
+                        )
+                        digest = hashlib.sha256(payload).hexdigest()
+                        if journal_name == "journal.json":
+                            allowed = {(intent["journal_size"], intent["journal_sha256"])}
+                            self._parse_journal(payload, quarantine_name=quarantine_name)
+                        else:
+                            allowed = {
+                                (
+                                    intent["journal_partial_size"],
+                                    intent["journal_partial_sha256"],
+                                ),
+                                (intent["journal_size"], intent["journal_sha256"]),
+                            }
+                        if (len(payload), digest) not in allowed:
+                            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                        self._unlink_identity(
+                            wrapper_fd,
+                            journal_name,
+                            identity,
+                            expected_digest=digest,
+                            expected_size=len(payload),
+                        )
+                finally:
+                    os.close(wrapper_fd)
+                self._rmdir_identity(management.quarantine, stage_name, wrapper_identity)
+            elif quarantine is not None:
+                if (
+                    ready is None
+                    or quarantine.mode_type != stat.S_IFDIR
+                    or quarantine.identity != (ready["stage_dev"], ready["stage_ino"])
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                wrapper_fd, _ = _open_directory(management.quarantine, quarantine_name)
+                try:
+                    if set(_bounded_names(wrapper_fd, 2)) != {"journal.json"}:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    journal_payload, _ = _read_file(
+                        wrapper_fd, "journal.json", max_bytes=intent["journal_size"]
+                    )
+                    if (
+                        len(journal_payload) != intent["journal_size"]
+                        or hashlib.sha256(journal_payload).hexdigest() != intent["journal_sha256"]
+                    ):
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    self._parse_journal(journal_payload, quarantine_name=quarantine_name)
+                finally:
+                    os.close(wrapper_fd)
+            if ready is not None:
+                assert ready_payload is not None and ready_identity is not None
+                self._retire_record(
+                    management.quarantine,
+                    record_name=ready_name,
+                    retired_name=ready["retired_name"],
+                    payload=ready_payload,
+                    identity=ready_identity,
                 )
-                self._parse_journal(
-                    journal_payload,
-                    quarantine_name=f"q-{match.group(1)}",
-                )
-                self._unlink_identity(
-                    wrapper_fd,
-                    "journal.json",
-                    journal_identity,
-                    expected_digest=hashlib.sha256(journal_payload).hexdigest(),
-                    expected_size=len(journal_payload),
-                )
-            finally:
-                os.close(wrapper_fd)
-            self._rmdir_identity(management.quarantine, staging_name, wrapper_identity)
+            self._retire_record(
+                management.quarantine,
+                record_name=intent_name,
+                retired_name=intent["retired_name"],
+                payload=intent_payload,
+                identity=intent_identity,
+            )
+        for name in names:
+            if _STAGE_READY_NAME.fullmatch(name) is not None and name not in recovered_ready:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
 
     def _recover_quarantines(self, management: _Management) -> None:
+        self._recover_delete_transitions(management.quarantine)
+        names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
+        self._recover_closing_intents(management, names)
         names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
         self._recover_closings(management, names)
-        self._recover_staged_wrappers(management, names)
+        names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
+        self._recover_stage_intents(management, names)
+        names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
+        if any(
+            _QUARANTINE_STAGE_NAME.fullmatch(name) is not None
+            or _STAGE_INTENT_NAME.fullmatch(name) is not None
+            or _STAGE_READY_NAME.fullmatch(name) is not None
+            or _CLOSING_INTENT_NAME.fullmatch(name) is not None
+            or _CLOSING_PARTIAL_NAME.fullmatch(name) is not None
+            for name in names
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         for quarantine_name in names:
             if _QUARANTINE_NAME.fullmatch(quarantine_name) is None:
                 continue
@@ -2033,6 +2839,7 @@ class CanonicalSkillPublisher:
             except (FileNotFoundError, ForgeException):
                 continue
             try:
+                self._recover_delete_tree(wrapper_fd)
                 try:
                     journal_payload, _ = _read_file(
                         wrapper_fd, "journal.json", max_bytes=_MAX_OWNER_BYTES
@@ -2117,9 +2924,6 @@ class CanonicalSkillPublisher:
         wrapper_id = uuid4().hex
         staging_name = f"stage-{wrapper_id}"
         quarantine_name = f"q-{wrapper_id}"
-        os.mkdir(staging_name, 0o700, dir_fd=management.quarantine)
-        _fsync_directory(management.quarantine)
-        wrapper_fd, wrapper_identity = _open_directory(management.quarantine, staging_name)
         journal_payload = self._journal_payload(
             quarantine_name=quarantine_name,
             generation_name=generation_name,
@@ -2127,9 +2931,47 @@ class CanonicalSkillPublisher:
             manifest=manifest,
             audit=audit,
         )
+        intent_name = f"stage-intent-{wrapper_id}.json"
+        retired_intent_name = f"retired-stage-intent-{wrapper_id}.json"
+        intent_payload = self._stage_record_payload(
+            identifier=wrapper_id,
+            journal_payload=journal_payload,
+            stage_identity=None,
+            intent_checksum=None,
+        )
+        intent_identity = self._publish_record(
+            management.quarantine,
+            temporary_name=f".stage-intent-{wrapper_id}.tmp",
+            record_name=intent_name,
+            payload=intent_payload,
+        )
+        os.mkdir(staging_name, 0o700, dir_fd=management.quarantine)
+        _fsync_directory(management.quarantine)
+        wrapper_fd, wrapper_identity = _open_directory(management.quarantine, staging_name)
+        ready_name = f"stage-ready-{wrapper_id}.json"
+        retired_ready_name = f"retired-stage-ready-{wrapper_id}.json"
+        intent = _load_checksummed_record(intent_payload)
+        ready_payload = self._stage_record_payload(
+            identifier=wrapper_id,
+            journal_payload=journal_payload,
+            stage_identity=wrapper_identity,
+            intent_checksum=intent["checksum"],
+        )
+        ready_identity = self._publish_record(
+            management.quarantine,
+            temporary_name=f".stage-ready-{wrapper_id}.tmp",
+            record_name=ready_name,
+            payload=ready_payload,
+        )
         try:
-            _write_file(wrapper_fd, "journal.json", journal_payload)
-            _fsync_directory(wrapper_fd)
+            self._checkpoint("cleanup:stage-created")
+            self._write_interrupted_file(
+                wrapper_fd,
+                partial_name="journal.partial",
+                final_name="journal.json",
+                payload=journal_payload,
+                checkpoint="cleanup:journal-writing",
+            )
             self._checkpoint("cleanup:wrapper-staged")
             if not _rename_noreplace(
                 staging_name,
@@ -2143,6 +2985,20 @@ class CanonicalSkillPublisher:
                 stat.S_IFDIR, wrapper_identity, None
             ):
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            self._retire_record(
+                management.quarantine,
+                record_name=ready_name,
+                retired_name=retired_ready_name,
+                payload=ready_payload,
+                identity=ready_identity,
+            )
+            self._retire_record(
+                management.quarantine,
+                record_name=intent_name,
+                retired_name=retired_intent_name,
+                payload=intent_payload,
+                identity=intent_identity,
+            )
             self._checkpoint("cleanup:wrapper-published")
             self._checkpoint("cleanup:quarantine")
             if not _rename_noreplace(

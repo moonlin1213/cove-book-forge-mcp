@@ -5,6 +5,7 @@ import re
 _FENCE_OPENING = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})")
 _TABLE_DELIMITER_CELL = re.compile(r":?-+:?")
 
+
 def split_chapter_content(content: str, max_characters: int) -> tuple[str, ...]:
     """Greedily pack whole Markdown blocks without truncating atomic blocks."""
     if max_characters < 1:

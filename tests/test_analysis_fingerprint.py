@@ -108,9 +108,9 @@ def test_fingerprint_normalizes_line_endings_and_unicode_nfc() -> None:
         }
     )
 
-    assert chapter_input_fingerprint(normalized, AnalysisConfig(), _model()) == chapter_input_fingerprint(
-        equivalent, AnalysisConfig(), _model()
-    )
+    assert chapter_input_fingerprint(
+        normalized, AnalysisConfig(), _model()
+    ) == chapter_input_fingerprint(equivalent, AnalysisConfig(), _model())
 
 
 def test_order_only_changes_to_supplemental_items_do_not_change_the_fingerprint() -> None:
@@ -122,9 +122,9 @@ def test_order_only_changes_to_supplemental_items_do_not_change_the_fingerprint(
         reflections=list(reversed(snapshot.reflections)),
     )
 
-    assert chapter_input_fingerprint(snapshot, AnalysisConfig(), _model()) == chapter_input_fingerprint(
-        reordered, AnalysisConfig(), _model()
-    )
+    assert chapter_input_fingerprint(
+        snapshot, AnalysisConfig(), _model()
+    ) == chapter_input_fingerprint(reordered, AnalysisConfig(), _model())
 
 
 def test_equivalent_supplemental_ids_have_a_total_canonical_sort_order() -> None:
@@ -149,9 +149,9 @@ def test_equivalent_supplemental_ids_have_a_total_canonical_sort_order() -> None
         "first variant",
         "second variant",
     }
-    assert chapter_input_fingerprint(first, AnalysisConfig(), _model()) == chapter_input_fingerprint(
-        reversed_items, AnalysisConfig(), _model()
-    )
+    assert chapter_input_fingerprint(
+        first, AnalysisConfig(), _model()
+    ) == chapter_input_fingerprint(reversed_items, AnalysisConfig(), _model())
 
 
 @pytest.mark.parametrize(
@@ -177,12 +177,14 @@ def test_relevant_content_and_analysis_configuration_changes_invalidate_fingerpr
         changed_payload["user_notes"] = [{"id": "note-a", "text": "changed note"}]
     changed = ChapterSnapshot.model_validate(changed_payload)
 
-    assert chapter_input_fingerprint(baseline, AnalysisConfig(), _model()) != chapter_input_fingerprint(
-        changed, changed_config or AnalysisConfig(), _model()
-    )
+    assert chapter_input_fingerprint(
+        baseline, AnalysisConfig(), _model()
+    ) != chapter_input_fingerprint(changed, changed_config or AnalysisConfig(), _model())
 
 
-def test_schema_change_in_canonical_payload_invalidates_fingerprint(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_schema_change_in_canonical_payload_invalidates_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     baseline = chapter_input_fingerprint(_snapshot(), AnalysisConfig(), _model())
     original = ChapterAnalysis.model_json_schema
 
@@ -199,9 +201,9 @@ def test_provider_identity_only_affects_opted_in_fingerprints() -> None:
     initial = _model()
     changed = _model(provider="anthropic", model="claude", base_url="https://api.anthropic.com")
 
-    assert chapter_input_fingerprint(_snapshot(), AnalysisConfig(), initial) == chapter_input_fingerprint(
-        _snapshot(), AnalysisConfig(), changed
-    )
+    assert chapter_input_fingerprint(
+        _snapshot(), AnalysisConfig(), initial
+    ) == chapter_input_fingerprint(_snapshot(), AnalysisConfig(), changed)
     opted_in = AnalysisConfig(include_provider_in_fingerprint=True)
     assert chapter_input_fingerprint(_snapshot(), opted_in, initial) != chapter_input_fingerprint(
         _snapshot(), opted_in, changed
@@ -217,15 +219,15 @@ def test_provider_identity_only_affects_opted_in_fingerprints() -> None:
     ],
 )
 def test_each_provider_identity_part_only_invalidates_an_opted_in_fingerprint(
-    model_change: dict[str, str]
+    model_change: dict[str, str],
 ) -> None:
     baseline = _model()
     changed = _model(**model_change)
     opted_in = AnalysisConfig(include_provider_in_fingerprint=True)
 
-    assert chapter_input_fingerprint(_snapshot(), AnalysisConfig(), baseline) == chapter_input_fingerprint(
-        _snapshot(), AnalysisConfig(), changed
-    )
+    assert chapter_input_fingerprint(
+        _snapshot(), AnalysisConfig(), baseline
+    ) == chapter_input_fingerprint(_snapshot(), AnalysisConfig(), changed)
     assert chapter_input_fingerprint(_snapshot(), opted_in, baseline) != chapter_input_fingerprint(
         _snapshot(), opted_in, changed
     )
@@ -254,9 +256,9 @@ def test_each_supplemental_collection_invalidates_the_fingerprint_when_its_conte
     changed_payload[field] = [{"id": f"{field}-changed", "text": "changed"}]
     changed = ChapterSnapshot.model_validate(changed_payload)
 
-    assert chapter_input_fingerprint(baseline, AnalysisConfig(), _model()) != chapter_input_fingerprint(
-        changed, AnalysisConfig(), _model()
-    )
+    assert chapter_input_fingerprint(
+        baseline, AnalysisConfig(), _model()
+    ) != chapter_input_fingerprint(changed, AnalysisConfig(), _model())
 
 
 def test_max_chunk_characters_invalidates_the_fingerprint() -> None:
@@ -264,4 +266,6 @@ def test_max_chunk_characters_invalidates_the_fingerprint() -> None:
 
     assert chapter_input_fingerprint(
         snapshot, AnalysisConfig(max_chunk_characters=128), _model()
-    ) != chapter_input_fingerprint(snapshot, AnalysisConfig(max_chunk_characters=1_000_000), _model())
+    ) != chapter_input_fingerprint(
+        snapshot, AnalysisConfig(max_chunk_characters=1_000_000), _model()
+    )

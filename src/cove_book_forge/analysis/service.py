@@ -7,8 +7,13 @@ from dataclasses import dataclass
 from pydantic import ValidationError
 
 from cove_book_forge.analysis.cache import ChapterAnalysisCache
+from cove_book_forge.analysis.chunks import split_chapter_content
 from cove_book_forge.analysis.fingerprint import chapter_input_fingerprint
-from cove_book_forge.analysis.prompts import build_chapter_analysis_prompts
+from cove_book_forge.analysis.prompts import (
+    build_chapter_analysis_prompts,
+    build_chapter_chunk_analysis_prompts,
+    build_chapter_merge_prompts,
+)
 from cove_book_forge.config.models import AnalysisConfig, ModelConfig
 from cove_book_forge.contracts.analysis import AnalyzedChapter, ChapterAnalysis
 from cove_book_forge.contracts.books import ChapterSnapshot
@@ -110,7 +115,36 @@ class ChapterAnalyzer:
         return _AttemptOutcome(analysis=analysis, from_cache=False)
 
     async def _generate_valid_analysis(self, snapshot: ChapterSnapshot) -> ChapterAnalysis:
-        system_prompt, user_prompt = build_chapter_analysis_prompts(snapshot)
+        chunks = split_chapter_content(
+            snapshot.chapter.content,
+            self._analysis_config.max_chunk_characters,
+        )
+        if len(chunks) == 1:
+            return await self._generate_valid_analysis_from_prompts(
+                *build_chapter_analysis_prompts(snapshot)
+            )
+
+        chunk_analyses: list[ChapterAnalysis] = []
+        for chunk_number, chunk in enumerate(chunks, start=1):
+            chunk_analyses.append(
+                await self._generate_valid_analysis_from_prompts(
+                    *build_chapter_chunk_analysis_prompts(
+                        chapter_title=snapshot.chapter.title,
+                        chunk_content=chunk,
+                        chunk_number=chunk_number,
+                        chunk_count=len(chunks),
+                    )
+                )
+            )
+        return await self._generate_valid_analysis_from_prompts(
+            *build_chapter_merge_prompts(snapshot, tuple(chunk_analyses))
+        )
+
+    async def _generate_valid_analysis_from_prompts(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+    ) -> ChapterAnalysis:
         schema = ChapterAnalysis.model_json_schema()
         for attempt in range(2):
             try:

@@ -1000,7 +1000,9 @@ def test_doctor_validates_library_application_schema_without_writing(
     elif case == "v3_missing_column":
         _create_library_schema(database, version=3)
         with closing(sqlite3.connect(database)) as connection, connection:
-            connection.execute("ALTER TABLE chapter_analyses RENAME COLUMN analysis_json TO missing")
+            connection.execute(
+                "ALTER TABLE chapter_analyses RENAME COLUMN analysis_json TO missing"
+            )
     elif case == "v0_unrelated":
         with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute("CREATE TABLE private_unrelated (secret TEXT)")

@@ -29,7 +29,9 @@ Add `AnalysisConfig` to `config/models.py` and `AppConfig.analysis` with backwar
 
 ```python
 class AnalysisConfig(ConfigModel):
-    prompt_template_version: str = Field(default="chapter-analysis-v1", min_length=1, max_length=120)
+    prompt_template_version: str = Field(
+        default="chapter-analysis-v1", min_length=1, max_length=120
+    )
     generator_version: str = Field(default="cove-analysis-v1", min_length=1, max_length=120)
     max_chunk_characters: int = Field(default=24_000, ge=128, le=1_000_000)
     include_provider_in_fingerprint: bool = False
@@ -49,20 +51,29 @@ Add the analysis package with these public/internal boundaries:
 ```python
 class ChapterAnalysisCache(Protocol):
     def load_chapter_analysis(
-        self, source_system: str, external_book_id: str, chapter_index: int,
+        self,
+        source_system: str,
+        external_book_id: str,
+        chapter_index: int,
         input_fingerprint: str,
     ) -> ChapterAnalysis | None: ...
 
     def store_chapter_analysis(
-        self, source_system: str, external_book_id: str, chapter_index: int,
-        input_fingerprint: str, analysis: ChapterAnalysis,
+        self,
+        source_system: str,
+        external_book_id: str,
+        chapter_index: int,
+        input_fingerprint: str,
+        analysis: ChapterAnalysis,
     ) -> None: ...
+
 
 def chapter_input_fingerprint(
     snapshot: ChapterSnapshot,
     analysis_config: AnalysisConfig,
     model_config: ModelConfig,
 ) -> str: ...
+
 
 class ChapterAnalyzer:
     def __init__(
@@ -73,7 +84,9 @@ class ChapterAnalyzer:
         model_config: ModelConfig,
     ) -> None: ...
 
-    async def analyze(self, snapshot: ChapterSnapshot, *, force: bool = False) -> AnalyzedChapter: ...
+    async def analyze(
+        self, snapshot: ChapterSnapshot, *, force: bool = False
+    ) -> AnalyzedChapter: ...
 ```
 
 ---

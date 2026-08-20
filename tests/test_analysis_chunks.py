@@ -45,7 +45,9 @@ def test_splitter_returns_the_original_content_as_one_chunk_when_it_fits() -> No
     assert split_chapter_content(content, max_characters=128) == (content,)
 
 
-def test_splitter_splits_an_oversized_non_atomic_paragraph_at_lossless_character_boundaries() -> None:
+def test_splitter_splits_an_oversized_non_atomic_paragraph_at_lossless_character_boundaries() -> (
+    None
+):
     content = "abcdefghijklmnopqrstuvwxyz"
 
     chunks = split_chapter_content(content, max_characters=7)
@@ -64,7 +66,11 @@ def test_splitter_keeps_four_character_fences_open_until_a_matching_closer(
 
     chunks = split_chapter_content(content, max_characters=18)
 
-    assert chunks == ("Before\n\n", f"{marker}python\ninside\n{fence * 3}\nstill code\n{marker}\n\n", "After")
+    assert chunks == (
+        "Before\n\n",
+        f"{marker}python\ninside\n{fence * 3}\nstill code\n{marker}\n\n",
+        "After",
+    )
     assert "".join(chunks) == content
 
 

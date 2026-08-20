@@ -208,11 +208,7 @@ def _inspect_library_schema(connection: sqlite3.Connection) -> _LibrarySchemaRea
 
     required_columns = {
         table: columns
-        | (
-            {"content_fingerprint"}
-            if version >= 2 and table == "chapter_snapshots"
-            else set()
-        )
+        | ({"content_fingerprint"} if version >= 2 and table == "chapter_snapshots" else set())
         for table, columns in _REQUIRED_V1_COLUMNS.items()
     }
     if version == _SCHEMA_VERSION:

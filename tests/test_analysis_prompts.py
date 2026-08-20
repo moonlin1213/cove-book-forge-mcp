@@ -87,9 +87,9 @@ def test_non_analysis_snapshot_fields_change_neither_prompt_payload_nor_fingerpr
     assert build_chapter_analysis_prompts(baseline) == build_chapter_analysis_prompts(
         metadata_only_change
     )
-    assert chapter_input_fingerprint(baseline, AnalysisConfig(), model) == chapter_input_fingerprint(
-        metadata_only_change, AnalysisConfig(), model
-    )
+    assert chapter_input_fingerprint(
+        baseline, AnalysisConfig(), model
+    ) == chapter_input_fingerprint(metadata_only_change, AnalysisConfig(), model)
 
 
 @pytest.mark.parametrize(
@@ -130,6 +130,6 @@ def test_each_analysis_source_field_changes_both_prompt_payload_and_fingerprint(
     model = ModelConfig(provider="local", model="model")
 
     assert build_chapter_analysis_prompts(baseline) != build_chapter_analysis_prompts(changed)
-    assert chapter_input_fingerprint(baseline, AnalysisConfig(), model) != chapter_input_fingerprint(
-        changed, AnalysisConfig(), model
-    )
+    assert chapter_input_fingerprint(
+        baseline, AnalysisConfig(), model
+    ) != chapter_input_fingerprint(changed, AnalysisConfig(), model)

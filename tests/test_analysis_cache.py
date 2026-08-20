@@ -25,7 +25,9 @@ def _analysis(core_idea: str = "A validated insight.") -> ChapterAnalysis:
     return ChapterAnalysis(core_idea=core_idea, topic_tags=("cache",))
 
 
-def test_disabled_library_persists_and_reuses_a_validated_analysis_by_full_key(tmp_path: Path) -> None:
+def test_disabled_library_persists_and_reuses_a_validated_analysis_by_full_key(
+    tmp_path: Path,
+) -> None:
     """Removing any identity/key field from the lookup must make this fail."""
     library = _library(tmp_path / "cache", enabled=False)
     fingerprint = "a" * 64
@@ -54,7 +56,9 @@ def test_changed_fingerprint_replaces_one_chapter_cache_entry(tmp_path: Path) ->
     assert library.load_chapter_analysis("reader", "book-1", 0, new_fingerprint) == replacement
 
 
-def test_cache_storage_is_canonical_and_corruption_fails_closed_without_content(tmp_path: Path) -> None:
+def test_cache_storage_is_canonical_and_corruption_fails_closed_without_content(
+    tmp_path: Path,
+) -> None:
     """Removing strict stored-JSON validation must expose malformed rows as valid analyses."""
     library = _library(tmp_path / "cache")
     fingerprint = "a" * 64
@@ -62,9 +66,7 @@ def test_cache_storage_is_canonical_and_corruption_fails_closed_without_content(
 
     database = library._repository._database  # noqa: SLF001 - corrupt persistent fixture
     with database.transaction() as connection:
-        stored = connection.execute(
-            "SELECT analysis_json FROM chapter_analyses"
-        ).fetchone()[0]
+        stored = connection.execute("SELECT analysis_json FROM chapter_analyses").fetchone()[0]
         assert stored == json.dumps(
             _analysis().model_dump(mode="json"),
             ensure_ascii=False,

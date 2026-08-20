@@ -45,8 +45,7 @@ def _create_v3_database_with_analysis_table(path: Path, analysis_table_columns: 
         for statement in library_database._SCHEMA_V1:  # noqa: SLF001 - legacy fixture
             connection.execute(statement)
         connection.execute(
-            "ALTER TABLE chapter_snapshots "
-            "ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE chapter_snapshots ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
         )
         connection.execute(f"CREATE TABLE chapter_analyses ({analysis_table_columns})")
         connection.execute("PRAGMA user_version = 3")
@@ -59,7 +58,9 @@ def _create_v3_database_with_analysis_table(path: Path, analysis_table_columns: 
         _VALID_ANALYSIS_TABLE_COLUMNS.replace(
             "chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),\n", ""
         ),
-        _VALID_ANALYSIS_TABLE_COLUMNS.replace("input_fingerprint TEXT NOT NULL", "input_fingerprint TEXT"),
+        _VALID_ANALYSIS_TABLE_COLUMNS.replace(
+            "input_fingerprint TEXT NOT NULL", "input_fingerprint TEXT"
+        ),
         _VALID_ANALYSIS_TABLE_COLUMNS.replace(
             "chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0)",
             "chapter_index INTEGER NOT NULL",
@@ -73,7 +74,7 @@ def _create_v3_database_with_analysis_table(path: Path, analysis_table_columns: 
         )
         + f", {_ANALYSIS_TABLE_PRIMARY_KEY}",
         _VALID_ANALYSIS_TABLE_COLUMNS.replace("CHECK (chapter_index >= 0)", "")
-        + ", CONSTRAINT \"CHECK (chapter_index >= 0)\" UNIQUE (input_fingerprint)"
+        + ', CONSTRAINT "CHECK (chapter_index >= 0)" UNIQUE (input_fingerprint)'
         + f", {_ANALYSIS_TABLE_PRIMARY_KEY}",
         _VALID_ANALYSIS_TABLE_COLUMNS
         + ", generated_extra TEXT GENERATED ALWAYS AS (source_system) VIRTUAL"
@@ -176,8 +177,7 @@ def test_v2_database_migrates_to_v3_without_changing_existing_data(tmp_path: Pat
         for statement in library_database._SCHEMA_V1:  # noqa: SLF001 - legacy fixture
             connection.execute(statement)
         connection.execute(
-            "ALTER TABLE chapter_snapshots "
-            "ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
+            "ALTER TABLE chapter_snapshots ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
         )
         connection.execute("PRAGMA user_version = 2")
         _insert_minimal_book(connection)

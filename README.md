@@ -2,14 +2,14 @@
 
 `cove-book-forge-mcp` is a local-first, open-source Python core for securely
 normalizing books and stable external reading snapshots. The implemented phases
-support deterministic EPUB/PDF ingestion, an optional local SQLite library, and
-explicit model Provider adapters for raw text or JSON-object generation.
+support deterministic EPUB/PDF ingestion, an optional local SQLite library,
+explicit model Provider adapters, and reusable structured chapter analysis.
 
 > **Status boundary:** standards-valid EPUB ingestion, text-layer PDF ingestion,
-> the optional SQLite library, external `ChapterSnapshot` caching, and model
-> Provider adapters are implemented. Chapter analysis/fingerprinting/cache,
-> forge/jobs, Obsidian output, Agent Skill generation/installation, and MCP
-> transport remain planned and are **not implemented**.
+> the optional SQLite library, external `ChapterSnapshot` caching, model Provider
+> adapters, and validated per-chapter analysis with persistent fingerprint reuse
+> are implemented. Forge/jobs, Obsidian output, Agent Skill generation or
+> installation, and MCP transport remain planned and are **not implemented**.
 
 This repository is independent of private Cove/栖渡 code and does not include an
 official reading UI.
@@ -126,15 +126,58 @@ book = library.upsert_chapter_snapshot(
 print(library.get_chapter(book, 0).content)
 ```
 
+## Reusable chapter analysis
+
+`ChapterAnalyzer` turns one normalized `ChapterSnapshot` into the strict public
+`ChapterAnalysis` contract through an injected async `ModelProvider`. It validates
+every structured response against the contract schema and allows at most one
+additional generation when the Provider reports invalid model output or the
+returned object does not validate. Authentication, rate-limit, availability, and
+configuration failures are not repaired and never trigger a fallback Provider.
+
+The analyzer computes a stable fingerprint over normalized chapter title/body,
+highlights, notes, annotations, reflections, analysis configuration, prompt and
+generator versions, and the `ChapterAnalysis` schema. A matching persistent cache
+entry returns with zero Provider calls, including after recreating both the
+library and analyzer. Provider/model/base identity is ignored by default, and can
+be included explicitly with `analysis.include_provider_in_fingerprint: true`.
+API-key names and values never enter the fingerprint.
+
+Long chapters are split losslessly at Markdown-aware boundaries. Ordered chunks
+contain chapter content only; fenced code and Markdown tables remain atomic, even
+when one block exceeds the configured limit. Each chunk receives a validated
+analysis, followed by exactly one final merge that receives the validated chunk
+analyses and the chapter's highlights, notes, annotations, and reflections. The
+full body is not repeated in the merge, and only the final merged analysis is
+cached under the complete chapter fingerprint.
+
+```python
+from cove_book_forge.analysis import ChapterAnalyzer
+
+analyzer = ChapterAnalyzer(
+    provider,
+    library,
+    config.analysis,
+    config.model,
+)
+analyzed = await analyzer.analyze(snapshot)
+print(analyzed.analysis.core_idea, analyzed.cache_hit)
+```
+
+The same `analyzed.analysis` is intended to feed future Obsidian and Agent Skill
+renderers without re-analysis. Those renderers, output publication, whole-book
+job orchestration, and MCP endpoints are outside the currently implemented phase.
+
 ## Model Providers
 
 The async Provider boundary supports `openai`, `openai-compatible`, `deepseek`,
 and `anthropic` as exact built-in names. It returns typed per-call results and
 cumulative input/output/total-token usage. Each generation call makes at most
 one request: there is no automatic retry, JSON repair, or fallback to another
-provider. Chapter-level prompts and schema validation belong to the planned
-analysis layer. Trusted provider usage is counted even when a charged response
-later fails termination, content, or JSON-object validation.
+provider inside an adapter. The implemented chapter-analysis layer owns its
+separate bounded schema validation/regeneration policy described above. Trusted
+provider usage is counted even when a charged response later fails termination,
+content, or JSON-object validation.
 
 API-key values are read only from the named process environment variable. Put
 the variable name—not the key—in YAML, and provide the value through your shell,
@@ -187,8 +230,9 @@ native mode for OpenAI or DeepSeek. Every path adds the controlled direct-object
 instruction and strictly accepts one JSON object. Anthropic always advertises
 native JSON mode and JSON Schema as unavailable and ignores an OpenAI-style
 override. Output capability maxima remain unknown; `default_max_output_tokens`
-is a caller default, not a vendor hard limit. Bounded repair and domain-schema
-validation remain planned analysis behavior.
+is a caller default, not a vendor hard limit. Domain-schema validation and one
+bounded invalid-output regeneration are supplied by `ChapterAnalyzer`, not the
+Provider adapter.
 
 Built-in Providers created by one application-owned `ProviderRegistry` share
 configured concurrency and 60-second request limits across models on the same

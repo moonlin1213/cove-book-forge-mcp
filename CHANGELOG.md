@@ -23,3 +23,12 @@
 - Extended `doctor` with network-free built-in Provider/base and credential
   readiness alongside read-only parser-dependency, library-directory, and SQLite
   checks that do not initialize or migrate storage.
+- Added strict reusable `ChapterAnalysis` generation with deterministic input
+  fingerprints, persistent zero-call cache hits, one bounded invalid-output
+  regeneration, and same-key singleflight behavior. Provider identity remains
+  outside the default fingerprint unless explicitly enabled.
+- Added lossless long-chapter analysis: ordered content-only chunks preserve
+  fenced code and Markdown tables, then exactly one validated merge combines the
+  canonical chunk analyses with supplemental reader data. Only the final merged
+  analysis is cached; Obsidian/Agent Skill rendering, whole-book jobs, and MCP
+  transport remain future work.

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import traceback
+from collections.abc import Mapping
 
 import pytest
 
@@ -20,14 +22,16 @@ from cove_book_forge.outputs.managed import (
     parse_obsidian_manifest,
     plan_obsidian_update,
 )
-from cove_book_forge.outputs.obsidian_render import ObsidianRenderer
+from cove_book_forge.outputs.obsidian_render import ObsidianRenderer, canonical_manifest_bytes
 
 
-def _snapshot(*, index: int = 0, title: str = "Chapter one") -> ChapterSnapshot:
+def _snapshot(
+    *, index: int = 0, title: str = "Chapter one", book_title: str = "Managed book"
+) -> ChapterSnapshot:
     return ChapterSnapshot(
         source_system="test-source",
         external_book_id="book-123",
-        book=BookMetadata(title="Managed book", author="A. Author", total_chapters=2),
+        book=BookMetadata(title=book_title, author="A. Author", total_chapters=2),
         chapter=ChapterContent(index=index, title=title, content="Source text."),
     )
 
@@ -59,6 +63,27 @@ def _assert_safe_error(error: ForgeException, sentinel: str) -> None:
     assert sentinel not in public
     assert "/Users/private" not in public
     assert "Traceback" not in public
+    assert error.__cause__ is None
+
+
+def _assert_raises_without_leak(operation, sentinel: str) -> None:
+    try:
+        operation()
+    except ForgeException as error:
+        _assert_safe_error(error, sentinel)
+        # The caller's own test source naturally appears in a full traceback;
+        # inspect the exception chain itself, which is what public adapters emit.
+        assert sentinel not in "".join(traceback.format_exception_only(error))
+    else:
+        pytest.fail("expected safe ForgeException")
+
+
+def _with_checksum(manifest):
+    payload = manifest.model_dump(mode="json", by_alias=True, exclude={"checksum"})
+    checksum = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return manifest.model_copy(update={"checksum": checksum})
 
 
 def test_parses_a_locked_managed_markdown_round_trip() -> None:
@@ -234,6 +259,153 @@ def test_renamed_current_chapter_removes_only_the_verified_old_note() -> None:
     assert first.chapter_path in plan.removals
     assert renamed.chapter_path in plan.writes
     assert first.moc_path not in plan.removals
+
+
+def test_update_rejects_a_renderer_that_drops_a_previously_rendered_chapter() -> None:
+    """Dropping the previous manifest from render input must never schedule old chapter deletion."""
+    first = _render(index=0, concepts=(Concept(term="Old", definition="First."),))
+    dropped_history = _render(index=1, concepts=(Concept(term="New", definition="Second."),))
+
+    _assert_raises_without_leak(
+        lambda: plan_obsidian_update(first.manifest, dict(first.files), dropped_history), "Old"
+    )
+
+
+def test_update_rejects_a_manifest_that_rewrites_a_noncurrent_chapter_summary() -> None:
+    """Changing an older chapter record could redirect ownership before its bytes are preserved."""
+    first = _render(index=0, concepts=(Concept(term="Old", definition="First."),))
+    current = ObsidianRenderer(ObsidianOutputConfig()).render(
+        _snapshot(index=1),
+        _analyzed(concepts=(Concept(term="New", definition="Second."),)),
+        first.manifest,
+    )
+    rewritten_old = current.manifest.chapters[0].model_copy(
+        update={"title": "PRIVATE-OLD-SENTINEL"}
+    )
+    changed_manifest = _with_checksum(
+        current.manifest.model_copy(
+            update={"chapters": (rewritten_old, current.manifest.chapters[1])}
+        )
+    )
+    changed_files = dict(current.files)
+    changed_files[_manifest_path(current)] = canonical_manifest_bytes(changed_manifest)
+    untrusted = current.model_copy(update={"files": changed_files, "manifest": changed_manifest})
+
+    _assert_raises_without_leak(
+        lambda: plan_obsidian_update(first.manifest, dict(first.files), untrusted),
+        "PRIVATE-OLD-SENTINEL",
+    )
+
+
+def test_first_publish_rejects_a_renderer_with_multiple_chapter_records() -> None:
+    """Without a previous manifest, an aggregate render cannot establish safe ownership history."""
+    first = _render(index=0)
+    aggregate = ObsidianRenderer(ObsidianOutputConfig()).render(
+        _snapshot(index=1), _analyzed(), first.manifest
+    )
+
+    _assert_raises_without_leak(lambda: plan_obsidian_update(None, {}, aggregate), "Managed book")
+
+
+def test_update_locks_the_book_root_and_moc_from_the_previous_manifest() -> None:
+    """A title-derived root replacement could otherwise remove a valid book bundle."""
+    first = _render()
+    replacement = ObsidianRenderer(ObsidianOutputConfig()).render(
+        _snapshot(book_title="Different display title"), _analyzed(), None
+    )
+
+    _assert_raises_without_leak(
+        lambda: plan_obsidian_update(first.manifest, dict(first.files), replacement),
+        "Different display title",
+    )
+
+
+def test_manifest_rejects_a_card_path_that_collides_with_its_manifest_path() -> None:
+    """Allowing the manifest path into the ownership set could overwrite control state as a card."""
+    rendered = _render(concepts=(Concept(term="One", definition="One definition."),))
+    manifest_path = _manifest_path(rendered)
+    original_card = rendered.manifest.cards[0]
+    collision_card = original_card.model_copy(update={"path": manifest_path})
+    original_chapter = rendered.manifest.chapters[0]
+    collision_chapter = original_chapter.model_copy(update={"card_paths": (manifest_path,)})
+    collision_manifest = _with_checksum(
+        rendered.manifest.model_copy(
+            update={"cards": (collision_card,), "chapters": (collision_chapter,)}
+        )
+    )
+
+    _assert_raises_without_leak(
+        lambda: parse_obsidian_manifest(canonical_manifest_bytes(collision_manifest)), manifest_path
+    )
+
+
+def test_manifest_rejects_duplicate_current_card_ownership_records() -> None:
+    """Two current-card records with the same stable ID would make update ownership ambiguous."""
+    rendered = _render(concepts=(Concept(term="One", definition="One definition."),))
+    duplicated = _with_checksum(
+        rendered.manifest.model_copy(
+            update={"cards": (rendered.manifest.cards[0], rendered.manifest.cards[0])}
+        )
+    )
+
+    _assert_raises_without_leak(
+        lambda: parse_obsidian_manifest(canonical_manifest_bytes(duplicated)),
+        rendered.manifest.cards[0].stable_id,
+    )
+
+
+def test_renderer_sanitizes_percent_from_all_path_display_components() -> None:
+    """A percent in a generated name would violate the portable path contract after rendering."""
+    rendered = ObsidianRenderer(ObsidianOutputConfig()).render(
+        _snapshot(title="Chapter% title", book_title="Book% title"),
+        _analyzed(concepts=(Concept(term="Concept% title", definition="Safe."),)),
+        None,
+    )
+
+    assert all("%" not in path for path in rendered.files)
+    chapter = rendered.files[rendered.chapter_path].decode()
+    assert "Chapter% title" in chapter
+
+
+def test_planner_rejects_unsafe_unrelated_mapping_keys_before_any_lookup() -> None:
+    """Ignoring unrelated unsafe keys would make a future publisher consume an unvalidated snapshot."""
+    rendered = _render()
+
+    _assert_raises_without_leak(
+        lambda: plan_obsidian_update(None, {"../private-sentinel": b"x"}, rendered),
+        "private-sentinel",
+    )
+
+
+def test_parser_rejects_non_bytes_manifest_input_without_leaking_its_representation() -> None:
+    """Calling decode on arbitrary objects would expose their private repr through an exception."""
+
+    class PrivatePayload:
+        def __repr__(self) -> str:
+            return "PRIVATE-MANIFEST-SENTINEL"
+
+    _assert_raises_without_leak(
+        lambda: parse_obsidian_manifest(PrivatePayload()), "PRIVATE-MANIFEST-SENTINEL"
+    )
+
+
+def test_planner_converts_mapping_iteration_failures_to_safe_errors() -> None:
+    """A hostile Mapping must not leak an exception while the planner snapshots candidate bytes."""
+
+    class ExplodingMapping(Mapping[str, bytes]):
+        def __getitem__(self, key: str) -> bytes:
+            raise RuntimeError("PRIVATE-MAPPING-SENTINEL")
+
+        def __iter__(self):
+            raise RuntimeError("PRIVATE-MAPPING-SENTINEL")
+
+        def __len__(self) -> int:
+            return 1
+
+    _assert_raises_without_leak(
+        lambda: plan_obsidian_update(None, ExplodingMapping(), _render()),
+        "PRIVATE-MAPPING-SENTINEL",
+    )
 
 
 @pytest.mark.parametrize(

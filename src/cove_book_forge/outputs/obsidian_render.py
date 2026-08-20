@@ -43,7 +43,7 @@ _MARKDOWN_FIELDS = (
     "cove_stable_id",
     "cove_body_sha256",
 )
-_UNSAFE_FILENAME = re.compile(r'[\\/:*?"<>|]+')
+_UNSAFE_FILENAME = re.compile(r'[\\/:*?"<>|%]+')
 _BARE_LINK = re.compile(r"(?i)\b(?:www\.|[a-z][a-z0-9+.-]*:)(?=\S)")
 _EMAIL_LINK = re.compile(r"(?i)(?<![\w.+-])[\w.+-]+@[\w.-]+\.[a-z]{2,}(?![\w.-])")
 _BLOCK_LINE = re.compile(r"^ {0,3}(?:#{1,6}(?:\s|$)|>|[-+*]\s|\d+[.)]\s|`{3,}|~{3,}|(?:=+|-+)\s*$)")

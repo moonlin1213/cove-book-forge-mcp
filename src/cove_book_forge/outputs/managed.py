@@ -15,8 +15,6 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
-from pydantic import ValidationError
-
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.outputs.obsidian_models import (
     ObsidianBookManifest,
@@ -82,6 +80,8 @@ def _require_path(path: str, *, modified: bool = False) -> str:
 
 
 def _load_json_object(data: bytes) -> dict[str, Any]:
+    if not isinstance(data, bytes):
+        raise _invalid()
     try:
         text = data.decode("utf-8")
 
@@ -94,7 +94,7 @@ def _load_json_object(data: bytes) -> dict[str, Any]:
             return result
 
         value = json.loads(text, object_pairs_hook=no_duplicates)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except Exception:
         raise _invalid() from None
     if not isinstance(value, dict):
         raise _invalid()
@@ -177,7 +177,7 @@ def _validate_manifest_references(manifest: ObsidianBookManifest) -> None:
     chapters: dict[int, ObsidianChapterManifest] = {}
     cards_by_path: dict[str, ObsidianCardManifest] = {}
     card_ids: set[str] = set()
-    managed_paths = {moc_path}
+    managed_paths = {moc_path, _manifest_path(manifest.book_key)}
     for chapter in manifest.chapters:
         note_path = _require_path(chapter.note_path)
         if (
@@ -220,12 +220,14 @@ def _validate_manifest_references(manifest: ObsidianBookManifest) -> None:
 
 def parse_obsidian_manifest(data: bytes) -> ObsidianBookManifest:
     """Parse only exact canonical v1 manifests with a verified checksum."""
+    if not isinstance(data, bytes):
+        raise _invalid()
     _load_json_object(data)
     try:
         # JSON arrays are the canonical representation of the immutable tuple fields.
         # ``model_validate`` in strict Python mode intentionally rejects those arrays.
         manifest = ObsidianBookManifest.model_validate_json(data)
-    except ValidationError:
+    except Exception:
         raise _invalid() from None
     expected = canonical_manifest_bytes(manifest)
     if data != expected:
@@ -335,7 +337,16 @@ def _validate_existing_bundle(
             raise _modified() from None
 
 
-def _validate_new_bundle(rendered: RenderedObsidianBook) -> tuple[str, ...]:
+def _current_chapter(manifest: ObsidianBookManifest, chapter_path: str) -> ObsidianChapterManifest:
+    matches = [chapter for chapter in manifest.chapters if chapter.note_path == chapter_path]
+    if len(matches) != 1:
+        raise _invalid()
+    return matches[0]
+
+
+def _validate_new_bundle(
+    rendered: RenderedObsidianBook,
+) -> tuple[tuple[str, ...], ObsidianChapterManifest]:
     manifest = rendered.manifest
     _validate_manifest_references(manifest)
     manifest_path = _manifest_path(manifest.book_key)
@@ -355,10 +366,8 @@ def _validate_new_bundle(rendered: RenderedObsidianBook) -> tuple[str, ...]:
         raise _invalid() from None
     if parsed_manifest != manifest or rendered.moc_path != manifest.moc_path:
         raise _invalid()
-    current_chapter = next(
-        (item for item in manifest.chapters if item.note_path == rendered.chapter_path), None
-    )
-    if current_chapter is None or tuple(current_chapter.card_paths) != rendered.card_paths:
+    current_chapter = _current_chapter(manifest, rendered.chapter_path)
+    if tuple(current_chapter.card_paths) != rendered.card_paths:
         raise _invalid()
     expected: list[tuple[str, str, int, str, str]] = [
         (rendered.moc_path, "moc", -1, f"{manifest.book_key}-moc", manifest.checksum),
@@ -394,7 +403,49 @@ def _validate_new_bundle(rendered: RenderedObsidianBook) -> tuple[str, ...]:
     # A renderer only carries bytes for the current chapter, its cards, MOC, and
     # manifest.  The manifest deliberately retains summaries for prior chapters;
     # those owned paths remain desired even though they must not be rewritten.
-    return tuple(sorted(_manifest_paths(manifest)))
+    return tuple(sorted(_manifest_paths(manifest))), current_chapter
+
+
+def _validate_preserved_history(
+    previous: ObsidianBookManifest,
+    current: ObsidianBookManifest,
+    current_chapter: ObsidianChapterManifest,
+) -> None:
+    """Prove that a current-chapter render did not discard another chapter's state."""
+    if (
+        previous.book_key != current.book_key
+        or previous.book_directory != current.book_directory
+        or previous.moc_path != current.moc_path
+    ):
+        raise _invalid()
+    current_index = current_chapter.index
+    old_chapters = {chapter.index: chapter for chapter in previous.chapters}
+    new_chapters = {chapter.index: chapter for chapter in current.chapters}
+    for index, chapter in old_chapters.items():
+        if index != current_index and new_chapters.get(index) != chapter:
+            raise _invalid()
+    old_cards = {card for card in previous.cards if card.chapter_index != current_index}
+    new_cards = {card for card in current.cards if card.chapter_index != current_index}
+    if old_cards != new_cards:
+        raise _invalid()
+
+
+def _snapshot_existing(existing: Mapping[str, bytes]) -> dict[str, bytes]:
+    """Copy untrusted mapping input once, validating every key and value first."""
+    if not isinstance(existing, Mapping):
+        raise _invalid()
+    try:
+        snapshot: dict[str, bytes] = {}
+        for key, value in existing.items():
+            if not isinstance(key, str) or not isinstance(value, bytes):
+                raise _invalid()
+            _require_path(key)
+            snapshot[key] = value
+        return snapshot
+    except ForgeException:
+        raise _invalid() from None
+    except Exception:
+        raise _invalid() from None
 
 
 def plan_obsidian_update(
@@ -407,30 +458,33 @@ def plan_obsidian_update(
     ``existing`` is purposely a mapping of candidate bytes.  Callers must not pass a
     directory abstraction here: every key is validated before the function reads it.
     """
-    if not isinstance(existing, Mapping):
-        raise _invalid()
-    desired_owned_paths = _validate_new_bundle(rendered)
+    existing_snapshot = _snapshot_existing(existing)
+    desired_owned_paths, current_chapter = _validate_new_bundle(rendered)
     write_candidates = tuple(sorted(rendered.files))
     if previous is None:
+        if (
+            len(rendered.manifest.chapters) != 1
+            or rendered.manifest.chapters[0] != current_chapter
+            or any(card.chapter_index != current_chapter.index for card in rendered.manifest.cards)
+        ):
+            raise _invalid()
         for path in desired_owned_paths:
-            if existing.get(path) is not None:
+            if path in existing_snapshot:
                 raise _modified()
         writes = {path: rendered.files[path] for path in write_candidates}
         return OutputUpdatePlan(writes, (), False, tuple(sorted(writes)))
-    if previous.book_key != rendered.manifest.book_key:
-        raise _invalid()
     _validate_manifest_references(previous)
-    _validate_existing_bundle(previous, existing)
+    _validate_preserved_history(previous, rendered.manifest, current_chapter)
+    _validate_existing_bundle(previous, existing_snapshot)
     owned_paths = set(_manifest_paths(previous))
     for path in write_candidates:
         _require_path(path)
-        data = existing.get(path)
-        if data is not None and path not in owned_paths:
+        if path in existing_snapshot and path not in owned_paths:
             raise _modified()
     writes = {
         path: rendered.files[path]
         for path in write_candidates
-        if existing.get(path) != rendered.files[path]
+        if existing_snapshot.get(path) != rendered.files[path]
     }
     removals = tuple(sorted(owned_paths - set(desired_owned_paths)))
     changed_paths = tuple(sorted((*writes, *removals)))

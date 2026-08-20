@@ -48,6 +48,9 @@ def _validate_component(component: str, *, max_bytes: int = MAX_COMPONENT_BYTES)
         or len(component.encode("utf-8")) > max_bytes
         or has_reserved_stem(component)
         or any(unicodedata.category(character).startswith("C") for character in component)
+        # Percent escapes are decoded by several vault/link consumers.  Keeping
+        # them out of on-disk names avoids a second, ambiguous path syntax.
+        or "%" in component
         or any(character in ':*?"<>|' for character in component)
     ):
         raise ValueError("path must use portable safe components")

@@ -3,6 +3,7 @@
 import json
 from typing import Any
 
+from cove_book_forge.analysis.fingerprint import canonical_analysis_source_payload
 from cove_book_forge.contracts.analysis import ChapterAnalysis
 from cove_book_forge.contracts.books import ChapterSnapshot
 
@@ -18,7 +19,7 @@ def build_chapter_analysis_prompts(snapshot: ChapterSnapshot) -> tuple[str, str]
         f"{schema}"
     )
     user_prompt = "Untrusted source JSON data:\n" + _compact_json(
-        {"untrusted_source": snapshot.model_dump(mode="json")}
+        {"untrusted_source": canonical_analysis_source_payload(snapshot)}
     )
     return system_prompt, user_prompt
 

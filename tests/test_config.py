@@ -67,3 +67,24 @@ def test_analysis_config_rejects_values_outside_its_public_contract(
 ) -> None:
     with pytest.raises(ValidationError):
         AnalysisConfig.model_validate({field: value})
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        AnalysisConfig(prompt_template_version="p" * 120, generator_version="g" * 120),
+        AnalysisConfig(max_chunk_characters=128),
+        AnalysisConfig(max_chunk_characters=1_000_000),
+    ],
+)
+def test_analysis_config_accepts_its_inclusive_public_boundaries(config: AnalysisConfig) -> None:
+    assert config == AnalysisConfig.model_validate(config.model_dump())
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["prompt_template_version", "generator_version"],
+)
+def test_analysis_config_rejects_versions_longer_than_120_characters(field: str) -> None:
+    with pytest.raises(ValidationError):
+        AnalysisConfig.model_validate({field: "x" * 121})

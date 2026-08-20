@@ -30,17 +30,10 @@ def canonical_chapter_input_payload(
     """Build the secret-free normalized payload used by the fingerprint."""
     payload: dict[str, Any] = {
         "analysis_config": _normalize_value(analysis_config.model_dump(mode="json")),
-        "chapter": {
-            "content": _normalize_text(snapshot.chapter.content),
-            "title": _normalize_text(snapshot.chapter.title),
-        },
         "chapter_analysis_schema_sha256": hashlib.sha256(
             _canonical_json_bytes(ChapterAnalysis.model_json_schema())
         ).hexdigest(),
-        "highlights": _sorted_items(snapshot.highlights),
-        "user_notes": _sorted_items(snapshot.user_notes),
-        "annotations": _sorted_items(snapshot.annotations),
-        "reflections": _sorted_items(snapshot.reflections),
+        "source": canonical_analysis_source_payload(snapshot),
     }
     if analysis_config.include_provider_in_fingerprint:
         payload["provider"] = {
@@ -51,9 +44,26 @@ def canonical_chapter_input_payload(
     return payload
 
 
+def canonical_analysis_source_payload(snapshot: ChapterSnapshot) -> dict[str, Any]:
+    """Return the complete normalized source data that analysis may consume."""
+    return {
+        "chapter": {
+            "content": _normalize_text(snapshot.chapter.content),
+            "title": _normalize_text(snapshot.chapter.title),
+        },
+        "highlights": _sorted_items(snapshot.highlights),
+        "user_notes": _sorted_items(snapshot.user_notes),
+        "annotations": _sorted_items(snapshot.annotations),
+        "reflections": _sorted_items(snapshot.reflections),
+    }
+
+
 def _sorted_items(items: tuple[Any, ...]) -> list[dict[str, Any]]:
     normalized = [_normalize_value(item.model_dump(mode="json")) for item in items]
-    return sorted(normalized, key=lambda item: item["id"])
+    return sorted(
+        normalized,
+        key=lambda item: (item["id"], _canonical_json_bytes(item)),
+    )
 
 
 def _normalize_value(value: Any) -> Any:

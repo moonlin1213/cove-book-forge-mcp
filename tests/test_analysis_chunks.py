@@ -1,3 +1,5 @@
+import pytest
+
 from cove_book_forge.analysis.chunks import split_chapter_content
 
 
@@ -41,3 +43,44 @@ def test_splitter_returns_the_original_content_as_one_chunk_when_it_fits() -> No
     content = "第一段\n\n第二段"
 
     assert split_chapter_content(content, max_characters=128) == (content,)
+
+
+def test_splitter_splits_an_oversized_non_atomic_paragraph_at_lossless_character_boundaries() -> None:
+    content = "abcdefghijklmnopqrstuvwxyz"
+
+    chunks = split_chapter_content(content, max_characters=7)
+
+    assert chunks == ("abcdefg", "hijklmn", "opqrstu", "vwxyz")
+    assert "".join(chunks) == content
+    assert all(len(chunk) <= 7 for chunk in chunks)
+
+
+@pytest.mark.parametrize("fence", ["`", "~"])
+def test_splitter_keeps_four_character_fences_open_until_a_matching_closer(
+    fence: str,
+) -> None:
+    marker = fence * 4
+    content = f"Before\n\n{marker}python\ninside\n{fence * 3}\nstill code\n{marker}\n\nAfter"
+
+    chunks = split_chapter_content(content, max_characters=18)
+
+    assert chunks == ("Before\n\n", f"{marker}python\ninside\n{fence * 3}\nstill code\n{marker}\n\n", "After")
+    assert "".join(chunks) == content
+
+
+def test_splitter_does_not_treat_fence_text_with_trailing_content_as_a_closer() -> None:
+    content = "```python\ninside\n``` not a closer\nstill code\n```\n\nAfter"
+
+    chunks = split_chapter_content(content, max_characters=18)
+
+    assert chunks == ("```python\ninside\n``` not a closer\nstill code\n```\n\n", "After")
+    assert "".join(chunks) == content
+
+
+def test_splitter_accepts_a_legally_indented_matching_fence_closer() -> None:
+    content = "  ```python\n  inside\n  ```\n\nAfter"
+
+    assert split_chapter_content(content, max_characters=18) == (
+        "  ```python\n  inside\n  ```\n\n",
+        "After",
+    )

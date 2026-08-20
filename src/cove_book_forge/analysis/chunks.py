@@ -1,5 +1,8 @@
 """Lossless chapter-content splitting at Markdown block boundaries."""
 
+import re
+
+_FENCE_OPENING = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})")
 
 def split_chapter_content(content: str, max_characters: int) -> tuple[str, ...]:
     """Greedily pack whole Markdown blocks without truncating atomic blocks."""
@@ -10,41 +13,66 @@ def split_chapter_content(content: str, max_characters: int) -> tuple[str, ...]:
 
     chunks: list[str] = []
     current = ""
-    for block in _blocks(content):
-        if current and len(current) + len(block) > max_characters:
+    for block, is_atomic in _blocks(content):
+        if is_atomic:
+            if current and len(current) + len(block) > max_characters:
+                chunks.append(current)
+                current = ""
+            current += block
+            continue
+
+        if len(block) <= max_characters:
+            if current and len(current) + len(block) > max_characters:
+                chunks.append(current)
+                current = ""
+            current += block
+            continue
+
+        if current:
             chunks.append(current)
             current = ""
-        current += block
+        remaining = block
+        while remaining:
+            if len(remaining) <= max_characters:
+                current += remaining
+                break
+            current += remaining[:max_characters]
+            chunks.append(current)
+            current = ""
+            remaining = remaining[max_characters:]
     if current:
         chunks.append(current)
     return tuple(chunks)
 
 
-def _blocks(content: str) -> tuple[str, ...]:
+def _blocks(content: str) -> tuple[tuple[str, bool], ...]:
     lines = content.splitlines(keepends=True)
-    blocks: list[str] = []
+    blocks: list[tuple[str, bool]] = []
     index = 0
     while index < len(lines):
         line = lines[index]
         if _fence_marker(line) is not None:
             block, index = _fenced_block(lines, index)
+            is_atomic = True
         elif _is_table_line(line):
             block, index = _table_block(lines, index)
+            is_atomic = True
         elif line.lstrip().startswith("#"):
             block, index = _heading_block(lines, index)
+            is_atomic = False
         else:
             block, index = _paragraph_block(lines, index)
-        blocks.append(block)
+            is_atomic = False
+        blocks.append((block, is_atomic))
     return tuple(blocks)
 
 
-def _fence_marker(line: str) -> str | None:
-    stripped = line.lstrip()
-    if stripped.startswith("```"):
-        return "```"
-    if stripped.startswith("~~~"):
-        return "~~~"
-    return None
+def _fence_marker(line: str) -> tuple[str, int] | None:
+    match = _FENCE_OPENING.match(line)
+    if match is None:
+        return None
+    marker = match.group("marker")
+    return marker[0], len(marker)
 
 
 def _fenced_block(lines: list[str], index: int) -> tuple[str, int]:
@@ -52,7 +80,7 @@ def _fenced_block(lines: list[str], index: int) -> tuple[str, int]:
     assert marker is not None
     end = index + 1
     while end < len(lines):
-        if lines[end].lstrip().startswith(marker):
+        if _is_closing_fence(lines[end], marker):
             end += 1
             break
         end += 1
@@ -89,3 +117,15 @@ def _with_trailing_blank_lines(lines: list[str], start: int, end: int) -> tuple[
 
 def _is_table_line(line: str) -> bool:
     return line.lstrip().startswith("|")
+
+
+def _is_closing_fence(line: str, opener: tuple[str, int]) -> bool:
+    candidate = line.rstrip("\r\n")
+    indentation = len(candidate) - len(candidate.lstrip(" "))
+    if indentation > 3:
+        return False
+
+    marker_character, marker_length = opener
+    candidate = candidate[indentation:]
+    run_length = len(candidate) - len(candidate.lstrip(marker_character))
+    return run_length >= marker_length and not candidate[run_length:].strip(" \t")

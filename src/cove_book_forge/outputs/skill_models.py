@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, Literal, Self
 
@@ -165,3 +166,25 @@ class RenderedAgentSkill(AgentSkillModel):
     @classmethod
     def validate_path(cls, value: str) -> str:
         return validate_relative_path(value)
+
+
+@dataclass(frozen=True)
+class SkillUpdatePlan:
+    """Complete immutable generation assembled by pure managed validation."""
+
+    complete_files: Mapping[str, bytes]
+    changed_paths: tuple[str, ...]
+    unchanged: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "complete_files", MappingProxyType(dict(self.complete_files)))
+
+
+@dataclass(frozen=True)
+class SkillPublisherReceipt:
+    """Internal canonical-publication receipt consumed by the later output service."""
+
+    rendered: RenderedAgentSkill
+    canonical_path: str
+    changed_paths: tuple[str, ...]
+    unchanged: bool

@@ -243,6 +243,7 @@ class _BackupStatus(StrEnum):
     VERIFIED = "verified"
     RESTORED = "restored"
     NO_MOVE = "no_move"
+    NO_MOVE_CONFLICT = "no_move_conflict"
     PROTECTED = "protected"
 
 
@@ -267,6 +268,13 @@ class _PublishedStatus(StrEnum):
     COMPETITOR = "competitor"
 
 
+class _RollbackMoveStatus(StrEnum):
+    INTENT = "intent"
+    MOVED = "moved"
+    NO_MOVE_CONFLICT = "no_move_conflict"
+    AMBIGUOUS = "ambiguous"
+
+
 @dataclass
 class _PublishedFile:
     path: str
@@ -279,6 +287,7 @@ class _PublishedFile:
     data: bytes
     status: _PublishedStatus = _PublishedStatus.INTENT
     rollback_name: str | None = None
+    rollback_status: _RollbackMoveStatus | None = None
 
 
 @dataclass
@@ -415,6 +424,7 @@ class GuardedPublisher:
             self._validate_rendered_budget(initial)
             initial_book_key = initial.manifest.book_key
             initial_paths = tuple(initial.files)
+            del initial
             manifest_path = self._manifest_path(initial_book_key)
             manifest_snapshot = self._read_snapshot(anchor, manifest_path)
             previous = self._previous_manifest(manifest_snapshot)
@@ -426,7 +436,6 @@ class GuardedPublisher:
             if rendered.manifest.book_key != initial_book_key:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             candidates = self._candidate_paths(initial_paths, rendered, previous)
-            del initial
             existing_size = sum(self._candidate_size(anchor, path) for path in candidates)
             staged_size = sum(len(payload) for payload in rendered.files.values())
             if existing_size + staged_size > _MAX_TOTAL_TRANSACTION_BYTES:
@@ -976,7 +985,8 @@ class GuardedPublisher:
                 destination_fd=transaction.backup_fd,
             )
             if not moved:
-                backup.status = _BackupStatus.PROTECTED
+                backup.status = _BackupStatus.NO_MOVE_CONFLICT
+                self._forget_moved(transaction, transaction.backup_fd, backup_name)
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             backup.status = _BackupStatus.MOVED
             moved_snapshot = self._snapshot_in_directory(transaction.backup_fd, backup_name)
@@ -985,7 +995,6 @@ class GuardedPublisher:
                 or moved_snapshot.size != backup.size
                 or moved_snapshot.digest != backup.digest
             ):
-                backup.status = _BackupStatus.PROTECTED
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             backup.status = _BackupStatus.VERIFIED
             _fsync(parent)
@@ -1261,6 +1270,8 @@ class GuardedPublisher:
         visible: _FileSnapshot | None = None
         with suppress(ForgeException, OSError):
             visible = self._read_snapshot(anchor, backup.path)
+        if backup.status is _BackupStatus.NO_MOVE_CONFLICT:
+            return visible is not None and self._snapshot_matches_backup(visible, backup)
         destination: _FileSnapshot | None = None
         destination_exists = False
         try:
@@ -1292,10 +1303,16 @@ class GuardedPublisher:
             self._forget_moved(transaction, transaction.backup_fd, backup.name)
             return True
         if visible.exists or not destination_is_old:
-            if not visible.exists and destination_exists:
+            if (
+                not visible.exists
+                and destination_exists
+                and backup.status in {_BackupStatus.MOVED, _BackupStatus.VERIFIED}
+            ):
                 self._restore_unverified_backup_entry(anchor, transaction, backup)
             backup.status = _BackupStatus.PROTECTED
             return False
+        if backup.status is _BackupStatus.INTENT:
+            backup.status = _BackupStatus.MOVED
         return self._restore_backup(anchor, transaction, backup)
 
     def _restore_unverified_backup_entry(
@@ -1304,6 +1321,8 @@ class GuardedPublisher:
         transaction: _Transaction,
         backup: _BackupFile,
     ) -> bool:
+        if backup.status not in {_BackupStatus.MOVED, _BackupStatus.VERIFIED}:
+            return False
         parent = self._open_directory(anchor, backup.parent_path, create=False)
         if parent is None:
             return False
@@ -1336,6 +1355,8 @@ class GuardedPublisher:
         transaction: _Transaction,
         published: _PublishedFile,
     ) -> bool:
+        if published.status in {_PublishedStatus.ABSENT, _PublishedStatus.REMOVED}:
+            return True
         parent_path = published.parent_path
         name = published.name
         parent = self._open_directory(anchor, parent_path, create=False)
@@ -1345,15 +1366,22 @@ class GuardedPublisher:
             return False
         try:
             if published.rollback_name is not None:
-                settled = self._settle_published_move(
-                    transaction,
-                    published,
-                    parent,
-                )
-                if settled is not None:
-                    return settled
+                if published.rollback_status is _RollbackMoveStatus.MOVED:
+                    settled = self._settle_published_move(transaction, published, parent)
+                    if settled is not None:
+                        return settled
+                elif published.rollback_status is _RollbackMoveStatus.AMBIGUOUS:
+                    return False
+            source_state = self._published_entry_state(parent, name, published)
+            if source_state == "absent":
+                published.status = _PublishedStatus.ABSENT
+                return True
+            if source_state != "expected":
+                published.status = _PublishedStatus.COMPETITOR
+                return False
             rollback_name = f"r{len(transaction.protected_entries):06d}-{uuid4().hex}"
             published.rollback_name = rollback_name
+            published.rollback_status = _RollbackMoveStatus.INTENT
             self._protect_moved(
                 transaction,
                 transaction.fd,
@@ -1362,25 +1390,50 @@ class GuardedPublisher:
                 published.path,
             )
             try:
-                os.rename(
+                moved = _rename_noreplace(
                     name,
                     rollback_name,
-                    src_dir_fd=parent,
-                    dst_dir_fd=transaction.fd,
+                    source_fd=parent,
+                    destination_fd=transaction.fd,
                 )
             except BaseException as rename_exc:
-                settled = self._settle_published_move(transaction, published, parent)
-                if settled:
-                    if not isinstance(rename_exc, Exception):
-                        raise rename_exc from None
+                source_state = self._published_entry_state(parent, name, published)
+                if source_state == "expected":
+                    published.rollback_status = _RollbackMoveStatus.NO_MOVE_CONFLICT
+                    self._forget_moved(transaction, transaction.fd, rollback_name)
+                    published.rollback_name = None
+                    raise rename_exc from None
+                if source_state == "absent" and self._rollback_destination_matches(
+                    transaction, rollback_name, published
+                ):
+                    published.rollback_status = _RollbackMoveStatus.MOVED
+                    settled = self._settle_published_move(transaction, published, parent)
+                    if settled:
+                        if not isinstance(rename_exc, Exception):
+                            raise rename_exc from None
+                        return True
+                published.rollback_status = _RollbackMoveStatus.AMBIGUOUS
+                raise rename_exc from None
+            if not moved:
+                published.rollback_status = _RollbackMoveStatus.NO_MOVE_CONFLICT
+                self._forget_moved(transaction, transaction.fd, rollback_name)
+                published.rollback_name = None
+                source_state = self._published_entry_state(parent, name, published)
+                if source_state == "absent":
+                    published.status = _PublishedStatus.ABSENT
                     return True
-                raise
+                if source_state == "expected":
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                published.status = _PublishedStatus.COMPETITOR
+                return False
+            published.rollback_status = _RollbackMoveStatus.MOVED
             settled = self._settle_published_move(transaction, published, parent)
             return bool(settled)
         except FileNotFoundError:
             if published.rollback_name is not None:
                 self._forget_moved(transaction, transaction.fd, published.rollback_name)
                 published.rollback_name = None
+                published.rollback_status = _RollbackMoveStatus.NO_MOVE_CONFLICT
             published.status = _PublishedStatus.ABSENT
             return True
         finally:
@@ -1395,28 +1448,72 @@ class GuardedPublisher:
         rollback_name = published.rollback_name
         if rollback_name is None:
             return None
+        if published.rollback_status is not _RollbackMoveStatus.MOVED:
+            return False
         if not self._entry_exists(transaction.fd, rollback_name):
             self._forget_moved(transaction, transaction.fd, rollback_name)
             published.rollback_name = None
-            return None
+            published.rollback_status = _RollbackMoveStatus.AMBIGUOUS
+            source_state = self._published_entry_state(parent, published.name, published)
+            if source_state == "absent":
+                published.status = _PublishedStatus.ABSENT
+                return True
+            return None if source_state == "expected" else False
         removed = self._discard_moved_published(transaction, rollback_name, published)
         if removed:
             _fsync(transaction.fd)
             _fsync(parent)
             published.status = _PublishedStatus.REMOVED
             published.rollback_name = None
+            published.rollback_status = _RollbackMoveStatus.MOVED
             return True
-        restored = self._restore_moved(
-            transaction,
-            transaction.fd,
-            rollback_name,
-            parent,
-            published.name,
-        )
-        if restored:
-            published.rollback_name = None
+        published.rollback_status = _RollbackMoveStatus.AMBIGUOUS
         published.status = _PublishedStatus.COMPETITOR
         return False
+
+    def _published_entry_state(
+        self, directory_fd: int, name: str, published: _PublishedFile
+    ) -> str:
+        try:
+            status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return "absent"
+        except OSError:
+            return "unknown"
+        if not stat.S_ISREG(status.st_mode):
+            return "other"
+        try:
+            snapshot = self._snapshot_in_directory(directory_fd, name)
+        except FileNotFoundError:
+            return "absent"
+        except (ForgeException, OSError):
+            return "unknown"
+        expected = published.data
+        if (
+            snapshot.identity == published.identity
+            and snapshot.size == published.size
+            and snapshot.digest == published.digest
+            and snapshot.data == expected
+        ):
+            return "expected"
+        return "other"
+
+    def _rollback_destination_matches(
+        self,
+        transaction: _Transaction,
+        rollback_name: str,
+        published: _PublishedFile,
+    ) -> bool:
+        try:
+            snapshot = self._snapshot_in_directory(transaction.fd, rollback_name)
+        except (FileNotFoundError, ForgeException, OSError):
+            return False
+        return (
+            snapshot.identity == published.identity
+            and snapshot.size == published.size
+            and snapshot.digest == published.digest
+            and snapshot.data == published.data
+        )
 
     def _discard_moved_published(
         self,

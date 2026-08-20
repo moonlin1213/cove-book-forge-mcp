@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import traceback
+import weakref
 from pathlib import Path
 
 import pytest
@@ -138,6 +139,55 @@ def test_publication_budgets_fail_closed_before_filesystem_mutation(
     assert raised.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
     assert list(vault.iterdir()) == []
     _assert_safe(raised.value, vault)
+
+
+def test_initial_render_is_released_before_manifest_read_and_second_render(tmp_path: Path) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    renderer = ObsidianRenderer(ObsidianOutputConfig(enabled=True, vault_path=vault))
+    initial_reference: weakref.ReferenceType[object] | None = None
+    calls = 0
+
+    def render(previous):
+        nonlocal calls, initial_reference
+        calls += 1
+        if calls == 1:
+            initial = renderer.render(_snapshot(), _analyzed(), previous)
+            initial_reference = weakref.ref(initial)
+            return initial
+        assert initial_reference is not None
+        assert initial_reference() is None
+        return renderer.render(_snapshot(), _analyzed(), previous)
+
+    receipt = _publisher(vault).publish(render)
+
+    assert calls == 2
+    assert receipt.unchanged is False
+
+
+def test_initial_render_budget_failure_does_not_invoke_second_render(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    renderer = ObsidianRenderer(ObsidianOutputConfig(enabled=True, vault_path=vault))
+    calls = 0
+
+    def render(previous):
+        nonlocal calls
+        calls += 1
+        return renderer.render(_snapshot(), _analyzed(), previous)
+
+    monkeypatch.setattr(publisher_module, "_MAX_TOTAL_TRANSACTION_BYTES", 1)
+
+    with pytest.raises(ForgeException) as raised:
+        _publisher(vault).publish(render)
+
+    assert raised.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert calls == 1
+    assert list(vault.iterdir()) == []
 
 
 def test_second_pass_growth_is_rejected_from_stat_before_reading_beyond_budget(
@@ -942,7 +992,7 @@ def test_backup_move_followed_by_internal_transition_signal_converges_to_old_bun
     _assert_no_transactions(vault)
 
 
-def test_occupied_backup_destination_preserves_source_destination_and_recovery_intent(
+def test_occupied_backup_destination_preserves_source_without_false_recovery_mapping(
     tmp_path: Path, monkeypatch
 ) -> None:
     import cove_book_forge.outputs.publisher as publisher_module
@@ -987,10 +1037,113 @@ def test_occupied_backup_destination_preserves_source_destination_and_recovery_i
     assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
     assert chapter.read_bytes() == old_chapter
     transactions = vault / ".cove-book-forge" / ".transactions"
-    assert any(path.read_bytes() == competitor for path in transactions.rglob("backup/b*"))
+    competitors = [
+        path for path in transactions.rglob("backup/b*") if path.read_bytes() == competitor
+    ]
+    assert len(competitors) == 1
     records = list(transactions.rglob("recovery-*.json"))
-    assert len(records) == 1
-    assert json.loads(records[0].read_bytes())["original_path"] == first.rendered.chapter_path
+    assert all(
+        json.loads(record.read_bytes())["moved_name"] != competitors[0].name for record in records
+    )
+
+
+def test_backup_noreplace_same_inode_collision_is_not_adopted_or_removed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    chapter = vault / first.rendered.chapter_path
+    old_chapter = chapter.read_bytes()
+    original = publisher_module._rename_noreplace
+    collision_name: str | None = None
+
+    def hardlink_collision(source, destination, *, source_fd, destination_fd):
+        nonlocal collision_name
+        if collision_name is None and source == chapter.name and destination.startswith("b"):
+            collision_name = destination
+            os.link(
+                source,
+                destination,
+                src_dir_fd=source_fd,
+                dst_dir_fd=destination_fd,
+                follow_symlinks=False,
+            )
+            return False
+        return original(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", hardlink_collision)
+
+    with pytest.raises(ForgeException):
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert collision_name is not None
+    assert chapter.read_bytes() == old_chapter
+    collision = next((vault / ".cove-book-forge" / ".transactions").rglob(collision_name))
+    assert collision.read_bytes() == old_chapter
+    assert collision.stat().st_ino == chapter.stat().st_ino
+    records = list((vault / ".cove-book-forge" / ".transactions").rglob("recovery-*.json"))
+    assert all(
+        json.loads(record.read_bytes())["moved_name"] != collision_name for record in records
+    )
+
+
+def test_backup_noreplace_winner_is_never_restored_after_visible_source_disappears(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    chapter = vault / first.rendered.chapter_path
+    winner = b"different occupied backup winner"
+    original = publisher_module._rename_noreplace
+    collision_name: str | None = None
+
+    def collision_then_source_disappears(source, destination, *, source_fd, destination_fd):
+        nonlocal collision_name
+        if collision_name is None and source == chapter.name and destination.startswith("b"):
+            collision_name = destination
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                os.write(descriptor, winner)
+            finally:
+                os.close(descriptor)
+            os.unlink(source, dir_fd=source_fd)
+            return False
+        return original(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", collision_then_source_disappears)
+
+    with pytest.raises(ForgeException):
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert collision_name is not None
+    assert not chapter.exists()
+    collision = next((vault / ".cove-book-forge" / ".transactions").rglob(collision_name))
+    assert collision.read_bytes() == winner
+    records = list((vault / ".cove-book-forge" / ".transactions").rglob("recovery-*.json"))
+    assert all(
+        json.loads(record.read_bytes())["moved_name"] != collision_name for record in records
+    )
 
 
 @pytest.mark.parametrize("failure", ["write", "fsync"])
@@ -1042,7 +1195,7 @@ def test_rollback_rename_success_followed_by_an_error_still_restores_old_bundle(
     _publish(vault, _analyzed())
     before = _visible(vault)
     real_link = publisher_module.os.link
-    real_rename = publisher_module.os.rename
+    real_rename = publisher_module._rename_noreplace
     manifest_failed = False
     rollback_failed = False
 
@@ -1062,7 +1215,7 @@ def test_rollback_rename_success_followed_by_an_error_still_restores_old_bundle(
         return result
 
     monkeypatch.setattr(publisher_module.os, "link", fail_manifest_once)
-    monkeypatch.setattr(publisher_module.os, "rename", rollback_rename_then_fail)
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", rollback_rename_then_fail)
 
     with pytest.raises(ForgeException):
         _publish(vault, _analyzed(fingerprint="b" * 64))
@@ -1070,6 +1223,173 @@ def test_rollback_rename_success_followed_by_an_error_still_restores_old_bundle(
     assert manifest_failed and rollback_failed
     assert _visible(vault) == before
     _assert_no_transactions(vault)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["source_hardlink", "regular", "source_absent", "directory", "symlink", "fifo"],
+)
+def test_rollback_noreplace_collision_never_adopts_or_deletes_destination(
+    tmp_path: Path, monkeypatch, kind: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    before = _visible(vault)
+    real_link = publisher_module.os.link
+    real_rename = publisher_module._rename_noreplace
+    competitor = b"rollback collision winner"
+    manifest_failed = False
+    collision_name: str | None = None
+
+    def fail_manifest_once(src, dst, **kwargs):
+        nonlocal manifest_failed
+        if not manifest_failed and isinstance(dst, str) and dst.endswith(".json"):
+            manifest_failed = True
+            raise OSError("PRIVATE-MANIFEST-FAILURE")
+        return real_link(src, dst, **kwargs)
+
+    def collide_once(source, destination, *, source_fd, destination_fd):
+        nonlocal collision_name
+        source_exists = True
+        try:
+            os.stat(source, dir_fd=source_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            source_exists = False
+        if collision_name is None and destination.startswith("r") and source_exists:
+            collision_name = destination
+            if kind == "source_hardlink":
+                os.link(
+                    source,
+                    destination,
+                    src_dir_fd=source_fd,
+                    dst_dir_fd=destination_fd,
+                    follow_symlinks=False,
+                )
+            elif kind in {"regular", "source_absent"}:
+                descriptor = os.open(
+                    destination,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=destination_fd,
+                )
+                try:
+                    os.write(descriptor, competitor)
+                finally:
+                    os.close(descriptor)
+                if kind == "source_absent":
+                    os.unlink(source, dir_fd=source_fd)
+            elif kind == "directory":
+                os.mkdir(destination, 0o700, dir_fd=destination_fd)
+            elif kind == "symlink":
+                os.symlink("opaque-rollback-winner", destination, dir_fd=destination_fd)
+            else:
+                os.mkfifo(destination, 0o600, dir_fd=destination_fd)
+            os.stat(destination, dir_fd=destination_fd, follow_symlinks=False)
+            return False
+        return real_rename(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    monkeypatch.setattr(publisher_module.os, "link", fail_manifest_once)
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", collide_once)
+
+    with pytest.raises(ForgeException):
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert manifest_failed
+    assert collision_name is not None
+    assert _visible(vault) == before
+    matches = list((vault / ".cove-book-forge" / ".transactions").rglob(collision_name))
+    assert len(matches) == 1
+    collision = matches[0]
+    status = collision.lstat()
+    if kind in {"source_hardlink", "regular", "source_absent"}:
+        assert stat.S_ISREG(status.st_mode)
+        expected = competitor if kind != "source_hardlink" else None
+        if expected is not None:
+            assert collision.read_bytes() == expected
+    elif kind == "directory":
+        assert stat.S_ISDIR(status.st_mode)
+    elif kind == "symlink":
+        assert stat.S_ISLNK(status.st_mode)
+        assert os.readlink(collision) == "opaque-rollback-winner"
+    else:
+        assert stat.S_ISFIFO(status.st_mode)
+    records = list((vault / ".cove-book-forge" / ".transactions").rglob("recovery-*.json"))
+    assert all(
+        json.loads(record.read_bytes())["moved_name"] != collision_name for record in records
+    )
+
+
+def test_rollback_ambiguous_exception_with_source_and_hardlink_destination_is_no_move(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    before = _visible(vault)
+    real_link = publisher_module.os.link
+    real_rename = publisher_module._rename_noreplace
+    signal = KeyboardInterrupt("rollback hardlink collision")
+    manifest_failed = False
+    collision_name: str | None = None
+
+    def fail_manifest_once(src, dst, **kwargs):
+        nonlocal manifest_failed
+        if not manifest_failed and isinstance(dst, str) and dst.endswith(".json"):
+            manifest_failed = True
+            raise OSError("PRIVATE-MANIFEST-FAILURE")
+        return real_link(src, dst, **kwargs)
+
+    def hardlink_then_interrupt(source, destination, *, source_fd, destination_fd):
+        nonlocal collision_name
+        try:
+            os.stat(source, dir_fd=source_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            source_exists = False
+        else:
+            source_exists = True
+        if collision_name is None and destination.startswith("r") and source_exists:
+            collision_name = destination
+            os.link(
+                source,
+                destination,
+                src_dir_fd=source_fd,
+                dst_dir_fd=destination_fd,
+                follow_symlinks=False,
+            )
+            raise signal
+        return real_rename(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    monkeypatch.setattr(publisher_module.os, "link", fail_manifest_once)
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", hardlink_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value is signal
+    assert manifest_failed
+    assert collision_name is not None
+    assert _visible(vault) == before
+    collision = next((vault / ".cove-book-forge" / ".transactions").rglob(collision_name))
+    assert stat.S_ISREG(collision.lstat().st_mode)
+    records = list((vault / ".cove-book-forge" / ".transactions").rglob("recovery-*.json"))
+    assert all(
+        json.loads(record.read_bytes())["moved_name"] != collision_name for record in records
+    )
 
 
 @pytest.mark.parametrize("kind", ["directory", "symlink", "fifo"])

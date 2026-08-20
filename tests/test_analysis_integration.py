@@ -169,7 +169,7 @@ async def test_disabled_library_analysis_persists_across_service_lifecycles(tmp_
 async def test_ob_and_skill_placeholders_read_the_same_cached_chapter_analysis(
     tmp_path: Path,
 ) -> None:
-    """Analyzing separately per future consumer must cause an extra Provider call."""
+    """Separate OB and Skill consumers reuse one cached Provider generation."""
     config = _config(tmp_path / "shared-consumers")
     provider = FakeProvider([{"core_idea": "One reusable analysis"}])
     snapshot = _snapshot()

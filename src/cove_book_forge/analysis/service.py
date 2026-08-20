@@ -8,7 +8,10 @@ from pydantic import ValidationError
 
 from cove_book_forge.analysis.cache import ChapterAnalysisCache
 from cove_book_forge.analysis.chunks import split_chapter_content
-from cove_book_forge.analysis.fingerprint import chapter_input_fingerprint
+from cove_book_forge.analysis.fingerprint import (
+    canonical_analysis_source_payload,
+    chapter_input_fingerprint,
+)
 from cove_book_forge.analysis.prompts import (
     build_chapter_analysis_prompts,
     build_chapter_chunk_analysis_prompts,
@@ -115,8 +118,10 @@ class ChapterAnalyzer:
         return _AttemptOutcome(analysis=analysis, from_cache=False)
 
     async def _generate_valid_analysis(self, snapshot: ChapterSnapshot) -> ChapterAnalysis:
+        canonical_source = canonical_analysis_source_payload(snapshot)
+        canonical_chapter = canonical_source["chapter"]
         chunks = split_chapter_content(
-            snapshot.chapter.content,
+            canonical_chapter["content"],
             self._analysis_config.max_chunk_characters,
         )
         if len(chunks) == 1:
@@ -129,7 +134,7 @@ class ChapterAnalyzer:
             chunk_analyses.append(
                 await self._generate_valid_analysis_from_prompts(
                     *build_chapter_chunk_analysis_prompts(
-                        chapter_title=snapshot.chapter.title,
+                        chapter_title=canonical_chapter["title"],
                         chunk_content=chunk,
                         chunk_number=chunk_number,
                         chunk_count=len(chunks),

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections import deque
 from collections.abc import Mapping
 
 import pytest
 from pydantic import JsonValue
 
-from cove_book_forge.analysis import ChapterAnalyzer
+from cove_book_forge.analysis import ChapterAnalyzer, chapter_input_fingerprint
 from cove_book_forge.config import AnalysisConfig, ModelConfig
 from cove_book_forge.contracts import ChapterAnalysis, ChapterSnapshot
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
@@ -278,3 +279,75 @@ async def test_later_chunk_failure_never_caches_partial_analysis() -> None:
     assert len(provider.calls) == 3
     assert cache.stored == []
     assert cache.entries == {}
+
+
+@pytest.mark.anyio
+async def test_equivalent_unicode_and_line_endings_use_identical_long_chapter_prompts() -> None:
+    """Splitting raw rather than canonical content must change calls for one fingerprint."""
+    nfc_content = ("é" * 127 + "\n") * 2
+    nfd_crlf_content = (unicodedata.normalize("NFD", "é") * 127 + "\r\n") * 2
+    nfc_snapshot = _snapshot(nfc_content)
+    nfd_snapshot = _snapshot(nfd_crlf_content)
+    nfc_snapshot = nfc_snapshot.model_copy(
+        update={
+            "chapter": nfc_snapshot.chapter.model_copy(update={"title": "Résumé"}),
+        }
+    )
+    nfd_snapshot = nfd_snapshot.model_copy(
+        update={
+            "chapter": nfd_snapshot.chapter.model_copy(
+                update={"title": unicodedata.normalize("NFD", "Résumé")}
+            ),
+        }
+    )
+    analysis_config = AnalysisConfig(max_chunk_characters=128)
+    model_config = _model()
+    shared_cache = RecordingCache()
+    generated_provider = RecordingProvider(
+        [_valid_value(f"generated {index}") for index in range(10)]
+    )
+
+    generated = await ChapterAnalyzer(
+        generated_provider,
+        shared_cache,
+        analysis_config,
+        model_config,
+    ).analyze(nfd_snapshot)
+    zero_call_provider = RecordingProvider([])
+    reused = await ChapterAnalyzer(
+        zero_call_provider,
+        shared_cache,
+        analysis_config,
+        model_config,
+    ).analyze(nfc_snapshot)
+
+    nfd_force_provider = RecordingProvider(
+        [_valid_value(f"generated {index}") for index in range(10)]
+    )
+    nfc_force_provider = RecordingProvider(
+        [_valid_value(f"generated {index}") for index in range(10)]
+    )
+    await ChapterAnalyzer(
+        nfd_force_provider,
+        RecordingCache(),
+        analysis_config,
+        model_config,
+    ).analyze(nfd_snapshot, force=True)
+    await ChapterAnalyzer(
+        nfc_force_provider,
+        RecordingCache(),
+        analysis_config,
+        model_config,
+    ).analyze(nfc_snapshot, force=True)
+
+    assert chapter_input_fingerprint(
+        nfd_snapshot, analysis_config, model_config
+    ) == chapter_input_fingerprint(nfc_snapshot, analysis_config, model_config)
+    assert generated.cache_hit is False
+    assert reused.analysis == generated.analysis
+    assert reused.cache_hit is True
+    assert zero_call_provider.calls == []
+    assert len(generated_provider.calls) == 3
+    assert len(nfd_force_provider.calls) == len(nfc_force_provider.calls) == 3
+    assert generated_provider.calls == nfd_force_provider.calls
+    assert nfd_force_provider.calls == nfc_force_provider.calls

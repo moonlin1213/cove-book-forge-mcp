@@ -20,7 +20,6 @@ from cove_book_forge.providers import (
 class DeterministicLocalProvider:
     def __init__(self, config: ModelConfig) -> None:
         self._model = config.model
-        self._max_output_tokens = config.default_max_output_tokens
         self._usage = ProviderUsage()
 
     @property
@@ -28,7 +27,7 @@ class DeterministicLocalProvider:
         return ProviderCapabilities(
             json_mode=True,
             json_schema=False,
-            max_output_tokens=self._max_output_tokens,
+            max_output_tokens=None,
         )
 
     @property

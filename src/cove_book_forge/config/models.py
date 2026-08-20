@@ -25,6 +25,7 @@ class ModelConfig(ConfigModel):
     model: str = Field(min_length=1, max_length=240)
     base_url: HttpUrl | None = None
     api_key_env: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
+    json_mode: bool | None = None
     max_concurrency: int = Field(default=2, ge=1, le=16)
     requests_per_minute: int = Field(default=20, ge=1, le=10_000)
     request_timeout_seconds: float = Field(default=60.0, gt=0, le=600)

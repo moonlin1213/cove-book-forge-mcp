@@ -201,6 +201,19 @@ def test_text_blocks_are_collected_in_order_and_non_text_blocks_are_ignored() ->
     assert result.model == "configured-claude"
 
 
+@pytest.mark.parametrize("stop_reason", ["end_turn", "stop_sequence"])
+def test_protocol_complete_stop_reasons_succeed(stop_reason: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=response_body(stop_reason=stop_reason))
+
+    provider = make_provider(ModelConfig(provider="anthropic", model="claude"), handler)
+
+    result = run(provider.generate_text("system", "user", max_output_tokens=10))
+
+    assert result.text == "answer"
+    assert provider.usage.request_count == 1
+
+
 def test_successful_calls_accumulate_usage_while_healthcheck_does_not() -> None:
     calls: list[tuple[str, str]] = []
     bodies = [
@@ -257,6 +270,7 @@ def test_json_generation_uses_prompt_instruction_without_openai_fields_or_schema
             provider="anthropic",
             model="claude",
             default_max_output_tokens=8192,
+            json_mode=True,
         ),
         handler,
     )
@@ -273,11 +287,50 @@ def test_json_generation_uses_prompt_instruction_without_openai_fields_or_schema
     assert result.value == {"theme": "attention"}
     assert provider.capabilities.json_mode is False
     assert provider.capabilities.json_schema is False
-    assert provider.capabilities.max_output_tokens == 8192
+    assert provider.capabilities.max_output_tokens is None
     assert "exactly one valid JSON object" in str(payloads[0]["system"])
     assert "response_format" not in payloads[0]
     assert "json_schema" not in payloads[0]
     assert "schema" not in payloads[0]
+
+
+@pytest.mark.parametrize("max_output_tokens", [0, -1])
+@pytest.mark.parametrize("generation_kind", ["text", "json"])
+def test_non_positive_max_output_tokens_fail_closed_before_transport(
+    max_output_tokens: int,
+    generation_kind: str,
+) -> None:
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json=response_body())
+
+    provider = make_provider(ModelConfig(provider="anthropic", model="claude"), handler)
+
+    with pytest.raises(ForgeException) as caught:
+        if generation_kind == "text":
+            run(
+                provider.generate_text(
+                    "system",
+                    "user",
+                    max_output_tokens=max_output_tokens,
+                )
+            )
+        else:
+            run(
+                provider.generate_json(
+                    "system",
+                    "user",
+                    max_output_tokens=max_output_tokens,
+                )
+            )
+
+    assert caught.value.code is ForgeErrorCode.MODEL_OUTPUT_INVALID
+    assert caught.value.details == {}
+    assert request_count == 0
+    assert provider.usage == ProviderUsage()
 
 
 @pytest.mark.parametrize(
@@ -289,9 +342,14 @@ def test_json_generation_uses_prompt_instruction_without_openai_fields_or_schema
         pytest.param("", False, id="empty"),
         pytest.param("   ", False, id="blank"),
         pytest.param("max_tokens", False, id="truncated"),
+        pytest.param("tool_use", False, id="tool-continuation"),
+        pytest.param("pause_turn", False, id="paused-continuation"),
+        pytest.param("refusal", False, id="refusal"),
+        pytest.param("content_filter", False, id="filtered"),
+        pytest.param("unknown", False, id="unknown"),
     ],
 )
-def test_invalid_or_truncated_stop_reason_does_not_mutate_usage(
+def test_trusted_usage_is_recorded_before_invalid_or_truncated_stop_reason(
     stop_reason: object,
     omit_stop_reason: bool,
 ) -> None:
@@ -308,28 +366,80 @@ def test_invalid_or_truncated_stop_reason_does_not_mutate_usage(
         run(provider.generate_text("system", "user", max_output_tokens=10))
 
     assert caught.value.code is ForgeErrorCode.MODEL_OUTPUT_INVALID
-    assert provider.usage == ProviderUsage()
+    assert provider.usage == ProviderUsage(
+        input_tokens=11,
+        output_tokens=7,
+        total_tokens=18,
+        request_count=1,
+    )
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "expected_usage"),
     [
-        "not-json",
-        {},
-        response_body(content={"type": "text", "text": "answer"}),
-        response_body(content=["not-a-block"]),
-        response_body(content=[{}]),
-        response_body(content=[{"type": 1, "text": "answer"}]),
-        response_body(content=[{"type": "text"}]),
-        response_body(content=[{"type": "text", "text": 7}]),
-        response_body(content=[{"type": "text", "text": "   "}]),
-        response_body(usage=None) | {"usage": None},
-        response_body(usage={"input_tokens": -1, "output_tokens": 1}),
-        response_body(usage={"input_tokens": True, "output_tokens": 1}),
-        response_body(usage={"input_tokens": 1, "output_tokens": "1"}),
+        pytest.param("not-json", ProviderUsage(), id="non-json-response"),
+        pytest.param({}, ProviderUsage(), id="missing-usage"),
+        pytest.param(
+            response_body(content={"type": "text", "text": "answer"}),
+            ProviderUsage(input_tokens=11, output_tokens=7, total_tokens=18, request_count=1),
+            id="non-list-content-with-trusted-usage",
+        ),
+        pytest.param(
+            response_body(content=["not-a-block"]),
+            ProviderUsage(input_tokens=11, output_tokens=7, total_tokens=18, request_count=1),
+            id="invalid-block-with-trusted-usage",
+        ),
+        pytest.param(
+            response_body(content=[{}]),
+            ProviderUsage(input_tokens=11, output_tokens=7, total_tokens=18, request_count=1),
+            id="missing-block-type-with-trusted-usage",
+        ),
+        pytest.param(
+            response_body(content=[{"type": 1, "text": "answer"}]),
+            ProviderUsage(input_tokens=11, output_tokens=7, total_tokens=18, request_count=1),
+            id="invalid-block-type-with-trusted-usage",
+        ),
+        pytest.param(
+            response_body(content=[{"type": "text"}]),
+            ProviderUsage(input_tokens=11, output_tokens=7, total_tokens=18, request_count=1),
+            id="missing-text-with-trusted-usage",
+        ),
+        pytest.param(
+            response_body(content=[{"type": "text", "text": 7}]),
+            ProviderUsage(input_tokens=11, output_tokens=7, total_tokens=18, request_count=1),
+            id="invalid-text-with-trusted-usage",
+        ),
+        pytest.param(
+            response_body(content=[{"type": "text", "text": "   "}]),
+            ProviderUsage(input_tokens=11, output_tokens=7, total_tokens=18, request_count=1),
+            id="blank-text-with-trusted-usage",
+        ),
+        pytest.param(
+            response_body(usage=None) | {"usage": None},
+            ProviderUsage(),
+            id="missing-usage",
+        ),
+        pytest.param(
+            response_body(usage={"input_tokens": -1, "output_tokens": 1}),
+            ProviderUsage(),
+            id="negative-usage",
+        ),
+        pytest.param(
+            response_body(usage={"input_tokens": True, "output_tokens": 1}),
+            ProviderUsage(),
+            id="boolean-usage",
+        ),
+        pytest.param(
+            response_body(usage={"input_tokens": 1, "output_tokens": "1"}),
+            ProviderUsage(),
+            id="string-usage",
+        ),
     ],
 )
-def test_malformed_content_or_usage_is_rejected_without_mutation(body: object) -> None:
+def test_malformed_content_records_only_trusted_usage(
+    body: object,
+    expected_usage: ProviderUsage,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if isinstance(body, str):
             return httpx.Response(200, text=body)
@@ -345,7 +455,7 @@ def test_malformed_content_or_usage_is_rejected_without_mutation(body: object) -
     assert caught.value.details == {}
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
-    assert provider.usage == ProviderUsage()
+    assert provider.usage == expected_usage
 
 
 @pytest.mark.parametrize(
@@ -376,7 +486,12 @@ def test_json_generation_accepts_only_a_direct_standard_json_object(content: str
         run(provider.generate_json("system", "user", max_output_tokens=10))
 
     assert caught.value.code is ForgeErrorCode.MODEL_OUTPUT_INVALID
-    assert provider.usage == ProviderUsage()
+    assert provider.usage == ProviderUsage(
+        input_tokens=11,
+        output_tokens=7,
+        total_tokens=18,
+        request_count=1,
+    )
 
 
 @pytest.mark.parametrize(

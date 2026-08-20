@@ -13,7 +13,7 @@ from cove_book_forge.providers.base import (
     ProviderUsage,
     TextGeneration,
 )
-from cove_book_forge.providers.transport import ProviderTransport
+from cove_book_forge.providers.transport import ProviderTransport, _RequestLimits
 
 _DEFAULT_BASE = "https://api.anthropic.com"
 _ANTHROPIC_VERSION = "2023-06-01"
@@ -29,6 +29,7 @@ class AnthropicProvider:
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        request_limits: _RequestLimits | None = None,
     ) -> None:
         self._config = config
         self._api_key = api_key if api_key and api_key.strip() else None
@@ -41,6 +42,7 @@ class AnthropicProvider:
             transport=transport,
             clock=clock,
             sleep=sleep,
+            request_limits=request_limits,
         )
 
     @property
@@ -48,7 +50,7 @@ class AnthropicProvider:
         return ProviderCapabilities(
             json_mode=False,
             json_schema=False,
-            max_output_tokens=self._config.default_max_output_tokens,
+            max_output_tokens=None,
         )
 
     @property
@@ -75,9 +77,7 @@ class AnthropicProvider:
             ),
         )
         text, model, usage = self._parse_generation(response)
-        result = TextGeneration(text=text, model=model, usage=usage)
-        self._record_usage(usage)
-        return result
+        return TextGeneration(text=text, model=model, usage=usage)
 
     async def generate_json(
         self,
@@ -103,9 +103,7 @@ class AnthropicProvider:
         )
         text, model, usage = self._parse_generation(response)
         value = self._parse_json_object(text)
-        result = JsonGeneration(value=value, model=model, usage=usage)
-        self._record_usage(usage)
-        return result
+        return JsonGeneration(value=value, model=model, usage=usage)
 
     async def healthcheck(self) -> None:
         await self._requester.request(
@@ -143,6 +141,8 @@ class AnthropicProvider:
         max_output_tokens: int,
         temperature: float | None,
     ) -> dict[str, object]:
+        if type(max_output_tokens) is not int or max_output_tokens <= 0:
+            self._invalid_output()
         payload: dict[str, object] = {
             "model": self._config.model,
             "max_tokens": max_output_tokens,
@@ -155,15 +155,12 @@ class AnthropicProvider:
 
     def _parse_generation(self, response: httpx.Response) -> tuple[str, str, ProviderUsage]:
         body = self._response_object(response)
+        usage = self._parse_usage(body.get("usage"))
+        self._record_usage(usage)
         stop_reason = body.get("stop_reason")
-        if (
-            not isinstance(stop_reason, str)
-            or not stop_reason.strip()
-            or stop_reason == "max_tokens"
-        ):
+        if stop_reason not in {"end_turn", "stop_sequence"}:
             self._invalid_output()
         text = self._parse_content(body.get("content"))
-        usage = self._parse_usage(body.get("usage"))
         model_value = body.get("model")
         model = (
             model_value

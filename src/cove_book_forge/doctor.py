@@ -15,6 +15,7 @@ from cove_book_forge.errors import ForgeException
 from cove_book_forge.library.database import _inspect_library_schema, _LibrarySchemaReadiness
 from cove_book_forge.library.service import _validate_data_root
 from cove_book_forge.providers import ProviderRegistry
+from cove_book_forge.providers.credentials import resolve_provider_credential
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _LIBRARY_DATABASE_FILENAME = "library.sqlite3"
@@ -22,7 +23,6 @@ _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _DATABASE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
 # In-memory SQLite deserialize may require additional working memory beyond this payload.
 _MAX_DATABASE_SNAPSHOT_BYTES = 256 * 1024 * 1024
-_CLOUD_MODEL_PROVIDERS = frozenset({"openai", "deepseek", "anthropic"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,15 +170,8 @@ def _dependency_check(name: str, module: str) -> DoctorCheck:
 
 def _model_provider_check(config: AppConfig) -> DoctorCheck:
     model_config = config.model
-    if model_config.provider == "openai-compatible" and model_config.base_url is None:
-        return DoctorCheck(
-            name="model_provider",
-            status=CheckStatus.FAIL,
-            message="Model provider configuration is unavailable.",
-        )
     try:
-        factory = ProviderRegistry().resolve(model_config.provider)
-        factory(model_config, None)
+        ProviderRegistry().create(model_config)
     except Exception:
         return DoctorCheck(
             name="model_provider",
@@ -195,20 +188,26 @@ def _model_provider_check(config: AppConfig) -> DoctorCheck:
 def _model_api_key_check(config: AppConfig) -> DoctorCheck | None:
     model_config = config.model
     key_name = model_config.api_key_env
-    if key_name is None:
-        if model_config.provider not in _CLOUD_MODEL_PROVIDERS:
-            return None
+    try:
+        resolve_provider_credential(model_config)
+    except ForgeException:
+        if key_name is not None:
+            return DoctorCheck(
+                name="model_api_key",
+                status=CheckStatus.FAIL,
+                message=f"Environment variable is missing: {key_name}",
+            )
         return DoctorCheck(
             name="model_api_key",
             status=CheckStatus.FAIL,
             message="API key environment variable is not configured.",
         )
-    value = os.environ.get(key_name)
-    is_set = value is not None and bool(value.strip())
+    if key_name is None:
+        return None
     return DoctorCheck(
         name="model_api_key",
-        status=CheckStatus.PASS if is_set else CheckStatus.FAIL,
-        message=f"Environment variable is {'set' if is_set else 'missing'}: {key_name}",
+        status=CheckStatus.PASS,
+        message=f"Environment variable is set: {key_name}",
     )
 
 

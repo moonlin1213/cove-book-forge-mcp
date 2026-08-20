@@ -96,6 +96,7 @@ def test_registry_builtins_complete_text_and_json_without_fallback(
             and (
                 "response_format" in json
                 or "Return exactly one valid JSON object" in str(json.get("system", ""))
+                or "Return exactly one valid JSON object" in str(json.get("messages", ""))
             )
         )
         content = '{"kind":"json"}' if is_json else "offline text"

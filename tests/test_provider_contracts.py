@@ -126,6 +126,7 @@ def test_common_model_settings_have_bounded_backward_compatible_defaults() -> No
 
     assert config.request_timeout_seconds == 60.0
     assert config.default_max_output_tokens == 4_096
+    assert config.json_mode is None
 
     with pytest.raises(ValidationError):
         ModelConfig(

@@ -9,6 +9,7 @@ from cove_book_forge.errors import ForgeErrorCode, ForgeException
 
 Clock = Callable[[], float]
 Sleep = Callable[[float], Awaitable[None]]
+_DEFAULT_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 
 class _RequestRateGate:
@@ -39,6 +40,23 @@ class _RequestRateGate:
             await self._sleep(delay)
 
 
+class _RequestLimits:
+    def __init__(
+        self,
+        *,
+        max_concurrency: int,
+        requests_per_minute: int,
+        clock: Clock,
+        sleep: Sleep,
+    ) -> None:
+        self.semaphore = asyncio.Semaphore(max_concurrency)
+        self.rate_gate = _RequestRateGate(
+            requests_per_minute,
+            clock=clock,
+            sleep=sleep,
+        )
+
+
 class ProviderTransport:
     def __init__(
         self,
@@ -49,6 +67,8 @@ class ProviderTransport:
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Clock | None = None,
         sleep: Sleep | None = None,
+        request_limits: _RequestLimits | None = None,
+        max_response_bytes: int = _DEFAULT_MAX_RESPONSE_BYTES,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -56,13 +76,16 @@ class ProviderTransport:
             raise ValueError("max_concurrency must be positive")
         if requests_per_minute <= 0:
             raise ValueError("requests_per_minute must be positive")
+        if max_response_bytes <= 0:
+            raise ValueError("max_response_bytes must be positive")
         resolved_clock = clock or time.monotonic
         resolved_sleep = sleep or asyncio.sleep
         self._timeout_seconds = timeout_seconds
         self._transport = transport
-        self._semaphore = asyncio.Semaphore(max_concurrency)
-        self._rate_gate = _RequestRateGate(
-            requests_per_minute,
+        self._max_response_bytes = max_response_bytes
+        self._request_limits = request_limits or _RequestLimits(
+            max_concurrency=max_concurrency,
+            requests_per_minute=requests_per_minute,
             clock=resolved_clock,
             sleep=resolved_sleep,
         )
@@ -75,29 +98,48 @@ class ProviderTransport:
         headers: Mapping[str, str] | None = None,
         json: Mapping[str, object] | None = None,
     ) -> httpx.Response:
-        async with self._semaphore:
-            await self._rate_gate.acquire()
+        async with self._request_limits.semaphore:
+            await self._request_limits.rate_gate.acquire()
             try:
-                async with httpx.AsyncClient(
-                    timeout=self._timeout_seconds,
-                    transport=self._transport,
-                ) as client:
-                    response = await client.request(
+                async with (
+                    httpx.AsyncClient(
+                        timeout=self._timeout_seconds,
+                        transport=self._transport,
+                    ) as client,
+                    client.stream(
                         method,
                         url,
                         headers=headers,
                         json=json,
+                    ) as response,
+                ):
+                    self._raise_for_status(response.status_code)
+                    content = await self._read_success_body(response)
+                    return httpx.Response(
+                        response.status_code,
+                        headers=response.headers,
+                        content=content,
+                        extensions=response.extensions,
+                        request=response.request,
                     )
             except httpx.RequestError:
-                response = None
-            if response is None:
+                pass
+            raise ForgeException(
+                ForgeErrorCode.MODEL_UNAVAILABLE,
+                "Model request failed.",
+                retryable=True,
+            ) from None
+
+    async def _read_success_body(self, response: httpx.Response) -> bytes:
+        content = bytearray()
+        async for chunk in response.aiter_bytes():
+            if len(chunk) > self._max_response_bytes - len(content):
                 raise ForgeException(
-                    ForgeErrorCode.MODEL_UNAVAILABLE,
-                    "Model request failed.",
-                    retryable=True,
+                    ForgeErrorCode.MODEL_OUTPUT_INVALID,
+                    "Model output was malformed.",
                 )
-            self._raise_for_status(response.status_code)
-            return response
+            content.extend(chunk)
+        return bytes(content)
 
     @staticmethod
     def _raise_for_status(status_code: int) -> None:

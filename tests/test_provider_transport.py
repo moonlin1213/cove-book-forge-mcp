@@ -35,6 +35,7 @@ def make_transport(
     requests_per_minute: int = 20,
     clock: Callable[[], float] | None = None,
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    max_response_bytes: int = 8 * 1024 * 1024,
 ) -> ProviderTransport:
     return ProviderTransport(
         timeout_seconds=5,
@@ -43,7 +44,23 @@ def make_transport(
         transport=httpx.MockTransport(handler),
         clock=clock,
         sleep=sleep,
+        max_response_bytes=max_response_bytes,
     )
+
+
+class TrackingStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.yielded = 0
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            self.yielded += 1
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 def test_transport_limits_the_complete_request_concurrency() -> None:
@@ -103,6 +120,65 @@ def test_transport_waits_for_the_monotonic_rate_window_without_real_sleep() -> N
 
     assert request_count == 3
     assert clock.sleeps == [60.0]
+
+
+def test_successful_response_at_exact_body_bound_is_returned() -> None:
+    stream = TrackingStream([b"1234", b"5678"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    transport = make_transport(handler, max_response_bytes=8)
+
+    response = run(transport.request("GET", "https://provider.test/models"))
+
+    assert response.content == b"12345678"
+    assert stream.yielded == 2
+    assert stream.closed is True
+
+
+def test_successful_response_one_byte_over_bound_fails_without_accumulating_remainder() -> None:
+    private_remainder = b"private-remainder-that-must-not-be-read"
+    stream = TrackingStream([b"1234", b"5678", b"9", private_remainder])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"x-private": "private-header"},
+            stream=stream,
+        )
+
+    transport = make_transport(handler, max_response_bytes=8)
+
+    with pytest.raises(ForgeException) as caught:
+        run(transport.request("GET", "https://private-provider.test/models"))
+
+    assert caught.value.code is ForgeErrorCode.MODEL_OUTPUT_INVALID
+    assert caught.value.details == {}
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert stream.yielded == 3
+    assert stream.closed is True
+    rendered = " ".join((str(caught.value), repr(caught.value), repr(caught.value.as_result())))
+    assert "private-provider" not in rendered
+    assert "private-header" not in rendered
+    assert private_remainder.decode() not in rendered
+
+
+def test_error_status_is_mapped_before_response_body_is_consumed() -> None:
+    stream = TrackingStream([b"private-error-body"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, stream=stream)
+
+    transport = make_transport(handler, max_response_bytes=8)
+
+    with pytest.raises(ForgeException) as caught:
+        run(transport.request("GET", "https://private-provider.test/models"))
+
+    assert caught.value.code is ForgeErrorCode.MODEL_UNAVAILABLE
+    assert stream.yielded == 0
+    assert stream.closed is True
 
 
 @pytest.mark.parametrize(

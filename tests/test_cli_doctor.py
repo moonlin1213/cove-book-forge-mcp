@@ -21,6 +21,7 @@ from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.library import BookLibrary, LibraryDatabase
 from cove_book_forge.library import database as library_database
 from cove_book_forge.providers.anthropic import AnthropicProvider
+from cove_book_forge.providers.factory import ProviderRegistry
 from cove_book_forge.providers.openai_compatible import OpenAICompatibleProvider
 from cove_book_forge.providers.transport import ProviderTransport
 
@@ -297,10 +298,61 @@ model:
 
     result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
 
+    loaded = load_config(config)
+    with pytest.raises(ForgeException) as registry_error:
+        ProviderRegistry().create(loaded.model)
+
     assert result.exit_code == 1
     payload = json.loads(result.stdout)
-    assert _check(payload, "model_provider")["status"] == "pass"
+    assert _check(payload, "model_provider")["status"] == "fail"
     assert _check(payload, "model_api_key")["status"] == "fail"
+    assert registry_error.value.code is ForgeErrorCode.MODEL_AUTH_FAILED
+    rendered = " ".join(
+        (
+            result.stdout,
+            str(registry_error.value),
+            repr(registry_error.value.as_result()),
+        )
+    )
+    assert provider_name not in rendered
+    if key_value:
+        assert key_value not in rendered
+
+
+@pytest.mark.parametrize("provider_name", ["openai", "deepseek", "anthropic"])
+def test_doctor_rejects_missing_cloud_credential_before_adapter_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_name: str,
+) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+model:
+  provider: {provider_name}
+  model: private-model
+""".strip(),
+        encoding="utf-8",
+    )
+    constructor_calls = 0
+
+    def forbidden_construction(*_args: object, **_kwargs: object) -> None:
+        nonlocal constructor_calls
+        constructor_calls += 1
+        raise AssertionError("credential policy must run before adapter construction")
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "__init__", forbidden_construction)
+    monkeypatch.setattr(AnthropicProvider, "__init__", forbidden_construction)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert _check(payload, "model_provider")["status"] == "fail"
+    assert _check(payload, "model_api_key")["status"] == "fail"
+    assert constructor_calls == 0
+    assert provider_name not in result.stdout
+    assert "private-model" not in result.stdout
 
 
 def test_doctor_allows_credential_free_openai_compatible_local_gateway(tmp_path: Path) -> None:

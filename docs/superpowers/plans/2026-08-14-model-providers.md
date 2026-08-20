@@ -74,7 +74,7 @@ The concrete method parameters are `system_prompt`, `user_prompt`, `max_output_t
 - Create: `tests/test_provider_factory.py`
 
 - [ ] Add failing tests for strict/frozen capability, usage, text, and JSON contracts; the async protocol; exact built-in selection; unknown-provider failure; explicit custom-factory injection; and missing/empty API-key environment variables.
-- [ ] Add `httpx>=0.28,<1`. Extend `ModelConfig` only with bounded request timeout and output-token defaults needed by every adapter; keep configuration backward compatible.
+- [ ] Add `httpx>=0.28,<1`. Extend `ModelConfig` only with bounded request timeout and output-token defaults needed by every adapter plus backward-compatible optional `json_mode: bool | None = None` capability selection.
 - [ ] Implement an async `ModelProvider` protocol and a factory for `openai`, `openai-compatible`, `deepseek`, and `anthropic`, plus a registry of caller-supplied factories. Unknown names return `CONFIG_INVALID` with only `model.provider` as public detail.
 - [ ] Resolve secrets at provider construction without retaining the environment-variable name in request payloads or exposing the value in model dumps/errors.
 - [ ] Run focused tests, Ruff, and strict mypy, then commit: `feat: define model provider boundary`.
@@ -88,7 +88,7 @@ The concrete method parameters are `system_prompt`, `user_prompt`, `max_output_t
 - Create: `tests/test_openai_compatible_provider.py`
 - Create: `tests/test_provider_transport.py`
 
-- [ ] Add failing `httpx.MockTransport` tests for OpenAI and DeepSeek URL construction, authorization, message payloads, plain text, JSON-object mode with an explicit JSON instruction, usage accounting, model identity, health check, malformed/truncated responses, and safe HTTP/network/timeout error mapping.
+- [ ] Add failing `httpx.MockTransport` tests for OpenAI and DeepSeek URL construction, authorization, message payloads, plain text, capability-driven JSON-object mode with an explicit JSON instruction, usage accounting, model identity, health check, malformed/truncated responses, and safe HTTP/network/timeout error mapping. Native JSON mode defaults on for exact OpenAI/DeepSeek and off for generic `openai-compatible`; an explicit `json_mode` boolean overrides those defaults.
 - [ ] Implement a shared async semaphore and deterministic requests-per-minute gate with injectable clock/sleep for tests. Each public generation call performs at most one HTTP request in this phase.
 - [ ] Implement `OpenAICompatibleProvider` against `<api_base>/chat/completions`, using the configured base exactly as an API prefix. Defaults are `https://api.openai.com/v1` for OpenAI and `https://api.deepseek.com` for DeepSeek.
 - [ ] Map 401/403 to `MODEL_AUTH_FAILED`, 429 to retryable `MODEL_RATE_LIMITED`, network/timeout/5xx to retryable `MODEL_UNAVAILABLE`, and malformed, empty, non-object JSON, or incomplete model output to `MODEL_OUTPUT_INVALID` without leaking response content.

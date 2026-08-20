@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cove-book-forge-mcp"
 version = "0.1.0.dev0"
-description = "Local-first MCP server that forges books into Obsidian knowledge and reusable Agent Skills."
+description = "Local-first ingestion, SQLite library, and model-provider core for a planned MCP server."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

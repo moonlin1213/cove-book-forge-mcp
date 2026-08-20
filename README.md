@@ -133,12 +133,15 @@ and `anthropic` as exact built-in names. It returns typed per-call results and
 cumulative input/output/total-token usage. Each generation call makes at most
 one request: there is no automatic retry, JSON repair, or fallback to another
 provider. Chapter-level prompts and schema validation belong to the planned
-analysis layer.
+analysis layer. Trusted provider usage is counted even when a charged response
+later fails termination, content, or JSON-object validation.
 
 API-key values are read only from the named process environment variable. Put
 the variable name—not the key—in YAML, and provide the value through your shell,
 service manager, or secrets manager. Keys, prompts, URLs, and raw response bodies
 are excluded from public errors and are not logged by the Provider layer.
+`openai`, `deepseek`, and `anthropic` require a configured, non-blank credential;
+generic `openai-compatible` and explicitly registered custom Providers may omit it.
 
 ### DeepSeek
 
@@ -162,6 +165,7 @@ model:
   provider: openai-compatible
   model: local-reader-model
   base_url: http://127.0.0.1:11434/v1
+  # json_mode: true  # opt in only when this gateway supports native JSON Mode
   # api_key_env: LOCAL_MODEL_API_KEY
 ```
 
@@ -176,10 +180,21 @@ model:
   api_key_env: ANTHROPIC_API_KEY
 ```
 
-OpenAI-compatible providers advertise JSON-object mode but not JSON Schema.
-Anthropic advertises neither native JSON mode nor JSON Schema in this phase;
-`generate_json` asks for and accepts one direct JSON object. Bounded repair and
-domain-schema validation remain planned analysis behavior.
+OpenAI and DeepSeek default to native JSON-object mode. Generic
+`openai-compatible` defaults to prompt-only JSON; set optional `json_mode: true`
+only for a gateway that supports `response_format`, or set `false` to disable
+native mode for OpenAI or DeepSeek. Every path adds the controlled direct-object
+instruction and strictly accepts one JSON object. Anthropic always advertises
+native JSON mode and JSON Schema as unavailable and ignores an OpenAI-style
+override. Output capability maxima remain unknown; `default_max_output_tokens`
+is a caller default, not a vendor hard limit. Bounded repair and domain-schema
+validation remain planned analysis behavior.
+
+Built-in Providers created by one application-owned `ProviderRegistry` share
+configured concurrency and 60-second request limits across models on the same
+route and credential identity. Each instance keeps its own cumulative usage.
+Separate registries are isolated, so an embedding application should reuse its
+registry for one application boundary.
 
 ### Explicit custom Provider registration
 
@@ -187,7 +202,7 @@ Applications can register a typed local or proprietary Provider explicitly,
 without plugin discovery or dynamic import paths:
 
 ```python
-from examples.custom_provider import custom_provider_factory
+from your_application.providers import custom_provider_factory
 
 from cove_book_forge.config import ModelConfig
 from cove_book_forge.providers import ProviderRegistry
@@ -196,10 +211,12 @@ registry = ProviderRegistry({"deterministic-local": custom_provider_factory})
 provider = registry.create(ModelConfig(provider="deterministic-local", model="reader-model"))
 ```
 
-See [`examples/custom_provider.py`](examples/custom_provider.py) for the complete
-typed example. The standalone `doctor` command recognizes only the exact built-ins;
-an embedding application owns readiness checks for its explicitly registered
-custom Providers.
+See the repository/sdist source example
+[`examples/custom_provider.py`](examples/custom_provider.py) for a complete typed
+implementation. It is source material, not a wheel package namespace; copy or
+adapt it under your own application package before using the import above. The
+standalone `doctor` command recognizes only the exact built-ins; an embedding
+application owns readiness checks for its explicitly registered custom Providers.
 
 ## Privacy defaults and diagnostics
 

@@ -13,7 +13,7 @@ from cove_book_forge.providers.base import (
     ProviderUsage,
     TextGeneration,
 )
-from cove_book_forge.providers.transport import ProviderTransport
+from cove_book_forge.providers.transport import ProviderTransport, _RequestLimits
 
 _DEFAULT_BASES = {
     "openai": "https://api.openai.com/v1",
@@ -31,10 +31,16 @@ class OpenAICompatibleProvider:
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] | None = None,
         sleep: Callable[[float], Awaitable[None]] | None = None,
+        request_limits: _RequestLimits | None = None,
     ) -> None:
         self._config = config
         self._api_key = api_key if api_key and api_key.strip() else None
         self._base_url = self._resolve_base_url(config)
+        self._json_mode = (
+            config.json_mode
+            if config.json_mode is not None
+            else config.provider in {"openai", "deepseek"}
+        )
         self._usage = ProviderUsage()
         self._requester = ProviderTransport(
             timeout_seconds=config.request_timeout_seconds,
@@ -43,14 +49,15 @@ class OpenAICompatibleProvider:
             transport=transport,
             clock=clock,
             sleep=sleep,
+            request_limits=request_limits,
         )
 
     @property
     def capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
-            json_mode=True,
+            json_mode=self._json_mode,
             json_schema=False,
-            max_output_tokens=self._config.default_max_output_tokens,
+            max_output_tokens=None,
         )
 
     @property
@@ -78,9 +85,7 @@ class OpenAICompatibleProvider:
             json=payload,
         )
         content, model, usage = self._parse_generation(response)
-        result = TextGeneration(text=content, model=model, usage=usage)
-        self._record_usage(usage)
-        return result
+        return TextGeneration(text=content, model=model, usage=usage)
 
     async def generate_json(
         self,
@@ -99,7 +104,8 @@ class OpenAICompatibleProvider:
             max_output_tokens=max_output_tokens,
             temperature=temperature,
         )
-        payload["response_format"] = {"type": "json_object"}
+        if self._json_mode:
+            payload["response_format"] = {"type": "json_object"}
         response = await self._requester.request(
             "POST",
             f"{self._base_url}/chat/completions",
@@ -108,9 +114,7 @@ class OpenAICompatibleProvider:
         )
         content, model, usage = self._parse_generation(response)
         value = self._parse_json_object(content)
-        result = JsonGeneration(value=value, model=model, usage=usage)
-        self._record_usage(usage)
-        return result
+        return JsonGeneration(value=value, model=model, usage=usage)
 
     async def healthcheck(self) -> None:
         await self._requester.request(
@@ -152,6 +156,8 @@ class OpenAICompatibleProvider:
         max_output_tokens: int,
         temperature: float | None,
     ) -> dict[str, object]:
+        if type(max_output_tokens) is not int or max_output_tokens <= 0:
+            self._invalid_output()
         payload: dict[str, object] = {
             "model": self._config.model,
             "messages": [
@@ -166,16 +172,14 @@ class OpenAICompatibleProvider:
 
     def _parse_generation(self, response: httpx.Response) -> tuple[str, str, ProviderUsage]:
         body = self._response_object(response)
+        usage = self._parse_usage(body.get("usage"))
+        self._record_usage(usage)
         choices = body.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], Mapping):
             self._invalid_output()
         choice = choices[0]
         finish_reason = choice.get("finish_reason")
-        if (
-            not isinstance(finish_reason, str)
-            or not finish_reason.strip()
-            or finish_reason == "length"
-        ):
+        if finish_reason != "stop":
             self._invalid_output()
         message = choice.get("message")
         if not isinstance(message, Mapping):
@@ -189,7 +193,6 @@ class OpenAICompatibleProvider:
             if isinstance(model_value, str) and model_value.strip()
             else self._config.model
         )
-        usage = self._parse_usage(body.get("usage"))
         return content, model, usage
 
     @classmethod

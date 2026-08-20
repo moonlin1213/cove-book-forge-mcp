@@ -42,14 +42,17 @@ _OWNER: Final = ".owner.json"
 _CONTENT: Final = "content"
 _MAX_FILE_BYTES: Final = 8 * 1024 * 1024
 _MAX_OWNER_BYTES: Final = 4 * 1024 * 1024
+_MAX_TOTAL_TREE_BYTES: Final = 64 * 1024 * 1024
 _MAX_TREE_FILES: Final = 5_011
 _MAX_TREE_ENTRIES: Final = 10_024
 _MAX_TRANSACTION_COUNT: Final = 64
 _MAX_ACTIVATION_ENTRIES: Final = 128
+_MAX_QUARANTINE_ENTRIES: Final = 128
 _READ_CHUNK: Final = 1024 * 1024
 _TX_NAME = re.compile(r"^tx-([0-9a-f]{32})$")
 _GENERATION_NAME = re.compile(r"^gen-([0-9a-f]{64})$")
 _ACTIVATION_NAME = re.compile(r"^activate-([0-9a-f]{32})$")
+_QUARANTINE_NAME = re.compile(r"^q-([0-9a-f]{32})$")
 _TARGET = re.compile(r"^\.cove-book-forge/generations/([0-9a-f]{16})/gen-([0-9a-f]{64})/content$")
 _ROOT_OWNER_BYTES: Final = b'{"owner":"cove-book-forge-canonical-skills","schema":1}'
 _SECURE_PRIMITIVES: Final = (
@@ -113,12 +116,16 @@ def _fsync_directory(descriptor: int) -> None:
 
 def _read_file(directory_fd: int, name: str, *, max_bytes: int) -> tuple[bytes, _Identity]:
     before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > max_bytes:
         raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
     descriptor = os.open(name, _READ_FLAGS, dir_fd=directory_fd)
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or _identity(opened) != _identity(before):
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or _identity(opened) != _identity(before)
+        ):
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         chunks: list[bytes] = []
         total = 0
@@ -131,7 +138,7 @@ def _read_file(directory_fd: int, name: str, *, max_bytes: int) -> tuple[bytes, 
             if total > max_bytes:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         after = os.fstat(descriptor)
-        if _identity(after) != _identity(opened) or after.st_size != total:
+        if _identity(after) != _identity(opened) or after.st_nlink != 1 or after.st_size != total:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         return b"".join(chunks), _identity(opened)
     finally:
@@ -149,7 +156,10 @@ def _write_file(directory_fd: int, name: str, payload: bytes) -> _Identity:
                 raise OSError(errno.EIO, "short write")
             written += count
         os.fsync(descriptor)
-        return _identity(os.fstat(descriptor))
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_nlink != 1:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return _identity(status)
     finally:
         os.close(descriptor)
 
@@ -274,9 +284,74 @@ class _Management:
     generations: int
     transactions: int
     activations: int
+    state: int
+    quarantine: int
+    root_link: _DirectoryLink
+    generation_link: _DirectoryLink
+    transaction_link: _DirectoryLink
+    activation_link: _DirectoryLink
+    state_link: _DirectoryLink
+    quarantine_link: _DirectoryLink
+
+    def verify(self, anchor: _RootAnchor) -> None:
+        anchor.verify()
+        if _identity(os.fstat(anchor.descriptor)) != self.root_link.parent_identity:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        root, root_identity = _open_directory(anchor.descriptor, self.root_link.name)
+        try:
+            if root_identity != self.root_link.identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            for link in (
+                self.generation_link,
+                self.transaction_link,
+                self.activation_link,
+                self.state_link,
+                self.quarantine_link,
+            ):
+                if link.parent_identity != root_identity:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                child, child_identity = _open_directory(root, link.name)
+                try:
+                    if child_identity != link.identity:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                finally:
+                    os.close(child)
+        finally:
+            os.close(root)
+        for descriptor, link in (
+            (self.root, self.root_link),
+            (self.generations, self.generation_link),
+            (self.transactions, self.transaction_link),
+            (self.activations, self.activation_link),
+            (self.state, self.state_link),
+            (self.quarantine, self.quarantine_link),
+        ):
+            if _identity(os.fstat(descriptor)) != link.identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+    def open_current_generations(self, anchor: _RootAnchor) -> int:
+        self.verify(anchor)
+        root, root_identity = _open_directory(anchor.descriptor, self.root_link.name)
+        try:
+            if root_identity != self.root_link.identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            generations, generation_identity = _open_directory(root, self.generation_link.name)
+        finally:
+            os.close(root)
+        if generation_identity != self.generation_link.identity:
+            os.close(generations)
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return generations
 
     def close(self) -> None:
-        for descriptor in (self.activations, self.transactions, self.generations, self.root):
+        for descriptor in (
+            self.quarantine,
+            self.state,
+            self.activations,
+            self.transactions,
+            self.generations,
+            self.root,
+        ):
             with suppress(OSError):
                 os.close(descriptor)
 
@@ -287,6 +362,37 @@ class _ActiveGeneration:
     pointer_identity: _Identity
     manifest: AgentSkillManifest
     files: Mapping[str, bytes]
+
+
+@dataclass(frozen=True)
+class _DirectoryLink:
+    parent_identity: _Identity
+    name: str
+    identity: _Identity
+
+
+@dataclass(frozen=True)
+class _RawEntry:
+    mode_type: int
+    identity: _Identity
+    target: str | None
+
+
+@dataclass(frozen=True)
+class _PublicationState:
+    book_key: str
+    skill_slug: str
+    current_target: str
+    previous_target: str | None
+
+
+@dataclass(frozen=True)
+class _AuditEntry:
+    directory: bool
+    identity: _Identity
+    nlink: int | None = None
+    size: int | None = None
+    digest: str | None = None
 
 
 def _rename_noreplace(
@@ -374,6 +480,21 @@ def _rename_exchange(source: str, destination: str, *, source_fd: int, destinati
         raise OSError(error_number, os.strerror(error_number))
 
 
+def _raw_entry(directory_fd: int, name: str) -> _RawEntry | None:
+    """Return a no-follow entry snapshot without interpreting or rejecting its kind."""
+    try:
+        entry = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        return None
+    target: str | None = None
+    if stat.S_ISLNK(entry.st_mode):
+        try:
+            target = os.readlink(name, dir_fd=directory_fd)
+        except OSError:
+            target = None
+    return _RawEntry(stat.S_IFMT(entry.st_mode), _identity(entry), target)
+
+
 class CanonicalSkillPublisher:
     """Publish immutable complete generations through one relative atomic pointer."""
 
@@ -401,6 +522,7 @@ class CanonicalSkillPublisher:
             management = self._management(anchor)
             self._recover_transactions(management)
             self._recover_activations(anchor, management)
+            self._recover_quarantines(management)
             anchor.verify()
             active = self._active_generation(anchor, management, render.skill_slug)
             if active is None:
@@ -411,17 +533,24 @@ class CanonicalSkillPublisher:
                 assert active is not None
                 anchor.verify()
                 self._cleanup_generations(management, render.manifest, active.target)
+                self._checkpoint("hierarchy:before-return")
+                management.verify(anchor)
                 return SkillPublisherReceipt(render, render.skill_slug, (), True)
 
             target = self._ensure_generation(management, render, plan.complete_files)
+            self._checkpoint("hierarchy:after-stage")
+            management.verify(anchor)
             self._activate(anchor, management, render, target, active)
+            self._checkpoint("hierarchy:after-cas")
+            management.verify(anchor)
             self._checkpoint("manifest:switch")
             visible = self._active_generation(anchor, management, render.skill_slug)
             if visible is None or visible.manifest != render.manifest or visible.target != target:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             self._checkpoint("cleanup:start")
             self._cleanup_generations(management, render.manifest, target)
-            anchor.verify()
+            self._checkpoint("hierarchy:before-return")
+            management.verify(anchor)
             return SkillPublisherReceipt(
                 render,
                 render.skill_slug,
@@ -435,6 +564,7 @@ class CanonicalSkillPublisher:
 
     def _management(self, anchor: _RootAnchor) -> _Management:
         root, _, created = _create_or_open_directory(anchor.descriptor, _MANAGEMENT)
+        children: list[int] = []
         try:
             names = set(_bounded_names(root, 8))
             if created:
@@ -444,14 +574,47 @@ class CanonicalSkillPublisher:
             owner, _ = _read_file(root, _OWNER, max_bytes=len(_ROOT_OWNER_BYTES))
             if owner != _ROOT_OWNER_BYTES:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            allowed = {_OWNER, "generations", "transactions", "activations"}
+            allowed = {
+                _OWNER,
+                "generations",
+                "transactions",
+                "activations",
+                "state",
+                "quarantine",
+            }
             if not names <= allowed:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            generations, _, _ = _create_or_open_directory(root, "generations")
-            transactions, _, _ = _create_or_open_directory(root, "transactions")
-            activations, _, _ = _create_or_open_directory(root, "activations")
-            return _Management(root, generations, transactions, activations)
+            root_identity = _identity(os.fstat(root))
+            generations, generation_identity, _ = _create_or_open_directory(root, "generations")
+            children.append(generations)
+            transactions, transaction_identity, _ = _create_or_open_directory(root, "transactions")
+            children.append(transactions)
+            activations, activation_identity, _ = _create_or_open_directory(root, "activations")
+            children.append(activations)
+            state, state_identity, _ = _create_or_open_directory(root, "state")
+            children.append(state)
+            quarantine, quarantine_identity, _ = _create_or_open_directory(root, "quarantine")
+            children.append(quarantine)
+            management = _Management(
+                root,
+                generations,
+                transactions,
+                activations,
+                state,
+                quarantine,
+                _DirectoryLink(anchor.identity, _MANAGEMENT, root_identity),
+                _DirectoryLink(root_identity, "generations", generation_identity),
+                _DirectoryLink(root_identity, "transactions", transaction_identity),
+                _DirectoryLink(root_identity, "activations", activation_identity),
+                _DirectoryLink(root_identity, "state", state_identity),
+                _DirectoryLink(root_identity, "quarantine", quarantine_identity),
+            )
+            management.verify(anchor)
+            return management
         except BaseException:
+            for descriptor in reversed(children):
+                with suppress(OSError):
+                    os.close(descriptor)
             os.close(root)
             raise
 
@@ -459,9 +622,10 @@ class CanonicalSkillPublisher:
         files: dict[str, bytes] = {}
         kinds: dict[str, str] = {}
         entry_count = 0
+        total_bytes = 0
 
         def visit(directory_fd: int, prefix: str) -> None:
-            nonlocal entry_count
+            nonlocal entry_count, total_bytes
             for name in _bounded_names(directory_fd, _MAX_TREE_ENTRIES - entry_count):
                 entry_count += 1
                 if entry_count > _MAX_TREE_ENTRIES:
@@ -479,9 +643,17 @@ class CanonicalSkillPublisher:
                     finally:
                         os.close(child)
                 elif stat.S_ISREG(entry.st_mode):
-                    if len(files) >= _MAX_TREE_FILES:
+                    if len(files) >= _MAX_TREE_FILES or entry.st_nlink != 1:
                         raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-                    payload, _ = _read_file(directory_fd, name, max_bytes=_MAX_FILE_BYTES)
+                    remaining = _MAX_TOTAL_TREE_BYTES - total_bytes
+                    payload, _ = _read_file(
+                        directory_fd,
+                        name,
+                        max_bytes=min(_MAX_FILE_BYTES, remaining),
+                    )
+                    total_bytes += len(payload)
+                    if total_bytes > _MAX_TOTAL_TREE_BYTES:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
                     files[path] = payload
                     kinds[path] = "file"
                 else:
@@ -568,19 +740,28 @@ class CanonicalSkillPublisher:
         target: str,
         *,
         expected_slug: str | None = None,
+        anchor: _RootAnchor | None = None,
     ) -> tuple[AgentSkillManifest, dict[str, bytes]]:
         book_key, generation_name = self._target_parts(target)
-        book_fd, _ = _open_directory(management.generations, book_key)
+        generations_fd = (
+            management.open_current_generations(anchor)
+            if anchor is not None
+            else os.dup(management.generations)
+        )
         try:
-            manifest, files, _ = self._validate_generation(
-                book_fd,
-                generation_name,
-                expected_book_key=book_key,
-                expected_slug=expected_slug,
-            )
-            return manifest, files
+            book_fd, _ = _open_directory(generations_fd, book_key)
+            try:
+                manifest, files, _ = self._validate_generation(
+                    book_fd,
+                    generation_name,
+                    expected_book_key=book_key,
+                    expected_slug=expected_slug,
+                )
+                return manifest, files
+            finally:
+                os.close(book_fd)
         finally:
-            os.close(book_fd)
+            os.close(generations_fd)
 
     def _active_pointer(self, anchor: _RootAnchor, skill_slug: str) -> tuple[str, _Identity] | None:
         try:
@@ -603,11 +784,14 @@ class CanonicalSkillPublisher:
         if pointer is None:
             return None
         target, pointer_identity = pointer
-        manifest, files = self._validate_target(management, target, expected_slug=skill_slug)
+        manifest, files = self._validate_target(
+            management, target, expected_slug=skill_slug, anchor=anchor
+        )
         anchor.verify()
         current = self._active_pointer(anchor, skill_slug)
         if current != pointer:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        management.verify(anchor)
         return _ActiveGeneration(target, pointer_identity, manifest, files)
 
     def _transaction_owner(
@@ -767,6 +951,158 @@ class CanonicalSkillPublisher:
             "schema": 1,
         }
 
+    def _state_payload(
+        self,
+        *,
+        book_key: str,
+        skill_slug: str,
+        current_target: str,
+        previous_target: str | None,
+    ) -> bytes:
+        payload = _canonical_json(
+            {
+                "book_key": book_key,
+                "current_target": current_target,
+                "owner": "cove-book-forge-skill-state",
+                "previous_target": previous_target,
+                "schema": 1,
+                "skill_slug": skill_slug,
+            }
+        )
+        return payload
+
+    def _parse_state(self, payload: bytes, *, book_key: str, skill_slug: str) -> _PublicationState:
+        state = _load_unique_json(payload)
+        current_target = state.get("current_target")
+        previous_target = state.get("previous_target")
+        if (
+            set(state)
+            != {
+                "book_key",
+                "current_target",
+                "owner",
+                "previous_target",
+                "schema",
+                "skill_slug",
+            }
+            or state.get("owner") != "cove-book-forge-skill-state"
+            or state.get("schema") != 1
+            or state.get("book_key") != book_key
+            or state.get("skill_slug") != skill_slug
+            or not isinstance(current_target, str)
+            or previous_target is not None
+            and not isinstance(previous_target, str)
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        current_book, _ = self._target_parts(current_target)
+        if current_book != book_key:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        if previous_target is not None:
+            previous_book, _ = self._target_parts(previous_target)
+            if previous_book != book_key or previous_target == current_target:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return _PublicationState(book_key, skill_slug, current_target, previous_target)
+
+    def _read_state(
+        self, management: _Management, *, book_key: str, skill_slug: str
+    ) -> tuple[_PublicationState, bytes, _Identity] | None:
+        name = f"{book_key}.json"
+        try:
+            payload, identity = _read_file(management.state, name, max_bytes=_MAX_OWNER_BYTES)
+        except FileNotFoundError:
+            return None
+        return (
+            self._parse_state(payload, book_key=book_key, skill_slug=skill_slug),
+            payload,
+            identity,
+        )
+
+    def _write_state(
+        self,
+        management: _Management,
+        *,
+        book_key: str,
+        skill_slug: str,
+        current_target: str,
+        previous_target: str | None,
+        scratch_name: str,
+    ) -> None:
+        payload = self._state_payload(
+            book_key=book_key,
+            skill_slug=skill_slug,
+            current_target=current_target,
+            previous_target=previous_target,
+        )
+        self._parse_state(payload, book_key=book_key, skill_slug=skill_slug)
+        name = f"{book_key}.json"
+        scratch = f"{scratch_name}.state"
+        previous = self._read_state(management, book_key=book_key, skill_slug=skill_slug)
+        try:
+            stale_payload, stale_identity = _read_file(
+                management.state, scratch, max_bytes=_MAX_OWNER_BYTES
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            self._parse_state(stale_payload, book_key=book_key, skill_slug=skill_slug)
+            if stale_payload != payload and (previous is None or stale_payload != previous[1]):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            self._unlink_identity(management.state, scratch, stale_identity)
+            _fsync_directory(management.state)
+
+        if previous is not None and previous[1] == payload:
+            return
+        new_identity = _write_file(management.state, scratch, payload)
+        _fsync_directory(management.state)
+        if previous is None:
+            if not _rename_noreplace(
+                scratch,
+                name,
+                source_fd=management.state,
+                destination_fd=management.state,
+            ):
+                self._unlink_identity(management.state, scratch, new_identity)
+                _fsync_directory(management.state)
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        else:
+            _, previous_payload, previous_identity = previous
+            expected_new = _RawEntry(stat.S_IFREG, new_identity, None)
+            expected_old = _RawEntry(stat.S_IFREG, previous_identity, None)
+            _rename_exchange(
+                scratch,
+                name,
+                source_fd=management.state,
+                destination_fd=management.state,
+            )
+            try:
+                _fsync_directory(management.state)
+                if (
+                    _raw_entry(management.state, name) != expected_new
+                    or _raw_entry(management.state, scratch) != expected_old
+                    or _read_file(management.state, name, max_bytes=_MAX_OWNER_BYTES)[0] != payload
+                    or _read_file(management.state, scratch, max_bytes=_MAX_OWNER_BYTES)[0]
+                    != previous_payload
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            except BaseException:
+                if (
+                    _raw_entry(management.state, name) == expected_new
+                    and _raw_entry(management.state, scratch) is not None
+                ):
+                    _rename_exchange(
+                        scratch,
+                        name,
+                        source_fd=management.state,
+                        destination_fd=management.state,
+                    )
+                    _fsync_directory(management.state)
+                raise
+            self._unlink_identity(management.state, scratch, previous_identity)
+        _fsync_directory(management.state)
+        stored = self._read_state(management, book_key=book_key, skill_slug=skill_slug)
+        if stored is None or stored[1] != payload:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
     def _create_activation(
         self,
         management: _Management,
@@ -786,7 +1122,9 @@ class CanonicalSkillPublisher:
 
     def _unlink_identity(self, directory_fd: int, name: str, identity: _Identity) -> None:
         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if _identity(current) != identity:
+        if _identity(current) != identity or (
+            stat.S_ISREG(current.st_mode) and current.st_nlink != 1
+        ):
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         os.unlink(name, dir_fd=directory_fd)
 
@@ -805,9 +1143,19 @@ class CanonicalSkillPublisher:
         active: _ActiveGeneration | None,
     ) -> None:
         old_target = active.target if active is not None else None
+        state = self._read_state(
+            management,
+            book_key=render.manifest.book_key,
+            skill_slug=render.skill_slug,
+        )
+        if (active is None and state is not None) or (
+            active is not None and (state is None or state[0].current_target != active.target)
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         activation, new_identity = self._create_activation(management, render, target, old_target)
         self._checkpoint("activation:before")
-        anchor.verify()
+        self._checkpoint("hierarchy:before-cas")
+        management.verify(anchor)
         self._checkpoint("activation:precondition")
         if active is None:
             if self._active_pointer(anchor, render.skill_slug) is not None:
@@ -829,31 +1177,42 @@ class CanonicalSkillPublisher:
             if current != (active.target, active.pointer_identity):
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             self._checkpoint("activation:exchange")
-            _rename_exchange(
-                activation,
-                render.skill_slug,
-                source_fd=management.activations,
-                destination_fd=anchor.descriptor,
-            )
-            _fsync_directory(anchor.descriptor)
-            swapped_new = self._active_pointer(anchor, render.skill_slug)
-            swapped_old = self._active_pointer_in(
-                management.activations, activation, validate_target=False
-            )
-            if swapped_new != (target, new_identity) or swapped_old != (
-                active.target,
-                active.pointer_identity,
-            ):
-                if swapped_new == (target, new_identity):
-                    _rename_exchange(
-                        activation,
+            expected_new = _RawEntry(stat.S_IFLNK, new_identity, target)
+            expected_old = _RawEntry(stat.S_IFLNK, active.pointer_identity, active.target)
+            try:
+                _rename_exchange(
+                    activation,
+                    render.skill_slug,
+                    source_fd=management.activations,
+                    destination_fd=anchor.descriptor,
+                )
+                _fsync_directory(anchor.descriptor)
+                _fsync_directory(management.activations)
+                self._checkpoint("activation:exchanged")
+                if (
+                    _raw_entry(anchor.descriptor, render.skill_slug) != expected_new
+                    or _raw_entry(management.activations, activation) != expected_old
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            except BaseException:
+                if _raw_entry(anchor.descriptor, render.skill_slug) == expected_new:
+                    self._rollback_exchange(
+                        anchor,
+                        management,
                         render.skill_slug,
-                        source_fd=management.activations,
-                        destination_fd=anchor.descriptor,
+                        activation,
+                        expected_new,
                     )
-                    _fsync_directory(anchor.descriptor)
-                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                raise
         self._checkpoint("activation:after")
+        self._write_state(
+            management,
+            book_key=render.manifest.book_key,
+            skill_slug=render.skill_slug,
+            current_target=target,
+            previous_target=old_target,
+            scratch_name=activation,
+        )
         self._checkpoint("cleanup:start")
         try:
             leftover = os.stat(activation, dir_fd=management.activations, follow_symlinks=False)
@@ -868,6 +1227,31 @@ class CanonicalSkillPublisher:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             self._unlink_identity(management.activations, activation, _identity(leftover))
         self._remove_activation_marker(management, activation)
+
+    def _rollback_exchange(
+        self,
+        anchor: _RootAnchor,
+        management: _Management,
+        active_name: str,
+        activation: str,
+        expected_new: _RawEntry,
+    ) -> None:
+        displaced = _raw_entry(management.activations, activation)
+        if _raw_entry(anchor.descriptor, active_name) != expected_new or displaced is None:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        _rename_exchange(
+            activation,
+            active_name,
+            source_fd=management.activations,
+            destination_fd=anchor.descriptor,
+        )
+        _fsync_directory(management.activations)
+        _fsync_directory(anchor.descriptor)
+        if (
+            _raw_entry(anchor.descriptor, active_name) != displaced
+            or _raw_entry(management.activations, activation) != expected_new
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
 
     def _active_pointer_in(
         self, directory_fd: int, name: str, *, validate_target: bool
@@ -906,20 +1290,30 @@ class CanonicalSkillPublisher:
             if set(marker) != expected_keys or marker.get("name") != activation:
                 continue
             active_name = marker.get("active_name")
+            book_key = marker.get("book_key")
             new_target = marker.get("new_target")
             old_target = marker.get("old_target")
             if (
                 marker.get("owner") != "cove-book-forge-skill-activation"
                 or marker.get("schema") != 1
                 or not isinstance(active_name, str)
+                or not isinstance(book_key, str)
                 or not isinstance(new_target, str)
                 or old_target is not None
                 and not isinstance(old_target, str)
             ):
                 continue
-            self._validate_target(management, new_target, expected_slug=active_name)
+            new_manifest, _ = self._validate_target(
+                management, new_target, expected_slug=active_name, anchor=anchor
+            )
+            if new_manifest.book_key != book_key:
+                continue
             if isinstance(old_target, str):
-                self._validate_target(management, old_target, expected_slug=active_name)
+                old_manifest, _ = self._validate_target(
+                    management, old_target, expected_slug=active_name, anchor=anchor
+                )
+                if old_manifest.book_key != book_key:
+                    continue
             root_pointer = self._active_pointer(anchor, active_name)
             staged_pointer = self._active_pointer_in(
                 management.activations, activation, validate_target=True
@@ -928,12 +1322,28 @@ class CanonicalSkillPublisher:
                 (old_target, new_target),
                 (new_target, old_target),
                 (new_target, None),
+                (old_target, None),
             }
             state = (
                 root_pointer[0] if root_pointer is not None else None,
                 staged_pointer[0] if staged_pointer is not None else None,
             )
             if state not in allowed:
+                continue
+            durable = self._read_state(management, book_key=book_key, skill_slug=active_name)
+            if state[0] == new_target:
+                self._write_state(
+                    management,
+                    book_key=book_key,
+                    skill_slug=active_name,
+                    current_target=new_target,
+                    previous_target=old_target,
+                    scratch_name=activation,
+                )
+            elif old_target is None:
+                if durable is not None:
+                    continue
+            elif durable is None or durable[0].current_target != old_target:
                 continue
             if staged_pointer is not None:
                 self._unlink_identity(management.activations, activation, staged_pointer[1])
@@ -1044,6 +1454,8 @@ class CanonicalSkillPublisher:
                     finally:
                         os.close(child)
                 elif stat.S_ISREG(entry.st_mode):
+                    if entry.st_nlink != 1:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
                     snapshot[path] = (False, identity)
                 else:
                     raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
@@ -1086,13 +1498,389 @@ class CanonicalSkillPublisher:
                     raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
                 os.rmdir(name, dir_fd=directory_fd)
             else:
-                if not stat.S_ISREG(current.st_mode):
+                if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
                     raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
                 self._unlink_identity(directory_fd, name, identity)
         _fsync_directory(directory_fd)
 
+    def _audit_tree(self, directory_fd: int) -> dict[str, _AuditEntry]:
+        audit: dict[str, _AuditEntry] = {}
+        total_bytes = 0
+
+        def visit(current_fd: int, prefix: str) -> None:
+            nonlocal total_bytes
+            remaining_entries = _MAX_TREE_ENTRIES - len(audit)
+            for name in _bounded_names(current_fd, remaining_entries):
+                if len(audit) >= _MAX_TREE_ENTRIES:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                path = f"{prefix}/{name}" if prefix else name
+                try:
+                    validate_relative_path(path)
+                except ValueError:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+                before = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+                if stat.S_ISDIR(before.st_mode):
+                    child, opened_identity = _open_directory(current_fd, name)
+                    try:
+                        if opened_identity != _identity(before):
+                            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                        audit[path] = _AuditEntry(True, opened_identity)
+                        visit(child, path)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(before.st_mode):
+                    if before.st_nlink != 1:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    remaining_bytes = _MAX_TOTAL_TREE_BYTES - total_bytes
+                    payload, identity = _read_file(
+                        current_fd,
+                        name,
+                        max_bytes=min(_MAX_FILE_BYTES, remaining_bytes),
+                    )
+                    after = os.stat(name, dir_fd=current_fd, follow_symlinks=False)
+                    if (
+                        _identity(after) != identity
+                        or after.st_nlink != 1
+                        or after.st_size != len(payload)
+                    ):
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    total_bytes += len(payload)
+                    audit[path] = _AuditEntry(
+                        False,
+                        identity,
+                        1,
+                        len(payload),
+                        hashlib.sha256(payload).hexdigest(),
+                    )
+                else:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+        visit(directory_fd, "")
+        return audit
+
+    def _audit_payload(
+        self,
+        payload_fd: int,
+        expected: Mapping[str, _AuditEntry],
+        *,
+        allow_missing: bool,
+    ) -> None:
+        current = self._audit_tree(payload_fd)
+        if (not allow_missing and set(current) != set(expected)) or not set(current) <= set(
+            expected
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        if any(current[path] != expected[path] for path in current):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+    def _journal_payload(
+        self,
+        *,
+        quarantine_name: str,
+        generation_name: str,
+        generation_identity: _Identity,
+        manifest: AgentSkillManifest,
+        audit: Mapping[str, _AuditEntry],
+    ) -> bytes:
+        entries: dict[str, object] = {}
+        for path, item in sorted(audit.items()):
+            entries[path] = {
+                "dev": item.identity[0],
+                "digest": item.digest,
+                "directory": item.directory,
+                "ino": item.identity[1],
+                "nlink": item.nlink,
+                "size": item.size,
+            }
+        payload = _canonical_json(
+            {
+                "book_key": manifest.book_key,
+                "entries": entries,
+                "generation_dev": generation_identity[0],
+                "generation_ino": generation_identity[1],
+                "generation_name": generation_name,
+                "manifest_checksum": manifest.checksum,
+                "owner": "cove-book-forge-generation-quarantine",
+                "quarantine_name": quarantine_name,
+                "schema": 1,
+                "skill_slug": manifest.skill_slug,
+            }
+        )
+        if len(payload) > _MAX_OWNER_BYTES:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return payload
+
+    def _parse_journal(
+        self, payload: bytes, *, quarantine_name: str
+    ) -> tuple[_Identity, dict[str, _AuditEntry]]:
+        journal = _load_unique_json(payload)
+        if (
+            set(journal)
+            != {
+                "book_key",
+                "entries",
+                "generation_dev",
+                "generation_ino",
+                "generation_name",
+                "manifest_checksum",
+                "owner",
+                "quarantine_name",
+                "schema",
+                "skill_slug",
+            }
+            or journal.get("owner") != "cove-book-forge-generation-quarantine"
+            or journal.get("schema") != 1
+            or journal.get("quarantine_name") != quarantine_name
+            or not isinstance(journal.get("book_key"), str)
+            or re.fullmatch(r"[0-9a-f]{16}", journal["book_key"]) is None
+            or not isinstance(journal.get("generation_name"), str)
+            or _GENERATION_NAME.fullmatch(journal["generation_name"]) is None
+            or not isinstance(journal.get("manifest_checksum"), str)
+            or f"gen-{journal['manifest_checksum']}" != journal["generation_name"]
+            or not isinstance(journal.get("skill_slug"), str)
+            or not isinstance(journal.get("generation_dev"), int)
+            or not isinstance(journal.get("generation_ino"), int)
+            or not isinstance(journal.get("entries"), dict)
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        audit: dict[str, _AuditEntry] = {}
+        total_bytes = 0
+        for path, raw in journal["entries"].items():
+            if not isinstance(path, str) or not isinstance(raw, dict):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            try:
+                validate_relative_path(path)
+            except ValueError:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+            if set(raw) != {"dev", "digest", "directory", "ino", "nlink", "size"}:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            directory = raw.get("directory")
+            dev = raw.get("dev")
+            ino = raw.get("ino")
+            nlink = raw.get("nlink")
+            size = raw.get("size")
+            digest = raw.get("digest")
+            if (
+                not isinstance(directory, bool)
+                or not isinstance(dev, int)
+                or not isinstance(ino, int)
+                or directory
+                and (nlink is not None or size is not None or digest is not None)
+                or not directory
+                and (
+                    nlink != 1
+                    or not isinstance(size, int)
+                    or size < 0
+                    or size > _MAX_FILE_BYTES
+                    or not isinstance(digest, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                )
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            audit[path] = _AuditEntry(directory, (dev, ino), nlink, size, digest)
+            if not directory:
+                assert isinstance(size, int)
+                total_bytes += size
+        if len(audit) > _MAX_TREE_ENTRIES or total_bytes > _MAX_TOTAL_TREE_BYTES:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return (journal["generation_dev"], journal["generation_ino"]), audit
+
+    def _verified_payload(self, journal_payload: bytes) -> bytes:
+        return _canonical_json(
+            {
+                "journal_sha256": hashlib.sha256(journal_payload).hexdigest(),
+                "owner": "cove-book-forge-verified-quarantine",
+                "schema": 1,
+            }
+        )
+
+    def _remove_audited_payload(
+        self,
+        directory_fd: int,
+        expected: Mapping[str, _AuditEntry],
+        *,
+        prefix: str = "",
+        checkpointed: list[bool] | None = None,
+    ) -> None:
+        if checkpointed is None:
+            checkpointed = [False]
+        names = _bounded_names(directory_fd, _MAX_TREE_ENTRIES)
+        for name in sorted(names):
+            path = f"{prefix}/{name}" if prefix else name
+            item = expected.get(path)
+            if item is None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if _identity(current) != item.identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            if item.directory:
+                if not stat.S_ISDIR(current.st_mode):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                child, opened_identity = _open_directory(directory_fd, name)
+                try:
+                    if opened_identity != item.identity:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    self._remove_audited_payload(
+                        child,
+                        expected,
+                        prefix=path,
+                        checkpointed=checkpointed,
+                    )
+                finally:
+                    os.close(child)
+                after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if _identity(after) != item.identity or not stat.S_ISDIR(after.st_mode):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                os.rmdir(name, dir_fd=directory_fd)
+            else:
+                if item.size is None or item.digest is None:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                payload, identity = _read_file(directory_fd, name, max_bytes=item.size)
+                after = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if (
+                    identity != item.identity
+                    or _identity(after) != item.identity
+                    or after.st_nlink != 1
+                    or after.st_size != item.size
+                    or hashlib.sha256(payload).hexdigest() != item.digest
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                self._unlink_identity(directory_fd, name, item.identity)
+            _fsync_directory(directory_fd)
+            if not checkpointed[0]:
+                checkpointed[0] = True
+                self._checkpoint("cleanup:partial")
+
+    def _finish_quarantine(
+        self,
+        management: _Management,
+        quarantine_name: str,
+        wrapper_fd: int,
+        generation_identity: _Identity,
+        audit: Mapping[str, _AuditEntry],
+        journal_payload: bytes,
+    ) -> None:
+        verified_payload = self._verified_payload(journal_payload)
+        try:
+            stored_verified, _ = _read_file(wrapper_fd, "verified.json", max_bytes=_MAX_OWNER_BYTES)
+        except FileNotFoundError:
+            payload_fd, payload_identity = _open_directory(wrapper_fd, "payload")
+            try:
+                if payload_identity != generation_identity:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                self._audit_payload(payload_fd, audit, allow_missing=False)
+            finally:
+                os.close(payload_fd)
+            _write_file(wrapper_fd, "verified.json", verified_payload)
+            _fsync_directory(wrapper_fd)
+        else:
+            if stored_verified != verified_payload:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+        self._checkpoint("cleanup:quarantined")
+        remaining_fd: int | None
+        try:
+            remaining_fd, payload_identity = _open_directory(wrapper_fd, "payload")
+        except FileNotFoundError:
+            remaining_fd = None
+        if remaining_fd is not None:
+            try:
+                if payload_identity != generation_identity:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                self._audit_payload(remaining_fd, audit, allow_missing=True)
+                self._remove_audited_payload(remaining_fd, audit)
+            finally:
+                os.close(remaining_fd)
+            current = os.stat("payload", dir_fd=wrapper_fd, follow_symlinks=False)
+            if _identity(current) != generation_identity or not stat.S_ISDIR(current.st_mode):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            os.rmdir("payload", dir_fd=wrapper_fd)
+            _fsync_directory(wrapper_fd)
+
+        for name, expected_payload in (
+            ("verified.json", verified_payload),
+            ("journal.json", journal_payload),
+        ):
+            stored, identity = _read_file(wrapper_fd, name, max_bytes=_MAX_OWNER_BYTES)
+            if stored != expected_payload:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            self._unlink_identity(wrapper_fd, name, identity)
+            _fsync_directory(wrapper_fd)
+        wrapper_status = os.stat(
+            quarantine_name,
+            dir_fd=management.quarantine,
+            follow_symlinks=False,
+        )
+        if _identity(wrapper_status) != _identity(os.fstat(wrapper_fd)):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        os.rmdir(quarantine_name, dir_fd=management.quarantine)
+        _fsync_directory(management.quarantine)
+
+    def _recover_quarantines(self, management: _Management) -> None:
+        names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
+        for quarantine_name in names:
+            if _QUARANTINE_NAME.fullmatch(quarantine_name) is None:
+                continue
+            try:
+                wrapper_fd, wrapper_identity = _open_directory(
+                    management.quarantine, quarantine_name
+                )
+            except (FileNotFoundError, ForgeException):
+                continue
+            try:
+                try:
+                    journal_payload, _ = _read_file(
+                        wrapper_fd, "journal.json", max_bytes=_MAX_OWNER_BYTES
+                    )
+                except (FileNotFoundError, ForgeException):
+                    continue
+                generation_identity, audit = self._parse_journal(
+                    journal_payload, quarantine_name=quarantine_name
+                )
+                try:
+                    os.stat("payload", dir_fd=wrapper_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    try:
+                        verified, _ = _read_file(
+                            wrapper_fd, "verified.json", max_bytes=_MAX_OWNER_BYTES
+                        )
+                    except FileNotFoundError:
+                        journal, journal_identity = _read_file(
+                            wrapper_fd, "journal.json", max_bytes=_MAX_OWNER_BYTES
+                        )
+                        if journal != journal_payload:
+                            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+                        self._unlink_identity(wrapper_fd, "journal.json", journal_identity)
+                        _fsync_directory(wrapper_fd)
+                        current_wrapper = os.stat(
+                            quarantine_name,
+                            dir_fd=management.quarantine,
+                            follow_symlinks=False,
+                        )
+                        if _identity(current_wrapper) != wrapper_identity:
+                            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+                        os.rmdir(quarantine_name, dir_fd=management.quarantine)
+                        _fsync_directory(management.quarantine)
+                        continue
+                    if verified != self._verified_payload(journal_payload):
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+                self._finish_quarantine(
+                    management,
+                    quarantine_name,
+                    wrapper_fd,
+                    generation_identity,
+                    audit,
+                    journal_payload,
+                )
+            finally:
+                os.close(wrapper_fd)
+
     def _remove_owned_generation(
-        self, book_fd: int, generation_name: str, manifest: AgentSkillManifest
+        self,
+        management: _Management,
+        book_fd: int,
+        generation_name: str,
+        manifest: AgentSkillManifest,
     ) -> None:
         _, _, generation_identity = self._validate_generation(
             book_fd,
@@ -1105,7 +1893,7 @@ class CanonicalSkillPublisher:
         try:
             if opened_identity != generation_identity:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            snapshot = self._snapshot_tree(generation_fd)
+            audit = self._audit_tree(generation_fd)
             expected_files = {_OWNER, *(f"{_CONTENT}/{item.path}" for item in manifest.files)}
             expected_files.add(f"{_CONTENT}/.cove-book-forge.json")
             expected_directories = {_CONTENT}
@@ -1118,46 +1906,98 @@ class CanonicalSkillPublisher:
                 **{path: False for path in expected_files},
                 **{path: True for path in expected_directories},
             }
-            if set(snapshot) != set(expected_tree) or any(
-                snapshot[path][0] != expected_tree[path] for path in snapshot
+            if set(audit) != set(expected_tree) or any(
+                audit[path].directory != expected_tree[path] for path in audit
             ):
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            self._remove_tree_snapshot(generation_fd, snapshot)
         finally:
             os.close(generation_fd)
-        current = os.stat(generation_name, dir_fd=book_fd, follow_symlinks=False)
-        if _identity(current) != generation_identity:
-            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-        os.rmdir(generation_name, dir_fd=book_fd)
+
+        quarantine_name = f"q-{uuid4().hex}"
+        os.mkdir(quarantine_name, 0o700, dir_fd=management.quarantine)
+        _fsync_directory(management.quarantine)
+        wrapper_fd, _ = _open_directory(management.quarantine, quarantine_name)
+        journal_payload = self._journal_payload(
+            quarantine_name=quarantine_name,
+            generation_name=generation_name,
+            generation_identity=generation_identity,
+            manifest=manifest,
+            audit=audit,
+        )
+        try:
+            _write_file(wrapper_fd, "journal.json", journal_payload)
+            _fsync_directory(wrapper_fd)
+            self._checkpoint("cleanup:quarantine")
+            if not _rename_noreplace(
+                generation_name,
+                "payload",
+                source_fd=book_fd,
+                destination_fd=wrapper_fd,
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            _fsync_directory(book_fd)
+            _fsync_directory(wrapper_fd)
+            _fsync_directory(management.quarantine)
+            if _raw_entry(book_fd, generation_name) is not None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            payload_fd, payload_identity = _open_directory(wrapper_fd, "payload")
+            try:
+                if payload_identity != generation_identity:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                self._audit_payload(payload_fd, audit, allow_missing=False)
+            finally:
+                os.close(payload_fd)
+            self._finish_quarantine(
+                management,
+                quarantine_name,
+                wrapper_fd,
+                generation_identity,
+                audit,
+                journal_payload,
+            )
+        finally:
+            os.close(wrapper_fd)
         _fsync_directory(book_fd)
 
     def _cleanup_generations(
         self, management: _Management, manifest: AgentSkillManifest, active_target: str
     ) -> None:
         _, active_name = self._target_parts(active_target)
+        state = self._read_state(
+            management,
+            book_key=manifest.book_key,
+            skill_slug=manifest.skill_slug,
+        )
+        if state is None or state[0].current_target != active_target:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        previous_name: str | None = None
+        if state[0].previous_target is not None:
+            _, previous_name = self._target_parts(state[0].previous_target)
+            previous_manifest, _ = self._validate_target(
+                management,
+                state[0].previous_target,
+                expected_slug=manifest.skill_slug,
+            )
+            if previous_manifest.book_key != manifest.book_key:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         book_fd, _ = _open_directory(management.generations, manifest.book_key)
         try:
-            candidates: list[tuple[int, str, AgentSkillManifest]] = []
+            candidates: list[tuple[str, AgentSkillManifest]] = []
             for name in _bounded_names(book_fd, _MAX_TRANSACTION_COUNT):
                 if _GENERATION_NAME.fullmatch(name) is None:
                     continue
-                try:
-                    candidate, _, _ = self._validate_generation(
-                        book_fd,
-                        name,
-                        expected_book_key=manifest.book_key,
-                        expected_slug=manifest.skill_slug,
-                    )
-                    entry = os.stat(name, dir_fd=book_fd, follow_symlinks=False)
-                except ForgeException:
-                    continue
-                candidates.append((entry.st_mtime_ns, name, candidate))
-            previous = sorted(
-                (item for item in candidates if item[1] != active_name), reverse=True
-            )[:1]
-            keep = {active_name, *(item[1] for item in previous)}
-            for _, name, candidate in candidates:
+                candidate, _, _ = self._validate_generation(
+                    book_fd,
+                    name,
+                    expected_book_key=manifest.book_key,
+                    expected_slug=manifest.skill_slug,
+                )
+                candidates.append((name, candidate))
+            keep = {active_name}
+            if previous_name is not None:
+                keep.add(previous_name)
+            for name, candidate in candidates:
                 if name not in keep:
-                    self._remove_owned_generation(book_fd, name, candidate)
+                    self._remove_owned_generation(management, book_fd, name, candidate)
         finally:
             os.close(book_fd)

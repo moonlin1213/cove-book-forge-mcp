@@ -41,6 +41,22 @@ def _manifest_bytes(payload: Mapping[str, object]) -> bytes:
     )
 
 
+def _resigned_file_mutation(
+    rendered: RenderedAgentSkill, path: str, payload: bytes
+) -> dict[str, bytes]:
+    files = _files(rendered)
+    files[path] = payload
+    manifest = rendered.manifest.model_dump(mode="json", by_alias=True)
+    for item in manifest["files"]:
+        if item["path"] == path:
+            item["sha256"] = hashlib.sha256(payload).hexdigest()
+            break
+    else:
+        raise AssertionError(f"missing managed path {path}")
+    files[".cove-book-forge.json"] = _manifest_bytes(manifest)
+    return files
+
+
 def _second(first: RenderedAgentSkill, *, title: str = "Second chapter") -> RenderedAgentSkill:
     from cove_book_forge.config import SkillOutputConfig
     from cove_book_forge.outputs import AgentSkillRenderer
@@ -195,6 +211,51 @@ def test_bundle_scans_for_forbidden_content_and_escaping_links(forbidden: bytes)
     with pytest.raises(ForgeException) as error:
         validate_skill_bundle(files)
     assert _error_code(error) is ForgeErrorCode.EXTERNAL_MODIFICATION
+
+
+@pytest.mark.parametrize(
+    ("path", "navigation"),
+    [
+        ("SKILL.md", b"\n[outside]: ../../escape.md\n"),
+        ("SKILL.md", b"\n[outside][escape]\n[escape]: glossary.md\n"),
+        ("SKILL.md", b'\n<a href="glossary.md">outside</a>\n'),
+        ("SKILL.md", b'\n<img src="glossary.md">\n'),
+        ("SKILL.md", b"\n<https://example.invalid>\n"),
+        ("SKILL.md", b"\n<ftp://example.invalid/file>\n"),
+        ("SKILL.md", b"\n<reader@example.invalid>\n"),
+        ("SKILL.md", b"\nhttps://example.invalid\n"),
+        ("SKILL.md", b"\n![outside](glossary.md)\n"),
+    ],
+)
+def test_resigned_managed_markdown_rejects_every_non_allowlisted_navigation_form(
+    path: str, navigation: bytes
+) -> None:
+    rendered = _render()
+    files = _resigned_file_mutation(rendered, path, rendered.files[path] + navigation)
+
+    with pytest.raises(ForgeException) as error:
+        validate_skill_bundle(files)
+
+    assert _error_code(error) is ForgeErrorCode.EXTERNAL_MODIFICATION
+
+
+def test_markdown_navigation_probe_reaches_the_semantic_scanner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cove_book_forge.outputs.skill_managed as skill_managed
+
+    rendered = _render()
+    path = "SKILL.md"
+    files = _resigned_file_mutation(
+        rendered,
+        path,
+        rendered.files[path] + b"\n[escape]: glossary.md\n",
+    )
+
+    with pytest.raises(ForgeException):
+        validate_skill_bundle(files)
+    monkeypatch.setattr(skill_managed, "_validate_links", lambda *_args: None)
+    assert validate_skill_bundle(files).skill_slug == rendered.skill_slug
 
 
 def test_first_update_plan_is_complete_and_unchanged_plan_has_zero_writes() -> None:

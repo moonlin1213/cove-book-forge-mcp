@@ -34,7 +34,11 @@ _ROOT_FILES: Final = frozenset(
 _MAX_MANIFEST_BYTES: Final = 2 * 1024 * 1024
 _MAX_FILE_BYTES: Final = 8 * 1024 * 1024
 _MAX_TOTAL_BYTES: Final = 64 * 1024 * 1024
-_LINK = re.compile(r"\]\(([^)]+)\)")
+_INLINE_LINK = re.compile(r"(?<!!)\[[^\]\n]+\]\(([^)\n]+)\)")
+_UNESCAPED_BRACKET = re.compile(r"(?<!\\)[\[\]]")
+_HTML_NAVIGATION = re.compile(r"(?is)<[^>]+\s(?:href|src)\s*=")
+_AUTOLINK = re.compile(r"(?i)<(?:(?:[a-z][a-z0-9+.-]*):[^>\n]+|www\.[^>\n]+|[^<>\s@]+@[^<>\s@]+)>")
+_BARE_URL = re.compile(r"(?i)(?:\bhttps?://|\bwww\.)\S+")
 _FORBIDDEN_BYTES: Final = (
     b"\x00",
     b"<script",
@@ -169,7 +173,9 @@ def _validate_openai_yaml(data: bytes, manifest: AgentSkillManifest) -> None:
 
 def _validate_links(path: str, text: str, expected_paths: frozenset[str]) -> None:
     parent = posixpath.dirname(path)
-    for target in _LINK.findall(text):
+    masked = list(text)
+    for match in _INLINE_LINK.finditer(text):
+        target = match.group(1)
         if not target or target.startswith(("/", "\\")) or "\\" in target:
             raise _modified()
         try:
@@ -179,6 +185,15 @@ def _validate_links(path: str, text: str, expected_paths: frozenset[str]) -> Non
         resolved = posixpath.normpath(posixpath.join(parent, target))
         if resolved not in expected_paths:
             raise _modified()
+        masked[match.start() : match.end()] = " " * (match.end() - match.start())
+    remaining = "".join(masked)
+    if (
+        _UNESCAPED_BRACKET.search(remaining)
+        or _HTML_NAVIGATION.search(remaining)
+        or _AUTOLINK.search(remaining)
+        or _BARE_URL.search(remaining)
+    ):
+        raise _modified()
 
 
 def _scan_content(

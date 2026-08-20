@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import shutil
 import stat
 from pathlib import Path
 
@@ -12,6 +14,7 @@ from test_skill_render import _analyzed, _render, _snapshot
 from cove_book_forge.config import SkillOutputConfig
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.outputs import AgentSkillRenderer
+from cove_book_forge.outputs import skill_publisher as skill_publisher_module
 from cove_book_forge.outputs.skill_managed import validate_skill_bundle
 from cove_book_forge.outputs.skill_models import RenderedAgentSkill
 from cove_book_forge.outputs.skill_publisher import CanonicalSkillPublisher
@@ -178,6 +181,60 @@ def test_existing_managed_generation_modification_fails_closed(
     _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
 
 
+@pytest.mark.parametrize("hardlink_target", ["management-owner", "generation-content"])
+def test_owned_regular_files_with_multiple_links_fail_closed(
+    tmp_path: Path, hardlink_target: str
+) -> None:
+    first = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    if hardlink_target == "management-owner":
+        target = tmp_path / ".cove-book-forge" / ".owner.json"
+    else:
+        target = tmp_path / first.skill_slug / first.chapter_path
+    source = tmp_path / f"{hardlink_target}-source"
+    source.write_bytes(target.read_bytes())
+    target.unlink()
+    os.link(source, target)
+    assert os.lstat(target).st_nlink == 2
+
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(first if hardlink_target == "management-owner" else _next(first))
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+
+def test_generation_tree_read_stops_at_the_aggregate_byte_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cove_book_forge.outputs.skill_publisher as skill_publisher
+
+    per_file = 8 * 1024 * 1024
+    for index in range(9):
+        path = tmp_path / f"payload-{index}.md"
+        with path.open("wb") as stream:
+            stream.truncate(per_file)
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    original_read = skill_publisher.os.read
+    bytes_read = 0
+
+    def counted_read(fd: int, count: int) -> bytes:
+        nonlocal bytes_read
+        payload = original_read(fd, count)
+        bytes_read += len(payload)
+        return payload
+
+    monkeypatch.setattr(skill_publisher.os, "read", counted_read)
+    try:
+        with pytest.raises(ForgeException) as error:
+            _publisher(tmp_path)._read_tree(descriptor)
+    finally:
+        os.close(descriptor)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert bytes_read <= 64 * 1024 * 1024 + 1
+
+
 def test_relative_managed_pointer_cannot_be_redirected_outside_or_to_another_book(
     tmp_path: Path,
 ) -> None:
@@ -222,6 +279,174 @@ def test_concurrent_pointer_precondition_change_is_not_overwritten_or_deleted(
     _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
     assert os.readlink(tmp_path / first.skill_slug) == "competitor"
     assert (competitor / "identity.txt").read_text(encoding="utf-8") == "competitor"
+
+
+def _replace_directory_with_identity_distinct_copy(path: Path) -> None:
+    detached = path.with_name(f"{path.name}-detached")
+    path.rename(detached)
+    shutil.copytree(detached, path, symlinks=True)
+
+
+@pytest.mark.parametrize(
+    ("relative_directory", "phase"),
+    [
+        (".cove-book-forge", "hierarchy:after-stage"),
+        (".cove-book-forge/generations", "hierarchy:before-cas"),
+        (".cove-book-forge/transactions", "hierarchy:after-cas"),
+        (".cove-book-forge/activations", "hierarchy:before-return"),
+    ],
+)
+def test_detached_management_hierarchy_can_never_report_publication_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_directory: str,
+    phase: str,
+) -> None:
+    first = _render()
+    second = _next(first)
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    replaced = False
+
+    def replace(checkpoint: str) -> None:
+        nonlocal replaced
+        if checkpoint == phase and not replaced:
+            _replace_directory_with_identity_distinct_copy(tmp_path / relative_directory)
+            replaced = True
+
+    monkeypatch.setattr(publisher, "_checkpoint", replace)
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(second)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert replaced
+
+
+@pytest.mark.parametrize("competitor_kind", ["file", "directory", "fifo", "symlink"])
+def test_exchange_always_restores_a_displaced_nonmatching_competitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, competitor_kind: str
+) -> None:
+    first = _render()
+    second = _next(first)
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    active = tmp_path / first.skill_slug
+    competitor_target = tmp_path / "competitor-target"
+    competitor_target.mkdir()
+    raced = False
+    competitor_identity: tuple[int, int] | None = None
+
+    def race(phase: str) -> None:
+        nonlocal raced, competitor_identity
+        if phase != "activation:exchange" or raced:
+            return
+        active.unlink()
+        if competitor_kind == "file":
+            active.write_bytes(b"competitor-file")
+        elif competitor_kind == "directory":
+            active.mkdir()
+            (active / "identity.txt").write_text("competitor-directory", encoding="utf-8")
+        elif competitor_kind == "fifo":
+            os.mkfifo(active)
+        else:
+            active.symlink_to("competitor-target")
+        status = os.lstat(active)
+        competitor_identity = (status.st_dev, status.st_ino)
+        raced = True
+
+    monkeypatch.setattr(publisher, "_checkpoint", race)
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(second)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert raced and competitor_identity is not None
+    restored = os.lstat(active)
+    assert (restored.st_dev, restored.st_ino) == competitor_identity
+    if competitor_kind == "file":
+        assert active.read_bytes() == b"competitor-file"
+    elif competitor_kind == "directory":
+        assert (active / "identity.txt").read_text(encoding="utf-8") == "competitor-directory"
+    elif competitor_kind == "fifo":
+        assert stat.S_ISFIFO(restored.st_mode)
+    else:
+        assert os.readlink(active) == "competitor-target"
+    activation_pointers = [
+        item
+        for item in (tmp_path / ".cove-book-forge" / "activations").iterdir()
+        if item.is_symlink()
+    ]
+    assert len(activation_pointers) == 1
+    assert os.readlink(activation_pointers[0]).endswith(f"gen-{second.manifest.checksum}/content")
+
+
+def test_exception_after_exchange_cannot_skip_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _render()
+    second = _next(first)
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    old_target = os.readlink(tmp_path / first.skill_slug)
+
+    def interrupt(phase: str) -> None:
+        if phase == "activation:exchanged":
+            raise SimulatedProcessCrash(phase)
+
+    monkeypatch.setattr(publisher, "_checkpoint", interrupt)
+    with pytest.raises(SimulatedProcessCrash, match="activation:exchanged"):
+        publisher.publish(second)
+
+    assert os.readlink(tmp_path / first.skill_slug) == old_target
+    activation_pointers = [
+        item
+        for item in (tmp_path / ".cove-book-forge" / "activations").iterdir()
+        if item.is_symlink()
+    ]
+    assert len(activation_pointers) == 1
+    assert os.readlink(activation_pointers[0]).endswith(f"gen-{second.manifest.checksum}/content")
+
+
+def test_signal_delivered_at_exchange_return_cannot_skip_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _render()
+    second = _next(first)
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    old_target = os.readlink(tmp_path / first.skill_slug)
+    rename_exchange = skill_publisher_module._rename_exchange
+    interrupted = False
+
+    def exchange_then_interrupt(
+        source: str,
+        destination: str,
+        *,
+        source_fd: int,
+        destination_fd: int,
+    ) -> None:
+        nonlocal interrupted
+        rename_exchange(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+        if not interrupted:
+            interrupted = True
+            raise SimulatedProcessCrash("signal at exchange return")
+
+    monkeypatch.setattr(skill_publisher_module, "_rename_exchange", exchange_then_interrupt)
+    with pytest.raises(SimulatedProcessCrash, match="exchange return"):
+        publisher.publish(second)
+
+    assert os.readlink(tmp_path / first.skill_slug) == old_target
+    staged = [
+        item
+        for item in (tmp_path / ".cove-book-forge" / "activations").iterdir()
+        if item.is_symlink()
+    ]
+    assert len(staged) == 1
+    assert os.readlink(staged[0]).endswith(f"gen-{second.manifest.checksum}/content")
 
 
 def test_ordinary_stage_failure_is_cleaned_without_touching_the_active_generation(
@@ -373,6 +598,171 @@ def test_cleanup_race_never_deletes_a_competitor_inserted_into_an_old_generation
     _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
     assert (first_generation / "competitor.txt").read_text(encoding="utf-8") == "keep"
     assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+
+def test_never_activated_generation_never_displaces_the_actual_predecessor_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    first_target = os.readlink(tmp_path / first.skill_slug)
+    never_activated = _next(first, chapter_index=2, title="Never activated")
+
+    def interrupt(phase: str) -> None:
+        if phase == "activation:before":
+            raise SimulatedProcessCrash(phase)
+
+    monkeypatch.setattr(publisher, "_checkpoint", interrupt)
+    with pytest.raises(SimulatedProcessCrash):
+        publisher.publish(never_activated)
+
+    second = _next(first, chapter_index=1, title="Actually activated")
+    _publisher(tmp_path).publish(second)
+
+    generations = tmp_path / ".cove-book-forge" / "generations" / first.manifest.book_key
+    names = {path.name for path in generations.iterdir()}
+    assert Path(first_target).parts[-2] in names
+    assert f"gen-{second.manifest.checksum}" in names
+    assert f"gen-{never_activated.manifest.checksum}" not in names
+    state = json.loads(
+        (tmp_path / ".cove-book-forge" / "state" / f"{first.manifest.book_key}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert state["current_target"].endswith(f"gen-{second.manifest.checksum}/content")
+    assert state["previous_target"] == first_target
+
+
+@pytest.mark.parametrize("has_previous", [False, True])
+def test_marker_only_recovery_cleans_missing_staged_pointer_without_scan_leak(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, has_previous: bool
+) -> None:
+    first = _render()
+    if has_previous:
+        _publisher(tmp_path).publish(first)
+        rendered = _next(first)
+    else:
+        rendered = first
+    publisher = _publisher(tmp_path)
+
+    def interrupt(phase: str) -> None:
+        if phase == "activation:before":
+            raise SimulatedProcessCrash(phase)
+
+    monkeypatch.setattr(publisher, "_checkpoint", interrupt)
+    with pytest.raises(SimulatedProcessCrash):
+        publisher.publish(rendered)
+    activations = tmp_path / ".cove-book-forge" / "activations"
+    for entry in activations.iterdir():
+        if entry.is_symlink():
+            entry.unlink()
+
+    stable = first
+    for _ in range(3):
+        _publisher(tmp_path).publish(stable)
+
+    assert list(activations.iterdir()) == []
+    assert validate_skill_bundle(_active_files(tmp_path, stable)) == stable.manifest
+
+
+@pytest.mark.parametrize("interruption", ["cleanup:quarantined", "cleanup:partial"])
+def test_quarantined_generation_cleanup_is_restartable_after_process_interruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, interruption: str
+) -> None:
+    first = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    second = _next(first)
+    publisher.publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+    interrupted = False
+
+    def interrupt(phase: str) -> None:
+        nonlocal interrupted
+        if phase == interruption and not interrupted:
+            interrupted = True
+            raise SimulatedProcessCrash(phase)
+
+    monkeypatch.setattr(publisher, "_checkpoint", interrupt)
+    with pytest.raises(SimulatedProcessCrash, match=interruption):
+        publisher.publish(third)
+
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    assert list(quarantine.iterdir())
+
+    _publisher(tmp_path).publish(third)
+
+    assert list(quarantine.iterdir()) == []
+    generations = tmp_path / ".cove-book-forge" / "generations" / first.manifest.book_key
+    assert {path.name for path in generations.iterdir()} == {
+        f"gen-{second.manifest.checksum}",
+        f"gen-{third.manifest.checksum}",
+    }
+
+
+def test_cleanup_quarantine_preserves_a_competitor_that_wins_the_source_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    first_generation = tmp_path / os.readlink(tmp_path / first.skill_slug)
+    first_generation = first_generation.parent
+    second = _next(first)
+    publisher.publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+    raced = False
+
+    def race(phase: str) -> None:
+        nonlocal raced
+        if phase == "cleanup:quarantine" and not raced:
+            first_generation.rename(first_generation.with_name("saved-original"))
+            first_generation.mkdir()
+            (first_generation / "competitor.txt").write_text("keep", encoding="utf-8")
+            raced = True
+
+    monkeypatch.setattr(publisher, "_checkpoint", race)
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(third)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert raced
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    competitor_files = list(quarantine.rglob("competitor.txt"))
+    assert len(competitor_files) == 1
+    assert competitor_files[0].read_text(encoding="utf-8") == "keep"
+
+
+def test_quarantine_recovery_rechecks_the_remaining_payload_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    second = _next(first)
+    publisher.publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+
+    def interrupt(phase: str) -> None:
+        if phase == "cleanup:quarantined":
+            raise SimulatedProcessCrash(phase)
+
+    monkeypatch.setattr(publisher, "_checkpoint", interrupt)
+    with pytest.raises(SimulatedProcessCrash):
+        publisher.publish(third)
+
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    payload = next(quarantine.glob("q-*/payload/.owner.json"))
+    original = payload.read_bytes()
+    payload.write_bytes(b"X" * len(original))
+
+    with pytest.raises(ForgeException) as error:
+        _publisher(tmp_path).publish(third)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert payload.read_bytes() == b"X" * len(original)
 
 
 def test_configuration_root_and_ancestor_are_opened_without_following_links(tmp_path: Path) -> None:

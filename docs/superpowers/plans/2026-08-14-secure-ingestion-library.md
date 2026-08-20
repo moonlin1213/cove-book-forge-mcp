@@ -31,13 +31,16 @@ class BookFormat(StrEnum):
     EPUB = "epub"
     PDF = "pdf"
 
+
 class ImportMode(StrEnum):
     COPY = "copy"
     REFERENCE = "reference"
 
+
 class PdfProfile(StrEnum):
     TEXT = "text"
     TECHNICAL = "technical"
+
 
 class ExtractedBook(ContractModel):
     format: BookFormat
@@ -46,12 +49,14 @@ class ExtractedBook(ContractModel):
     source_fingerprint: str
     pdf_profile: PdfProfile | None = None
 
+
 class ImportedBook(ContractModel):
     book: BookRef
     metadata: BookMetadata
     format: BookFormat
     import_mode: ImportMode
     source_fingerprint: str
+
 
 class StoredBook(ContractModel):
     book: BookRef
@@ -79,7 +84,9 @@ class BookLibrary:
     def list_books(self) -> tuple[StoredBook, ...]: ...
     def get_book(self, book: BookRef) -> StoredBook: ...
     def get_chapter(self, book: BookRef, index: int) -> ChapterContent: ...
-    def upsert_external_book(self, identity: ExternalIdentity, metadata: BookMetadata) -> BookRef: ...
+    def upsert_external_book(
+        self, identity: ExternalIdentity, metadata: BookMetadata
+    ) -> BookRef: ...
     def upsert_chapter_snapshot(self, snapshot: ChapterSnapshot) -> BookRef: ...
 ```
 

@@ -1,14 +1,15 @@
 # cove-book-forge-mcp
 
 `cove-book-forge-mcp` is a local-first, open-source Python core for securely
-normalizing books and stable external reading snapshots. The implemented phase
-supports deterministic EPUB/PDF ingestion and an optional local SQLite library;
-it does not call a model or send book content over the network.
+normalizing books and stable external reading snapshots. The implemented phases
+support deterministic EPUB/PDF ingestion, an optional local SQLite library, and
+explicit model Provider adapters for raw text or JSON-object generation.
 
 > **Status boundary:** standards-valid EPUB ingestion, text-layer PDF ingestion,
-> the optional SQLite library, and external `ChapterSnapshot` caching are
-> implemented. MCP transport, model providers, forge/jobs, Obsidian output, and
-> Agent Skill generation or installation are planned and are **not implemented**.
+> the optional SQLite library, external `ChapterSnapshot` caching, and model
+> Provider adapters are implemented. Chapter analysis/fingerprinting/cache,
+> forge/jobs, Obsidian output, Agent Skill generation/installation, and MCP
+> transport remain planned and are **not implemented**.
 
 This repository is independent of private Cove/栖渡 code and does not include an
 official reading UI.
@@ -125,6 +126,81 @@ book = library.upsert_chapter_snapshot(
 print(library.get_chapter(book, 0).content)
 ```
 
+## Model Providers
+
+The async Provider boundary supports `openai`, `openai-compatible`, `deepseek`,
+and `anthropic` as exact built-in names. It returns typed per-call results and
+cumulative input/output/total-token usage. Each generation call makes at most
+one request: there is no automatic retry, JSON repair, or fallback to another
+provider. Chapter-level prompts and schema validation belong to the planned
+analysis layer.
+
+API-key values are read only from the named process environment variable. Put
+the variable name—not the key—in YAML, and provide the value through your shell,
+service manager, or secrets manager. Keys, prompts, URLs, and raw response bodies
+are excluded from public errors and are not logged by the Provider layer.
+
+### DeepSeek
+
+DeepSeek uses the OpenAI-compatible chat-completions protocol and the built-in
+DeepSeek API base:
+
+```yaml
+model:
+  provider: deepseek
+  model: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY
+```
+
+### OpenAI-compatible or self-hosted gateway
+
+An explicit `base_url` is required. `api_key_env` is optional for a local gateway;
+when configured, its environment value must be non-empty.
+
+```yaml
+model:
+  provider: openai-compatible
+  model: local-reader-model
+  base_url: http://127.0.0.1:11434/v1
+  # api_key_env: LOCAL_MODEL_API_KEY
+```
+
+### Anthropic Claude
+
+Claude uses the Anthropic Messages API:
+
+```yaml
+model:
+  provider: anthropic
+  model: claude-sonnet-4-5
+  api_key_env: ANTHROPIC_API_KEY
+```
+
+OpenAI-compatible providers advertise JSON-object mode but not JSON Schema.
+Anthropic advertises neither native JSON mode nor JSON Schema in this phase;
+`generate_json` asks for and accepts one direct JSON object. Bounded repair and
+domain-schema validation remain planned analysis behavior.
+
+### Explicit custom Provider registration
+
+Applications can register a typed local or proprietary Provider explicitly,
+without plugin discovery or dynamic import paths:
+
+```python
+from examples.custom_provider import custom_provider_factory
+
+from cove_book_forge.config import ModelConfig
+from cove_book_forge.providers import ProviderRegistry
+
+registry = ProviderRegistry({"deterministic-local": custom_provider_factory})
+provider = registry.create(ModelConfig(provider="deterministic-local", model="reader-model"))
+```
+
+See [`examples/custom_provider.py`](examples/custom_provider.py) for the complete
+typed example. The standalone `doctor` command recognizes only the exact built-ins;
+an embedding application owns readiness checks for its explicitly registered
+custom Providers.
+
 ## Privacy defaults and diagnostics
 
 - Library data and normalized snapshots stay local.
@@ -134,11 +210,12 @@ print(library.get_chapter(book, 0).content)
 - Configured output roots require explicit authorization, although output
   generation is not part of the implemented phase.
 
-The `doctor` command is read-only. It checks configuration, environment-variable
-presence, EPUB/PDF parser dependencies, configured library-directory readiness,
-and any existing `library.sqlite3` through a read-only SQLite integrity check.
-It does not create directories, databases, journals, WAL files, temporary files,
-or migrations.
+The `doctor` command is read-only and network-free. It checks configuration,
+built-in Provider/base readiness, required environment-variable presence,
+EPUB/PDF parser dependencies, configured library-directory readiness, and any
+existing `library.sqlite3` through a read-only SQLite integrity check. It never
+calls Provider generation or health-check APIs, and does not create directories,
+databases, journals, WAL files, temporary files, or migrations.
 
 ```bash
 uv sync --group dev
@@ -157,10 +234,15 @@ Run the complete local verification sequence before submitting a change:
 uv lock --check
 uv run --no-sync pytest --cov=cove_book_forge --cov-report=term-missing
 uv run --no-sync ruff check .
+uv run --no-sync ruff format --check .
 uv run --no-sync mypy src/cove_book_forge
+uv run --no-sync mypy examples/custom_provider.py
 uv build --clear
 uv run --no-sync python scripts/verify_distribution.py dist
 ```
+
+Provider tests use local mocked transports and deterministic fake Providers only;
+the test suite performs no live model request and requires no real account or key.
 
 ## Acknowledgements
 

@@ -51,9 +51,7 @@ class SkillOutputConfig(ConfigModel):
 
     @model_validator(mode="after")
     def require_absolute_enabled_path(self) -> Self:
-        if self.enabled and (
-            self.canonical_path is None or not self.canonical_path.is_absolute()
-        ):
+        if self.enabled and (self.canonical_path is None or not self.canonical_path.is_absolute()):
             raise ValueError("enabled Skill output requires an absolute canonical_path")
         return self
 

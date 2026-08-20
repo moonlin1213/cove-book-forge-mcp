@@ -579,20 +579,24 @@ class ExternalIdentity(ContractModel):
     source_system: str = Field(min_length=1, max_length=80)
     external_book_id: str = Field(min_length=1, max_length=240)
 
+
 class BookMetadata(ContractModel):
     title: str = Field(min_length=1, max_length=500)
     author: str = Field(default="", max_length=300)
     language: str = Field(default="", max_length=40)
     total_chapters: int = Field(default=0, ge=0)
 
+
 class BookRef(ContractModel):
     book_id: str = Field(min_length=1, max_length=120)
+
 
 class ChapterContent(ContractModel):
     index: int = Field(ge=0)
     title: str = Field(default="", max_length=500)
     content: str = Field(min_length=1)
     source_locator: str = Field(default="", max_length=500)
+
 
 class Highlight(ContractModel):
     id: str = Field(min_length=1, max_length=240)
@@ -601,10 +605,12 @@ class Highlight(ContractModel):
     paragraph_index: int | None = Field(default=None, ge=0)
     page: int | None = Field(default=None, ge=1)
 
+
 class UserNote(ContractModel):
     id: str = Field(min_length=1, max_length=240)
     text: str = Field(min_length=1)
     paragraph_index: int | None = Field(default=None, ge=0)
+
 
 class Annotation(ContractModel):
     id: str = Field(min_length=1, max_length=240)
@@ -613,10 +619,12 @@ class Annotation(ContractModel):
     kind: str = Field(default="annotation", max_length=80)
     paragraph_index: int | None = Field(default=None, ge=0)
 
+
 class Reflection(ContractModel):
     id: str = Field(min_length=1, max_length=240)
     text: str = Field(min_length=1)
     author_label: str = Field(default="", max_length=120)
+
 
 class ChapterSnapshot(ContractModel):
     source_system: str = Field(min_length=1, max_length=80)
@@ -903,6 +911,7 @@ class ForgeTarget(StrEnum):
     OBSIDIAN = "obsidian"
     SKILL = "skill"
 
+
 class ForgeJobStatus(StrEnum):
     QUEUED = "queued"
     PLANNING = "planning"
@@ -916,6 +925,7 @@ class ForgeJobStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
 
 class ForgeJobControl(StrEnum):
     PAUSE = "pause"
@@ -1137,9 +1147,9 @@ def test_invalid_config_is_a_structured_public_error(tmp_path: Path) -> None:
 
 
 def test_defaults_are_local_first_and_require_full_book_confirmation() -> None:
-    config = AppConfig.model_validate({
-        "model": {"provider": "openai-compatible", "model": "local-model"}
-    })
+    config = AppConfig.model_validate(
+        {"model": {"provider": "openai-compatible", "model": "local-model"}}
+    )
     assert config.library.enabled is True
     assert config.full_book_forge.require_preflight_confirmation is True
     assert config.telemetry_enabled is False
@@ -1211,9 +1221,7 @@ class SkillOutputConfig(ConfigModel):
 
     @model_validator(mode="after")
     def require_absolute_enabled_path(self) -> Self:
-        if self.enabled and (
-            self.canonical_path is None or not self.canonical_path.is_absolute()
-        ):
+        if self.enabled and (self.canonical_path is None or not self.canonical_path.is_absolute()):
             raise ValueError("enabled Skill output requires an absolute canonical_path")
         return self
 
@@ -1693,7 +1701,10 @@ def doctor(
 ) -> None:
     report = run_doctor(config)
     if json_output:
-        payload = {"ok": report.ok, "checks": [item.model_dump(mode="json") for item in report.checks]}
+        payload = {
+            "ok": report.ok,
+            "checks": [item.model_dump(mode="json") for item in report.checks],
+        }
         typer.echo(json.dumps(payload, ensure_ascii=False))
     else:
         for check in report.checks:

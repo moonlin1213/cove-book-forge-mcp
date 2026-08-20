@@ -56,7 +56,9 @@ def fingerprint_source(source: Path, *, limits: ExtractionLimits | None = None) 
     bytes_read = 0
     try:
         with source.open("rb") as stream:
-            while chunk := stream.read(min(_HASH_CHUNK_SIZE, limits.max_source_bytes - bytes_read + 1)):
+            while chunk := stream.read(
+                min(_HASH_CHUNK_SIZE, limits.max_source_bytes - bytes_read + 1)
+            ):
                 bytes_read += len(chunk)
                 if bytes_read > limits.max_source_bytes:
                     raise _source_error(ForgeErrorCode.EXTRACTION_FAILED)

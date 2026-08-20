@@ -17,5 +17,9 @@
 - Added stable external `ChapterSnapshot` upserts while managed import is
   disabled, plus an idempotent schema migration that fingerprints stored
   snapshots.
-- Extended `doctor` with read-only parser-dependency, library-directory, and
-  SQLite readiness checks that do not initialize or migrate storage.
+- Added one async model Provider boundary with exact OpenAI, OpenAI-compatible,
+  DeepSeek, and Anthropic adapters; explicit custom registration; bounded
+  transport; safe error mapping; and typed token-usage accounting.
+- Extended `doctor` with network-free built-in Provider/base and credential
+  readiness alongside read-only parser-dependency, library-directory, and SQLite
+  checks that do not initialize or migrate storage.

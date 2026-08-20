@@ -9,6 +9,7 @@ from cove_book_forge.contracts.books import BookMetadata, BookRef, ChapterConten
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
+
 class BookFormat(StrEnum):
     EPUB = "epub"
     PDF = "pdf"
@@ -40,6 +41,7 @@ class ExtractedBook(ContractModel):
 
     _validate_source_fingerprint = field_validator("source_fingerprint")(_validate_fingerprint)
 
+
 class ImportedBook(ContractModel):
     book: BookRef
     metadata: BookMetadata
@@ -48,6 +50,7 @@ class ImportedBook(ContractModel):
     source_fingerprint: str
 
     _validate_source_fingerprint = field_validator("source_fingerprint")(_validate_fingerprint)
+
 
 class StoredBook(ContractModel):
     book: BookRef

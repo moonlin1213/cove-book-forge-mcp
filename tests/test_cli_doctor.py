@@ -9,6 +9,7 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -19,6 +20,9 @@ from cove_book_forge.doctor import CheckStatus, run_doctor
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.library import BookLibrary, LibraryDatabase
 from cove_book_forge.library import database as library_database
+from cove_book_forge.providers.anthropic import AnthropicProvider
+from cove_book_forge.providers.openai_compatible import OpenAICompatibleProvider
+from cove_book_forge.providers.transport import ProviderTransport
 
 runner = CliRunner()
 
@@ -30,8 +34,9 @@ library:
   enabled: {str(enabled).lower()}
   data_dir: {data_dir}
 model:
-  provider: test
+  provider: openai-compatible
   model: test
+  base_url: http://localhost:11434/v1
 """.strip(),
         encoding="utf-8",
     )
@@ -164,6 +169,7 @@ library:
 model:
   provider: openai-compatible
   model: local-model
+  base_url: http://localhost:11434/v1
 outputs:
   obsidian:
     enabled: false
@@ -179,6 +185,7 @@ outputs:
     payload = json.loads(result.stdout)
     assert payload["ok"] is True
     assert payload["checks"][0]["name"] == "configuration"
+    assert _check(payload, "model_provider")["status"] == "pass"
     assert _check(payload, "beautifulsoup4")["status"] == "pass"
     assert _check(payload, "defusedxml")["status"] == "pass"
     assert _check(payload, "pypdf")["status"] == "pass"
@@ -236,7 +243,12 @@ model:
     assert "Authorization" not in result.stdout
 
 
-def test_doctor_reports_empty_key_environment_as_missing(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("key_value", ["", "   "])
+def test_doctor_reports_empty_key_environment_as_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    key_value: str,
+) -> None:
     config = tmp_path / "config.yaml"
     config.write_text(
         """
@@ -247,7 +259,7 @@ model:
 """.strip(),
         encoding="utf-8",
     )
-    monkeypatch.setenv("EMPTY_TEST_KEY", "")
+    monkeypatch.setenv("EMPTY_TEST_KEY", key_value)
 
     result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
 
@@ -259,6 +271,155 @@ model:
         "status": "fail",
         "message": "Environment variable is missing: EMPTY_TEST_KEY",
     }
+
+
+@pytest.mark.parametrize("provider_name", ["openai", "deepseek", "anthropic"])
+@pytest.mark.parametrize("key_value", [None, "", "   "])
+def test_doctor_requires_a_nonempty_configured_key_for_cloud_builtins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_name: str,
+    key_value: str | None,
+) -> None:
+    config = tmp_path / "config.yaml"
+    key_config = ""
+    if key_value is not None:
+        key_config = "\n  api_key_env: CLOUD_MODEL_KEY"
+        monkeypatch.setenv("CLOUD_MODEL_KEY", key_value)
+    config.write_text(
+        f"""
+model:
+  provider: {provider_name}
+  model: cloud-model{key_config}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert _check(payload, "model_provider")["status"] == "pass"
+    assert _check(payload, "model_api_key")["status"] == "fail"
+
+
+def test_doctor_allows_credential_free_openai_compatible_local_gateway(tmp_path: Path) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+library:
+  enabled: false
+  data_dir: {data_dir}
+model:
+  provider: openai-compatible
+  model: local-model
+  base_url: http://localhost:11434/v1
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert _check(payload, "model_provider")["status"] == "pass"
+    assert not any(check["name"] == "model_api_key" for check in payload["checks"])
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "base_url"),
+    [
+        ("unregistered-private-provider", None),
+        ("openai-compatible", None),
+        ("openai-compatible", "https://private.invalid/v1?token=secret-query"),
+        ("openai", "https://private.invalid/v1#secret-fragment"),
+        ("anthropic", "https://private.invalid#secret-fragment"),
+    ],
+)
+def test_doctor_fails_invalid_provider_readiness_with_a_generic_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_name: str,
+    base_url: str | None,
+) -> None:
+    monkeypatch.setenv("DOCTOR_MODEL_KEY", "private-doctor-key")
+    base_config = f"\n  base_url: {base_url}" if base_url is not None else ""
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+model:
+  provider: {provider_name}
+  model: private-model
+  api_key_env: DOCTOR_MODEL_KEY{base_config}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert _check(payload, "model_provider") == {
+        "name": "model_provider",
+        "status": "fail",
+        "message": "Model provider configuration is unavailable.",
+    }
+    for private_value in (
+        provider_name,
+        str(base_url),
+        "private-doctor-key",
+        "secret-query",
+        "secret-fragment",
+    ):
+        assert private_value not in result.stdout
+
+
+def test_doctor_provider_readiness_is_network_free_and_does_not_mutate_filesystem(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+library:
+  enabled: false
+  data_dir: {data_dir}
+model:
+  provider: anthropic
+  model: claude-local-fixture
+  api_key_env: DOCTOR_READ_ONLY_KEY
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DOCTOR_READ_ONLY_KEY", "configured-but-never-sent")
+
+    def forbidden_access(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("doctor attempted provider I/O")
+
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_text", forbidden_access)
+    monkeypatch.setattr(OpenAICompatibleProvider, "generate_json", forbidden_access)
+    monkeypatch.setattr(OpenAICompatibleProvider, "healthcheck", forbidden_access)
+    monkeypatch.setattr(AnthropicProvider, "generate_text", forbidden_access)
+    monkeypatch.setattr(AnthropicProvider, "generate_json", forbidden_access)
+    monkeypatch.setattr(AnthropicProvider, "healthcheck", forbidden_access)
+    monkeypatch.setattr(ProviderTransport, "request", forbidden_access)
+    monkeypatch.setattr(httpx.AsyncClient, "request", forbidden_access)
+    before = _filesystem_snapshot(tmp_path)
+    before_metadata = _filesystem_metadata_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert _check(payload, "model_provider")["status"] == "pass"
+    assert _check(payload, "model_api_key")["status"] == "pass"
+    assert "configured-but-never-sent" not in result.stdout
+    assert _filesystem_snapshot(tmp_path) == before
+    assert _filesystem_metadata_snapshot(tmp_path) == before_metadata
 
 
 def test_doctor_redacts_private_paths_from_directory_failures(tmp_path: Path) -> None:

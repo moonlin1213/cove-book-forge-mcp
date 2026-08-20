@@ -39,6 +39,7 @@ include = [
   "/src",
   "/tests",
   "/scripts",
+  "/examples",
   "/pyproject.toml",
   "/uv.lock",
   "/README.md",

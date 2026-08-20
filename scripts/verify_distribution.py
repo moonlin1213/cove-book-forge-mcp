@@ -37,8 +37,7 @@ def _archive_files(distribution_dir: Path) -> tuple[Path, Path]:
     source_distributions = tuple(distribution_dir.glob("*.tar.gz"))
     if len(wheels) != 1 or len(source_distributions) != 1:
         raise ValueError(
-            "expected exactly one wheel and one source distribution in "
-            f"{distribution_dir}"
+            f"expected exactly one wheel and one source distribution in {distribution_dir}"
         )
     return wheels[0], source_distributions[0]
 

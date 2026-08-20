@@ -58,6 +58,9 @@ _QUARANTINE_CLOSING_NAME = re.compile(r"^closing-(q-[0-9a-f]{32})\.json$")
 _STAGE_INTENT_NAME = re.compile(r"^stage-intent-([0-9a-f]{32})\.json$")
 _STAGE_READY_NAME = re.compile(r"^stage-ready-([0-9a-f]{32})\.json$")
 _CLOSING_INTENT_NAME = re.compile(r"^closing-intent-(q-[0-9a-f]{32})\.json$")
+_STAGE_INTENT_TEMP_NAME = re.compile(r"^\.stage-intent-([0-9a-f]{32})\.tmp$")
+_STAGE_READY_TEMP_NAME = re.compile(r"^\.stage-ready-([0-9a-f]{32})\.tmp$")
+_CLOSING_INTENT_TEMP_NAME = re.compile(r"^\.closing-intent-(q-[0-9a-f]{32})\.tmp$")
 _CLOSING_PARTIAL_NAME = re.compile(r"^\.closing-(q-[0-9a-f]{32})\.partial$")
 _DELETE_INTENT_NAME = re.compile(r"^delete-intent-([0-9a-f]{32})\.json$")
 _DELETE_INTENT_TEMP_NAME = re.compile(r"^\.delete-intent-([0-9a-f]{32})\.tmp$")
@@ -1186,6 +1189,23 @@ class CanonicalSkillPublisher:
         payload: bytes,
     ) -> _Identity:
         temporary_identity = _write_file(directory_fd, temporary_name, payload)
+        return self._finish_record_publication(
+            directory_fd,
+            temporary_name=temporary_name,
+            record_name=record_name,
+            payload=payload,
+            temporary_identity=temporary_identity,
+        )
+
+    def _finish_record_publication(
+        self,
+        directory_fd: int,
+        *,
+        temporary_name: str,
+        record_name: str,
+        payload: bytes,
+        temporary_identity: _Identity,
+    ) -> _Identity:
         if not _rename_noreplace(
             temporary_name,
             record_name,
@@ -1392,6 +1412,89 @@ class CanonicalSkillPublisher:
             digest,
         )
 
+    def _verify_delete_record_association(
+        self,
+        directory_fd: int,
+        *,
+        source_name: str,
+        destination_name: str,
+        expected: _RawEntry,
+        expected_nlink: int,
+        expected_size: int,
+        expected_digest: str | None,
+    ) -> None:
+        if (
+            _raw_entry(directory_fd, source_name) != expected
+            or _raw_entry(directory_fd, destination_name) is not None
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        status = os.stat(source_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            _identity(status) != expected.identity
+            or stat.S_IFMT(status.st_mode) != expected.mode_type
+            or status.st_nlink != expected_nlink
+            or status.st_size != expected_size
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        if expected.mode_type == stat.S_IFREG:
+            payload, identity = _read_file(
+                directory_fd,
+                source_name,
+                max_bytes=expected_size,
+            )
+            if (
+                identity != expected.identity
+                or expected_digest is None
+                or hashlib.sha256(payload).hexdigest() != expected_digest
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        elif expected.mode_type == stat.S_IFDIR:
+            child, identity = _open_directory(directory_fd, source_name)
+            try:
+                if identity != expected.identity or _bounded_names(child, 1):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            finally:
+                os.close(child)
+
+    def _recover_delete_record_temporaries(self, directory_fd: int) -> None:
+        for temporary_name in sorted(_bounded_names(directory_fd, _MAX_TREE_ENTRIES)):
+            match = _DELETE_INTENT_TEMP_NAME.fullmatch(temporary_name)
+            if match is None:
+                continue
+            record_name = f"delete-intent-{match.group(1)}.json"
+            payload, temporary_identity = _read_file(
+                directory_fd,
+                temporary_name,
+                max_bytes=_MAX_OWNER_BYTES,
+            )
+            (
+                source_name,
+                destination_name,
+                _,
+                expected,
+                expected_nlink,
+                expected_size,
+                expected_digest,
+            ) = self._parse_delete_intent(payload, record_name=record_name)
+            if _raw_entry(directory_fd, record_name) is not None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            self._verify_delete_record_association(
+                directory_fd,
+                source_name=source_name,
+                destination_name=destination_name,
+                expected=expected,
+                expected_nlink=expected_nlink,
+                expected_size=expected_size,
+                expected_digest=expected_digest,
+            )
+            self._finish_record_publication(
+                directory_fd,
+                temporary_name=temporary_name,
+                record_name=record_name,
+                payload=payload,
+                temporary_identity=temporary_identity,
+            )
+
     def _delete_isolated_entry(
         self,
         directory_fd: int,
@@ -1440,6 +1543,7 @@ class CanonicalSkillPublisher:
 
     def _recover_delete_transitions(self, directory_fd: int) -> None:
         self._recover_retired_records(directory_fd)
+        self._recover_delete_record_temporaries(directory_fd)
         names = _bounded_names(directory_fd, _MAX_TREE_ENTRIES)
         for record_name in sorted(names):
             if _DELETE_INTENT_NAME.fullmatch(record_name) is None:
@@ -1459,7 +1563,31 @@ class CanonicalSkillPublisher:
             source = _raw_entry(directory_fd, source_name)
             destination = _raw_entry(directory_fd, destination_name)
             if source == expected and destination is None:
-                pass
+                self._verify_delete_record_association(
+                    directory_fd,
+                    source_name=source_name,
+                    destination_name=destination_name,
+                    expected=expected,
+                    expected_nlink=expected_nlink,
+                    expected_size=expected_size,
+                    expected_digest=expected_digest,
+                )
+                if not _rename_noreplace(
+                    source_name,
+                    destination_name,
+                    source_fd=directory_fd,
+                    destination_fd=directory_fd,
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                _fsync_directory(directory_fd)
+                self._delete_isolated_entry(
+                    directory_fd,
+                    destination_name,
+                    expected,
+                    expected_nlink=expected_nlink,
+                    expected_size=expected_size,
+                    expected_digest=expected_digest,
+                )
             elif source is None and destination == expected:
                 self._delete_isolated_entry(
                     directory_fd,
@@ -2325,6 +2453,163 @@ class CanonicalSkillPublisher:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         return record
 
+    def _stage_records_match(
+        self,
+        intent: Mapping[str, Any],
+        ready: Mapping[str, Any],
+    ) -> bool:
+        return ready["intent_checksum"] == intent["checksum"] and all(
+            ready[key] == intent[key]
+            for key in (
+                "journal_partial_sha256",
+                "journal_partial_size",
+                "journal_sha256",
+                "journal_size",
+                "quarantine_name",
+                "stage_name",
+            )
+        )
+
+    def _recover_quarantine_record_temporaries(self, management: _Management) -> None:
+        names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
+        for temporary_name in sorted(names):
+            stage_intent_match = _STAGE_INTENT_TEMP_NAME.fullmatch(temporary_name)
+            stage_ready_match = _STAGE_READY_TEMP_NAME.fullmatch(temporary_name)
+            closing_match = _CLOSING_INTENT_TEMP_NAME.fullmatch(temporary_name)
+            if stage_intent_match is not None:
+                identifier = stage_intent_match.group(1)
+                record_name = f"stage-intent-{identifier}.json"
+                payload, temporary_identity = _read_file(
+                    management.quarantine,
+                    temporary_name,
+                    max_bytes=_MAX_OWNER_BYTES,
+                )
+                intent = self._parse_stage_record(
+                    payload,
+                    record_name=record_name,
+                    ready=False,
+                )
+                related_names = (
+                    record_name,
+                    intent["stage_name"],
+                    intent["quarantine_name"],
+                    f"stage-ready-{identifier}.json",
+                    f".stage-ready-{identifier}.tmp",
+                )
+                if any(
+                    _raw_entry(management.quarantine, name) is not None for name in related_names
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            elif stage_ready_match is not None:
+                identifier = stage_ready_match.group(1)
+                record_name = f"stage-ready-{identifier}.json"
+                payload, temporary_identity = _read_file(
+                    management.quarantine,
+                    temporary_name,
+                    max_bytes=_MAX_OWNER_BYTES,
+                )
+                ready = self._parse_stage_record(
+                    payload,
+                    record_name=record_name,
+                    ready=True,
+                )
+                intent_name = f"stage-intent-{identifier}.json"
+                intent_payload, _ = _read_file(
+                    management.quarantine,
+                    intent_name,
+                    max_bytes=_MAX_OWNER_BYTES,
+                )
+                intent = self._parse_stage_record(
+                    intent_payload,
+                    record_name=intent_name,
+                    ready=False,
+                )
+                stage = _raw_entry(management.quarantine, ready["stage_name"])
+                if (
+                    not self._stage_records_match(intent, ready)
+                    or _raw_entry(management.quarantine, record_name) is not None
+                    or _raw_entry(management.quarantine, ready["quarantine_name"]) is not None
+                    or stage
+                    != _RawEntry(
+                        stat.S_IFDIR,
+                        (ready["stage_dev"], ready["stage_ino"]),
+                        None,
+                    )
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                stage_fd, stage_identity = _open_directory(
+                    management.quarantine,
+                    ready["stage_name"],
+                )
+                try:
+                    if stage_identity != stage.identity or _bounded_names(stage_fd, 1):
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                finally:
+                    os.close(stage_fd)
+            elif closing_match is not None:
+                quarantine_name = closing_match.group(1)
+                record_name = f"closing-intent-{quarantine_name}.json"
+                payload, temporary_identity = _read_file(
+                    management.quarantine,
+                    temporary_name,
+                    max_bytes=_MAX_OWNER_BYTES,
+                )
+                intent = self._parse_closing_intent(payload, record_name=record_name)
+                wrapper = _raw_entry(management.quarantine, quarantine_name)
+                expected_wrapper = _RawEntry(
+                    stat.S_IFDIR,
+                    (intent["wrapper_dev"], intent["wrapper_ino"]),
+                    None,
+                )
+                if (
+                    _raw_entry(management.quarantine, record_name) is not None
+                    or _raw_entry(management.quarantine, intent["partial_name"]) is not None
+                    or _raw_entry(management.quarantine, intent["final_name"]) is not None
+                    or wrapper != expected_wrapper
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                wrapper_fd, wrapper_identity = _open_directory(
+                    management.quarantine,
+                    quarantine_name,
+                )
+                try:
+                    if wrapper_identity != expected_wrapper.identity or set(
+                        _bounded_names(wrapper_fd, 3)
+                    ) != {"journal.json", "verified.json"}:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    journal_payload, _ = _read_file(
+                        wrapper_fd,
+                        "journal.json",
+                        max_bytes=_MAX_OWNER_BYTES,
+                    )
+                    verified_payload, _ = _read_file(
+                        wrapper_fd,
+                        "verified.json",
+                        max_bytes=_MAX_OWNER_BYTES,
+                    )
+                finally:
+                    os.close(wrapper_fd)
+                closing_payload = self._closing_payload(
+                    quarantine_name=quarantine_name,
+                    wrapper_identity=wrapper_identity,
+                    journal_payload=journal_payload,
+                    verified_payload=verified_payload,
+                )
+                if (
+                    len(closing_payload) != intent["closing_size"]
+                    or hashlib.sha256(closing_payload).hexdigest() != intent["closing_sha256"]
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            else:
+                continue
+            self._finish_record_publication(
+                management.quarantine,
+                temporary_name=temporary_name,
+                record_name=record_name,
+                payload=payload,
+                temporary_identity=temporary_identity,
+            )
+
     def _verified_payload(self, journal_payload: bytes) -> bytes:
         return _canonical_json(
             {
@@ -2701,17 +2986,7 @@ class CanonicalSkillPublisher:
                     management.quarantine, ready_name, max_bytes=_MAX_OWNER_BYTES
                 )
                 ready = self._parse_stage_record(ready_payload, record_name=ready_name, ready=True)
-                if ready["intent_checksum"] != intent["checksum"] or any(
-                    ready[key] != intent[key]
-                    for key in (
-                        "journal_partial_sha256",
-                        "journal_partial_size",
-                        "journal_sha256",
-                        "journal_size",
-                        "quarantine_name",
-                        "stage_name",
-                    )
-                ):
+                if not self._stage_records_match(intent, ready):
                     raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
                 recovered_ready.add(ready_name)
             stage_name = intent["stage_name"]
@@ -2815,6 +3090,7 @@ class CanonicalSkillPublisher:
 
     def _recover_quarantines(self, management: _Management) -> None:
         self._recover_delete_transitions(management.quarantine)
+        self._recover_quarantine_record_temporaries(management)
         names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
         self._recover_closing_intents(management, names)
         names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
@@ -2827,6 +3103,9 @@ class CanonicalSkillPublisher:
             or _STAGE_INTENT_NAME.fullmatch(name) is not None
             or _STAGE_READY_NAME.fullmatch(name) is not None
             or _CLOSING_INTENT_NAME.fullmatch(name) is not None
+            or _STAGE_INTENT_TEMP_NAME.fullmatch(name) is not None
+            or _STAGE_READY_TEMP_NAME.fullmatch(name) is not None
+            or _CLOSING_INTENT_TEMP_NAME.fullmatch(name) is not None
             or _CLOSING_PARTIAL_NAME.fullmatch(name) is not None
             for name in names
         ):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -92,6 +93,127 @@ raise SystemExit(98)
         check=False,
     )
     assert completed.returncode == 86, completed.stderr
+
+
+def _run_skill_record_temp_hard_crash(root: Path, record_kind: str) -> None:
+    script = r"""
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from test_skill_render import _analyzed, _render, _snapshot
+
+from cove_book_forge.config import SkillOutputConfig
+from cove_book_forge.outputs import AgentSkillRenderer
+from cove_book_forge.outputs import skill_publisher as skill_publisher_module
+from cove_book_forge.outputs.skill_publisher import CanonicalSkillPublisher
+
+root = Path(os.environ["COVE_SKILL_CRASH_ROOT"])
+record_kind = os.environ["COVE_SKILL_RECORD_KIND"]
+first = _render()
+renderer = AgentSkillRenderer(SkillOutputConfig())
+second = renderer.render(
+    _snapshot(chapter_index=1, title="Second chapter"),
+    _analyzed(fingerprint="2" * 64),
+    first.manifest,
+)
+third = renderer.render(
+    _snapshot(chapter_index=2, title="Third chapter"),
+    _analyzed(fingerprint="3" * 64),
+    second.manifest,
+)
+rename_noreplace = skill_publisher_module._rename_noreplace
+fsync = skill_publisher_module.os.fsync
+synced = set()
+
+def track_fsync(descriptor):
+    result = fsync(descriptor)
+    status = os.fstat(descriptor)
+    synced.add((status.st_dev, status.st_ino))
+    return result
+
+def crash(source, destination, *, source_fd, destination_fd):
+    if source.startswith(f".{record_kind}-") and source.endswith(".tmp"):
+        entry = os.stat(source, dir_fd=source_fd, follow_symlinks=False)
+        if (entry.st_dev, entry.st_ino) not in synced:
+            return rename_noreplace(
+                source,
+                destination,
+                source_fd=source_fd,
+                destination_fd=destination_fd,
+            )
+        descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_fd)
+        try:
+            chunks = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            status = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        payload = b"".join(chunks)
+        record = json.loads(payload.decode("utf-8"))
+        checksum = record.pop("checksum")
+        unsigned = json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        assert hashlib.sha256(unsigned).hexdigest() == checksum
+        assert record["record_name"] == destination
+        assert status.st_nlink == 1 and status.st_size == len(payload)
+        os._exit(86)
+    return rename_noreplace(
+        source,
+        destination,
+        source_fd=source_fd,
+        destination_fd=destination_fd,
+    )
+
+skill_publisher_module.os.fsync = track_fsync
+skill_publisher_module._rename_noreplace = crash
+CanonicalSkillPublisher(
+    SkillOutputConfig(enabled=True, canonical_path=root)
+).publish(third)
+raise SystemExit(98)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env={
+            **os.environ,
+            "COVE_SKILL_CRASH_ROOT": str(root),
+            "COVE_SKILL_RECORD_KIND": record_kind,
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 86, completed.stderr
+
+
+def _record_temp(root: Path, record_kind: str) -> tuple[Path, dict[str, object]]:
+    matches = list((root / ".cove-book-forge").rglob(f".{record_kind}-*.tmp"))
+    assert len(matches) == 1
+    temporary = matches[0]
+    payload = temporary.read_bytes()
+    record = json.loads(payload.decode("utf-8"))
+    checksum = record.pop("checksum")
+    unsigned = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    assert hashlib.sha256(unsigned).hexdigest() == checksum
+    assert record["record_name"] == f"{temporary.name[1:-4]}.json"
+    return temporary, record
 
 
 def _active(root: Path, rendered: RenderedAgentSkill) -> Path:
@@ -1097,6 +1219,149 @@ def test_cleanup_transition_hard_crashes_recover_without_visible_debris(
         for path in management.rglob("*")
         if path.name.startswith((".delete-", "delete-intent-", "retired-"))
     ]
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+
+@pytest.mark.parametrize(
+    "record_kind",
+    ["stage-intent", "stage-ready", "closing-intent", "delete-intent"],
+)
+def test_complete_record_temp_hard_crashes_recover_without_visible_debris(
+    tmp_path: Path,
+    record_kind: str,
+) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+
+    _run_skill_record_temp_hard_crash(tmp_path, record_kind)
+    temporary, _ = _record_temp(tmp_path, record_kind)
+
+    _publisher(tmp_path).publish(third)
+
+    management = tmp_path / ".cove-book-forge"
+    assert not temporary.exists()
+    assert not list(management.rglob(f".{record_kind}-*.tmp"))
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+
+@pytest.mark.parametrize(
+    "record_kind",
+    ["stage-intent", "stage-ready", "closing-intent", "delete-intent"],
+)
+def test_record_temp_with_unproven_associated_state_is_preserved(
+    tmp_path: Path,
+    record_kind: str,
+) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+    _run_skill_record_temp_hard_crash(tmp_path, record_kind)
+    temporary, record = _record_temp(tmp_path, record_kind)
+    original_temp = temporary.read_bytes()
+
+    if record_kind == "stage-intent":
+        competitor = temporary.parent / str(record["stage_name"])
+        competitor.mkdir()
+        (competitor / "competitor.txt").write_bytes(b"competitor")
+    elif record_kind == "stage-ready":
+        competitor = temporary.parent / str(record["stage_name"])
+        competitor.rmdir()
+        competitor.mkdir()
+        (competitor / "competitor.txt").write_bytes(b"competitor")
+    elif record_kind == "closing-intent":
+        wrapper = temporary.parent / str(record["quarantine_name"])
+        wrapper.rename(wrapper.with_name(f"saved-{wrapper.name}"))
+        competitor = wrapper
+        competitor.mkdir()
+        (competitor / "competitor.txt").write_bytes(b"competitor")
+    else:
+        source = temporary.parent / str(record["source_name"])
+        source.rename(source.with_name(f"saved-{source.name}"))
+        competitor = source
+        competitor.write_bytes(b"competitor")
+
+    with pytest.raises(ForgeException) as error:
+        _publisher(tmp_path).publish(third)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert temporary.read_bytes() == original_temp
+    if competitor.is_dir():
+        assert (competitor / "competitor.txt").read_bytes() == b"competitor"
+    else:
+        assert competitor.read_bytes() == b"competitor"
+
+
+def test_record_temp_with_wrong_name_binding_is_preserved(tmp_path: Path) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+    _run_skill_record_temp_hard_crash(tmp_path, "stage-intent")
+    temporary, _ = _record_temp(tmp_path, "stage-intent")
+    rebound = temporary.with_name(f".stage-intent-{'f' * 32}.tmp")
+    temporary.rename(rebound)
+    payload = rebound.read_bytes()
+
+    with pytest.raises(ForgeException) as error:
+        _publisher(tmp_path).publish(third)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert rebound.read_bytes() == payload
+
+
+@pytest.mark.parametrize(
+    "record_kind",
+    ["stage-intent", "stage-ready", "closing-intent", "delete-intent"],
+)
+def test_record_temp_with_wrong_canonical_checksum_is_preserved(
+    tmp_path: Path,
+    record_kind: str,
+) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+    _run_skill_record_temp_hard_crash(tmp_path, record_kind)
+    temporary, _ = _record_temp(tmp_path, record_kind)
+    record = json.loads(temporary.read_text(encoding="utf-8"))
+    record["schema"] = 2
+    corrupted = json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    temporary.write_bytes(corrupted)
+
+    with pytest.raises(ForgeException) as error:
+        _publisher(tmp_path).publish(third)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert temporary.read_bytes() == corrupted
+
+
+def test_owned_record_temp_crashes_never_exhaust_the_transition_scan(tmp_path: Path) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+
+    for _ in range(128):
+        _run_skill_record_temp_hard_crash(tmp_path, "stage-intent")
+
+    _publisher(tmp_path).publish(third)
+
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    assert list(quarantine.iterdir()) == []
     assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
 
 

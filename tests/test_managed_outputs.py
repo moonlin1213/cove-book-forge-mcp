@@ -86,6 +86,29 @@ def _with_checksum(manifest):
     return manifest.model_copy(update={"checksum": checksum})
 
 
+def _replace_moc_fingerprint(data: bytes, fingerprint: str) -> bytes:
+    """Keep the locked MOC body, replacing only its controlled manifest fingerprint."""
+    _, raw_header, body = data.split(b"---\n", 2)
+    fields: dict[str, str] = {}
+    for line in raw_header.decode().splitlines():
+        key, raw_value = line.split(": ", 1)
+        fields[key] = json.loads(raw_value)
+    fields["cove_source_fingerprint"] = fingerprint
+    return (
+        b"---\n"
+        + b"".join(f"{key}: {json.dumps(value)}\n".encode() for key, value in fields.items())
+        + b"---\n"
+        + body
+    )
+
+
+def _rendered_with_manifest(rendered, manifest):
+    files = dict(rendered.files)
+    files[_manifest_path(rendered)] = canonical_manifest_bytes(manifest)
+    files[rendered.moc_path] = _replace_moc_fingerprint(files[rendered.moc_path], manifest.checksum)
+    return rendered.model_copy(update={"files": files, "manifest": manifest})
+
+
 def test_parses_a_locked_managed_markdown_round_trip() -> None:
     """Removing the exact frontmatter contract must make this fail."""
     rendered = _render()
@@ -297,6 +320,64 @@ def test_update_rejects_a_manifest_that_rewrites_a_noncurrent_chapter_summary() 
     )
 
 
+def test_update_rejects_an_added_cardless_noncurrent_chapter_record() -> None:
+    """An added old chapter can become a deletion/removal target in a later update."""
+    first = _render(index=0)
+    current = ObsidianRenderer(ObsidianOutputConfig()).render(
+        _snapshot(index=1), _analyzed(), first.manifest
+    )
+    added = current.manifest.chapters[0].model_copy(
+        update={
+            "index": 7,
+            "note_path": "Books/Managed book--6d85fd8b00de6581/Chapters/08 extra.md",
+        }
+    )
+    untrusted = _rendered_with_manifest(
+        current,
+        _with_checksum(
+            current.manifest.model_copy(
+                update={"chapters": (*current.manifest.chapters, added), "total_chapters": 8}
+            )
+        ),
+    )
+
+    _assert_raises_without_leak(
+        lambda: plan_obsidian_update(first.manifest, dict(first.files), untrusted), "extra.md"
+    )
+
+
+def test_update_rejects_reordered_noncurrent_card_records() -> None:
+    """Order is part of the canonical retained history and must not drift between updates."""
+    first = _render(
+        index=0,
+        concepts=(
+            Concept(term="Alpha", definition="One."),
+            Concept(term="Beta", definition="Two."),
+        ),
+    )
+    current = ObsidianRenderer(ObsidianOutputConfig()).render(
+        _snapshot(index=1), _analyzed(), first.manifest
+    )
+    old_cards = tuple(card for card in current.manifest.cards if card.chapter_index == 0)
+    reordered = _rendered_with_manifest(
+        current,
+        _with_checksum(
+            current.manifest.model_copy(
+                update={
+                    "cards": (
+                        *reversed(old_cards),
+                        *(card for card in current.manifest.cards if card.chapter_index == 1),
+                    )
+                }
+            )
+        ),
+    )
+
+    _assert_raises_without_leak(
+        lambda: plan_obsidian_update(first.manifest, dict(first.files), reordered), "Alpha"
+    )
+
+
 def test_first_publish_rejects_a_renderer_with_multiple_chapter_records() -> None:
     """Without a previous manifest, an aggregate render cannot establish safe ownership history."""
     first = _render(index=0)
@@ -331,6 +412,28 @@ def test_manifest_rejects_a_card_path_that_collides_with_its_manifest_path() -> 
     collision_manifest = _with_checksum(
         rendered.manifest.model_copy(
             update={"cards": (collision_card,), "chapters": (collision_chapter,)}
+        )
+    )
+
+    _assert_raises_without_leak(
+        lambda: parse_obsidian_manifest(canonical_manifest_bytes(collision_manifest)), manifest_path
+    )
+
+
+def test_manifest_rejects_moc_path_that_is_the_manifest_path() -> None:
+    """A set silently deduplicates MOC/control-path equality unless it is rejected explicitly."""
+    rendered = _render()
+    manifest_path = _manifest_path(rendered)
+    moved_chapter = rendered.manifest.chapters[0].model_copy(
+        update={"note_path": ".cove-book-forge/obsidian/Chapters/01 chapter.md"}
+    )
+    collision_manifest = _with_checksum(
+        rendered.manifest.model_copy(
+            update={
+                "book_directory": ".cove-book-forge/obsidian",
+                "moc_path": manifest_path,
+                "chapters": (moved_chapter,),
+            }
         )
     )
 

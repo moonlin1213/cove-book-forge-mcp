@@ -174,6 +174,8 @@ def _validate_manifest_references(manifest: ObsidianBookManifest) -> None:
         or moc_path.rsplit("/", 1)[0] != book_directory
     ):
         raise _invalid()
+    if moc_path == _manifest_path(manifest.book_key):
+        raise _invalid()
     chapters: dict[int, ObsidianChapterManifest] = {}
     cards_by_path: dict[str, ObsidianCardManifest] = {}
     card_ids: set[str] = set()
@@ -419,14 +421,15 @@ def _validate_preserved_history(
     ):
         raise _invalid()
     current_index = current_chapter.index
-    old_chapters = {chapter.index: chapter for chapter in previous.chapters}
-    new_chapters = {chapter.index: chapter for chapter in current.chapters}
-    for index, chapter in old_chapters.items():
-        if index != current_index and new_chapters.get(index) != chapter:
-            raise _invalid()
-    old_cards = {card for card in previous.cards if card.chapter_index != current_index}
-    new_cards = {card for card in current.cards if card.chapter_index != current_index}
-    if old_cards != new_cards:
+    previous_chapters = tuple(
+        chapter for chapter in previous.chapters if chapter.index != current_index
+    )
+    current_chapters = tuple(
+        chapter for chapter in current.chapters if chapter.index != current_index
+    )
+    previous_cards = tuple(card for card in previous.cards if card.chapter_index != current_index)
+    current_cards = tuple(card for card in current.cards if card.chapter_index != current_index)
+    if previous_chapters != current_chapters or previous_cards != current_cards:
         raise _invalid()
 
 

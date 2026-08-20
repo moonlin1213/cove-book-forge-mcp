@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -178,6 +179,7 @@ def test_renderer_builds_exact_managed_tree_with_compact_progressive_skill() -> 
         "SKILL.md",
         "agents/openai.yaml",
         "chapters/ch0001-reversible-moves.md",
+        "chapters/index.md",
         "glossary.md",
         "patterns.md",
         "cheatsheet.md",
@@ -189,7 +191,13 @@ def test_renderer_builds_exact_managed_tree_with_compact_progressive_skill() -> 
         "description": "Apply analysed book references to a relevant task.",
     }
     assert len(body.splitlines()) < 500
-    for link in ("glossary.md", "patterns.md", "cheatsheet.md", rendered.chapter_path):
+    for link in (
+        "glossary.md",
+        "patterns.md",
+        "cheatsheet.md",
+        "chapters/index.md",
+        rendered.chapter_path,
+    ):
         assert f"]({link})" in body
     assert "untrusted reference content" in body.casefold()
     assert "Raw private source text" not in body
@@ -350,7 +358,14 @@ def _historical_chapter(index: int) -> AgentSkillChapterManifest:
 
 def _full_history_manifest() -> AgentSkillManifest:
     chapters = tuple(_historical_chapter(index) for index in range(5_000))
-    roots = ("SKILL.md", "agents/openai.yaml", "glossary.md", "patterns.md", "cheatsheet.md")
+    roots = (
+        "SKILL.md",
+        "agents/openai.yaml",
+        "chapters/index.md",
+        "glossary.md",
+        "patterns.md",
+        "cheatsheet.md",
+    )
     files = tuple(
         SkillFileHash(path=path, sha256="a" * 64)
         for path in (*roots, *(chapter.chapter_path for chapter in chapters))
@@ -379,6 +394,83 @@ def test_maximum_history_keeps_skill_under_500_lines_with_a_remaining_summary() 
     assert len(rendered.manifest.chapters) == 5_000
 
 
+def test_chapter_index_keeps_every_large_book_chapter_navigable_from_skill() -> None:
+    rendered = AgentSkillRenderer(SkillOutputConfig()).render(
+        _snapshot(), _analyzed(), _full_history_manifest()
+    )
+
+    skill = rendered.files["SKILL.md"].decode("utf-8")
+    index = rendered.files["chapters/index.md"].decode("utf-8")
+    assert "](chapters/index.md)" in skill
+    assert "(ch0101-chapter-100.md)" in index
+    assert "(ch5000-chapter-4999.md)" in index
+    assert len(index.splitlines()) <= 5_005
+    assert len(index.encode("utf-8")) <= 1_500_000
+    assert "chapters/index.md" in {item.path for item in rendered.manifest.files}
+
+
+def test_current_chapter_is_guaranteed_aggregate_coverage_after_full_history_budget() -> None:
+    full_history = ChapterAnalysis(
+        core_idea="First.",
+        concepts=tuple(
+            Concept(term=f"Old concept {index}", definition="Old.") for index in range(128)
+        ),
+        frameworks=tuple(Framework(name=f"Old framework {index}") for index in range(128)),
+        methods=tuple(Method(name=f"Old method {index}") for index in range(128)),
+        decision_rules=tuple(DecisionRule(rule=f"Old rule {index}") for index in range(128)),
+    )
+    first = _render(
+        _snapshot(chapter_index=0), _analyzed().model_copy(update={"analysis": full_history})
+    )
+    current = ChapterAnalysis(
+        core_idea="Second.",
+        concepts=(Concept(term="Current concept", definition="Current."),),
+        frameworks=(Framework(name="Current framework"),),
+        methods=(Method(name="Current method"),),
+        decision_rules=(DecisionRule(rule="Current rule"),),
+    )
+    second = AgentSkillRenderer(SkillOutputConfig()).render(
+        _snapshot(chapter_index=1, title="Second"),
+        _analyzed(fingerprint="b" * 64).model_copy(update={"analysis": current}),
+        first.manifest,
+    )
+
+    glossary = second.files["glossary.md"].decode("utf-8")
+    patterns = second.files["patterns.md"].decode("utf-8")
+    cheatsheet = second.files["cheatsheet.md"].decode("utf-8")
+    assert "Current concept" in glossary
+    assert "Current framework" in patterns
+    assert "Current method" in patterns
+    assert "Current rule" in cheatsheet
+    assert "Coverage: 128 items shown; 1 omitted." in glossary
+    assert "Old concept 127" not in glossary
+
+
+def test_aggregate_budget_does_not_iterate_or_materialize_every_logical_item() -> None:
+    class BombItems:
+        def __len__(self) -> int:
+            return 128
+
+        def __getitem__(self, index: int) -> str:
+            if not 0 <= index < 128:
+                raise IndexError(index)
+            return f"Item {index}"
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            raise AssertionError("aggregate must not enumerate every source item")
+
+    chapters = tuple(SimpleNamespace(index=index, concepts=BombItems()) for index in range(5_000))
+    manifest = SimpleNamespace(chapters=chapters)
+
+    values, total = AgentSkillRenderer._aggregate_values(  # type: ignore[arg-type]
+        manifest, 4_999, lambda chapter: chapter.concepts
+    )
+
+    assert total == 640_000
+    assert len(values) == 128
+    assert values[0] == "Chapter 5000: Item 0"
+
+
 def test_renaming_the_current_chapter_replaces_its_single_managed_hash() -> None:
     first = _render()
     second = AgentSkillRenderer(SkillOutputConfig()).render(
@@ -390,7 +482,9 @@ def test_renaming_the_current_chapter_replaces_its_single_managed_hash() -> None
 
     for rendered in (second, third):
         chapter_hashes = [
-            item.path for item in rendered.manifest.files if item.path.startswith("chapters/")
+            item.path
+            for item in rendered.manifest.files
+            if item.path.startswith("chapters/") and item.path != "chapters/index.md"
         ]
         assert chapter_hashes == [rendered.chapter_path]
     assert first.chapter_path not in {item.path for item in second.manifest.files}

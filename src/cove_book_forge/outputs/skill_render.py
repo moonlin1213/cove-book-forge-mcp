@@ -7,7 +7,7 @@ import html
 import json
 import re
 import unicodedata
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from itertools import islice
 from typing import Any, Literal
 
@@ -45,6 +45,7 @@ _MAX_REFERENCE_BYTES = 1_000
 _MAX_SUMMARY_ITEMS = 128
 _MAX_SKILL_CHAPTER_PREVIEW = 100
 _MAX_SKILL_FRAMEWORK_PREVIEW = 12
+_MAX_CHAPTER_INDEX_BYTES = 1_500_000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -238,9 +239,10 @@ class AgentSkillRenderer:
             "SKILL.md": self._skill_file(skeleton),
             "agents/openai.yaml": self._openai_yaml(skeleton),
             chapter_path: self._chapter_file(snapshot, analyzed.analysis),
-            "glossary.md": self._glossary(skeleton),
-            "patterns.md": self._patterns(skeleton),
-            "cheatsheet.md": self._cheatsheet(skeleton),
+            "chapters/index.md": self._chapter_index(skeleton),
+            "glossary.md": self._glossary(skeleton, current.index),
+            "patterns.md": self._patterns(skeleton, current.index),
+            "cheatsheet.md": self._cheatsheet(skeleton, current.index),
         }
         old_hashes = (
             {item.path: item.sha256 for item in validated_previous.files}
@@ -284,9 +286,12 @@ class AgentSkillRenderer:
         if previous is None or previous.book_key != book_key:
             return None
         validated = AgentSkillManifest.model_validate(previous.model_dump(by_alias=True))
+        if any(not chapter.chapter_path.startswith("chapters/") for chapter in validated.chapters):
+            raise ValueError("previous Skill manifest has an unsafe chapter index path")
         expected_paths = {
             "SKILL.md",
             "agents/openai.yaml",
+            "chapters/index.md",
             "glossary.md",
             "patterns.md",
             "cheatsheet.md",
@@ -334,6 +339,7 @@ class AgentSkillRenderer:
                 "- [Glossary](glossary.md)",
                 "- [Reusable patterns](patterns.md)",
                 "- [Quick rules](cheatsheet.md)",
+                "- [Chapter index](chapters/index.md)",
                 "",
                 "## Core frameworks",
                 *_items(framework_values, limit=_MAX_SKILL_FRAMEWORK_PREVIEW),
@@ -431,28 +437,97 @@ class AgentSkillRenderer:
         return ("\n".join(sections) + "\n").encode("utf-8")
 
     @staticmethod
-    def _glossary(manifest: AgentSkillManifest) -> bytes:
-        values = [
-            f"Chapter {chapter.index + 1:04d}: {concept}"
-            for chapter in manifest.chapters
-            for concept in chapter.concepts
-        ]
-        return ("# Glossary\n\n" + "\n".join(_items(values)) + "\n").encode("utf-8")
+    def _chapter_index(manifest: AgentSkillManifest) -> bytes:
+        lines = ["# Chapter index", ""]
+        for chapter in manifest.chapters:
+            path = chapter.chapter_path.removeprefix("chapters/")
+            lines.append(f"- [Chapter {chapter.index + 1:04d}]({path})")
+        result = ("\n".join(lines) + "\n").encode("utf-8")
+        if len(result) > _MAX_CHAPTER_INDEX_BYTES:
+            raise ValueError("chapter index exceeds the managed byte budget")
+        return result
 
     @staticmethod
-    def _patterns(manifest: AgentSkillManifest) -> bytes:
-        values = [
-            f"Chapter {chapter.index + 1:04d}: {value}"
-            for chapter in manifest.chapters
-            for value in (*chapter.frameworks, *chapter.mental_models, *chapter.methods)
-        ]
-        return ("# Reusable patterns\n\n" + "\n".join(_items(values)) + "\n").encode("utf-8")
+    def _aggregate_values(
+        manifest: AgentSkillManifest,
+        current_index: int,
+        select: Callable[[AgentSkillChapterManifest], tuple[str, ...]],
+    ) -> tuple[tuple[str, ...], int]:
+        """Allocate a deterministic per-book budget without materialising every value."""
+        chapters = manifest.chapters
+        total = sum(len(select(chapter)) for chapter in chapters)
+        if not chapters or not total:
+            return (), total
+        current_position = next(
+            (
+                position
+                for position, chapter in enumerate(chapters)
+                if chapter.index == current_index
+            ),
+            0,
+        )
+        values: list[str] = []
+        current = chapters[current_position]
+        current_values = select(current)
+        if current_values:
+            values.append(f"Chapter {current.index + 1:04d}: {current_values[0]}")
+        offset = 1
+        while len(values) < _MAX_SUMMARY_ITEMS:
+            emitted = False
+            for relative_position in range(1, len(chapters) + 1):
+                chapter = chapters[(current_position + relative_position) % len(chapters)]
+                item_position = offset if chapter.index == current_index else offset - 1
+                chapter_values = select(chapter)
+                if item_position < len(chapter_values):
+                    values.append(
+                        f"Chapter {chapter.index + 1:04d}: {chapter_values[item_position]}"
+                    )
+                    emitted = True
+                    if len(values) == _MAX_SUMMARY_ITEMS:
+                        break
+            if not emitted:
+                break
+            offset += 1
+        return tuple(values), total
 
     @staticmethod
-    def _cheatsheet(manifest: AgentSkillManifest) -> bytes:
-        values = [
-            f"Chapter {chapter.index + 1:04d}: {value}"
-            for chapter in manifest.chapters
-            for value in (*chapter.decision_rules, *chapter.key_takeaways)
+    def _aggregate_file(
+        title: str,
+        manifest: AgentSkillManifest,
+        current_index: int,
+        select: Callable[[AgentSkillChapterManifest], tuple[str, ...]],
+    ) -> bytes:
+        values, total = AgentSkillRenderer._aggregate_values(manifest, current_index, select)
+        omitted = total - len(values)
+        lines = [
+            f"# {title}",
+            "",
+            *_items(values),
+            "",
+            f"- Coverage: {len(values)} items shown; {omitted} omitted.",
         ]
-        return ("# Quick rules\n\n" + "\n".join(_items(values)) + "\n").encode("utf-8")
+        return ("\n".join(lines) + "\n").encode("utf-8")
+
+    @staticmethod
+    def _glossary(manifest: AgentSkillManifest, current_index: int) -> bytes:
+        return AgentSkillRenderer._aggregate_file(
+            "Glossary", manifest, current_index, lambda chapter: chapter.concepts
+        )
+
+    @staticmethod
+    def _patterns(manifest: AgentSkillManifest, current_index: int) -> bytes:
+        return AgentSkillRenderer._aggregate_file(
+            "Reusable patterns",
+            manifest,
+            current_index,
+            lambda chapter: (*chapter.frameworks, *chapter.mental_models, *chapter.methods),
+        )
+
+    @staticmethod
+    def _cheatsheet(manifest: AgentSkillManifest, current_index: int) -> bytes:
+        return AgentSkillRenderer._aggregate_file(
+            "Quick rules",
+            manifest,
+            current_index,
+            lambda chapter: (*chapter.decision_rules, *chapter.key_takeaways),
+        )

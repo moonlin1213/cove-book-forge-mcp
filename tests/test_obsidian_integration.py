@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from collections import deque
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
@@ -155,6 +156,31 @@ def _file_state(vault: Path) -> dict[str, tuple[int, int, bytes]]:
                 path.read_bytes(),
             )
     return files
+
+
+def _filesystem_state(root: Path) -> tuple[tuple[object, ...], ...]:
+    entries: list[tuple[object, ...]] = []
+    for path in (root, *sorted(root.rglob("*"))):
+        status = path.lstat()
+        if stat.S_ISREG(status.st_mode):
+            payload: object = path.read_bytes()
+        elif stat.S_ISLNK(status.st_mode):
+            payload = path.readlink().as_posix()
+        else:
+            payload = None
+        entries.append(
+            (
+                "." if path == root else path.relative_to(root).as_posix(),
+                status.st_dev,
+                status.st_ino,
+                status.st_mode,
+                status.st_size,
+                status.st_mtime_ns,
+                status.st_ctime_ns,
+                payload,
+            )
+        )
+    return tuple(entries)
 
 
 @pytest.mark.anyio
@@ -324,10 +350,13 @@ async def test_skill_placeholder_consumes_cached_analysis_without_creating_skill
         analyzer = ChapterAnalyzer(provider, library, config.analysis, config.model)
         ob_analysis = await analyzer.analyze(snapshot)
         ObsidianOutput(config.outputs.obsidian).publish(snapshot, ob_analysis)
+        before_placeholder = _filesystem_state(tmp_path)
         skill_cached = await analyzer.analyze(snapshot)
         skill_placeholder = skill_cached.analysis
+        after_placeholder = _filesystem_state(tmp_path)
 
     assert provider.calls == 1
     assert skill_cached.cache_hit is True
     assert skill_placeholder == ob_analysis.analysis
+    assert after_placeholder == before_placeholder
     assert not any(path.name == "SKILL.md" for path in tmp_path.rglob("*"))

@@ -21,6 +21,7 @@ from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.library import BookLibrary, LibraryDatabase
 from cove_book_forge.library import database as library_database
 from cove_book_forge.outputs import ObsidianOutput
+from cove_book_forge.outputs import publisher as publisher_module
 from cove_book_forge.outputs.obsidian_render import ObsidianRenderer
 from cove_book_forge.outputs.publisher import GuardedPublisher
 from cove_book_forge.providers.anthropic import AnthropicProvider
@@ -296,6 +297,160 @@ def test_doctor_checks_enabled_obsidian_vault_read_only_without_render_or_publis
     assert _filesystem_snapshot(tmp_path) == before
     assert _filesystem_metadata_snapshot(tmp_path) == before_metadata
     assert not (vault / ".cove-book-forge").exists()
+
+
+@pytest.mark.parametrize(("allowed", "expected_status"), [(False, "fail"), (True, "pass")])
+def test_doctor_checks_effective_access_through_the_captured_vault_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    allowed: bool,
+    expected_status: str,
+) -> None:
+    """Checking only owner write mode would advertise a vault the effective user cannot use."""
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    vault = tmp_path / "private-effective-access-vault"
+    vault.mkdir(mode=0o700)
+    config = _write_obsidian_config(
+        tmp_path / "config.yaml",
+        data_dir,
+        enabled=True,
+        vault_path=vault,
+    )
+    real_access = os.access
+    anchored_calls: list[tuple[object, int, int | None, bool]] = []
+
+    def controlled_access(
+        path: object,
+        mode: int,
+        *,
+        dir_fd: int | None = None,
+        effective_ids: bool = False,
+        follow_symlinks: bool = True,
+    ) -> bool:
+        if path == "." and dir_fd is not None:
+            anchored_calls.append((path, mode, dir_fd, effective_ids))
+            return allowed
+        return real_access(
+            path,
+            mode,
+            dir_fd=dir_fd,
+            effective_ids=effective_ids,
+            follow_symlinks=follow_symlinks,
+        )
+
+    monkeypatch.setattr(publisher_module.os, "access", controlled_access)
+    before = _filesystem_snapshot(tmp_path)
+    before_metadata = _filesystem_metadata_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == (0 if allowed else 1)
+    payload = json.loads(result.stdout)
+    check = _check(payload, "obsidian_output")
+    assert check["status"] == expected_status
+    assert check["message"] == (
+        "Obsidian output directory is ready."
+        if allowed
+        else "Obsidian output directory is not ready."
+    )
+    assert str(vault) not in result.stdout
+    assert len(anchored_calls) == 1
+    _path, mode, descriptor, effective_ids = anchored_calls[0]
+    assert mode == os.W_OK | os.X_OK
+    assert effective_ids is True
+    assert descriptor is not None
+    with pytest.raises(OSError):
+        os.fstat(descriptor)
+    assert _filesystem_snapshot(tmp_path) == before
+    assert _filesystem_metadata_snapshot(tmp_path) == before_metadata
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ["access-error", "dir-fd-unsupported", "effective-ids-unsupported"],
+)
+def test_doctor_fails_closed_when_effective_access_cannot_be_proven(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """Treating an unsupported or failed effective-access probe as ready would fail open."""
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    vault = tmp_path / f"private-{failure}-vault"
+    vault.mkdir(mode=0o700)
+    config = _write_obsidian_config(
+        tmp_path / "config.yaml",
+        data_dir,
+        enabled=True,
+        vault_path=vault,
+    )
+    real_access = os.access
+    real_anchor_close = publisher_module._VaultAnchor.close
+    anchored_descriptors: list[int] = []
+    closed_descriptors: list[int] = []
+
+    def recording_anchor_close(anchor: publisher_module._VaultAnchor) -> None:
+        descriptor = anchor.descriptor
+        closed_descriptors.append(descriptor)
+        real_anchor_close(anchor)
+
+    def failing_access(
+        path: object,
+        mode: int,
+        *,
+        dir_fd: int | None = None,
+        effective_ids: bool = False,
+        follow_symlinks: bool = True,
+    ) -> bool:
+        if path == "." and dir_fd is not None:
+            anchored_descriptors.append(dir_fd)
+            raise OSError("private effective-access failure")
+        return real_access(
+            path,
+            mode,
+            dir_fd=dir_fd,
+            effective_ids=effective_ids,
+            follow_symlinks=follow_symlinks,
+        )
+
+    if failure == "access-error":
+        monkeypatch.setattr(publisher_module.os, "access", failing_access)
+    elif failure == "dir-fd-unsupported":
+        monkeypatch.setattr(
+            publisher_module,
+            "_EFFECTIVE_ACCESS_DIR_FD_SUPPORTED",
+            False,
+        )
+    else:
+        monkeypatch.setattr(
+            publisher_module,
+            "_EFFECTIVE_ACCESS_IDS_SUPPORTED",
+            False,
+        )
+    monkeypatch.setattr(publisher_module._VaultAnchor, "close", recording_anchor_close)
+    before = _filesystem_snapshot(tmp_path)
+    before_metadata = _filesystem_metadata_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert _check(payload, "obsidian_output") == {
+        "name": "obsidian_output",
+        "status": "fail",
+        "message": "Obsidian output directory is not ready.",
+    }
+    assert str(vault) not in result.stdout
+    assert "private effective-access failure" not in result.stdout
+    assert len(closed_descriptors) == 1
+    assert not anchored_descriptors or anchored_descriptors == closed_descriptors
+    for descriptor in closed_descriptors:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    assert _filesystem_snapshot(tmp_path) == before
+    assert _filesystem_metadata_snapshot(tmp_path) == before_metadata
 
 
 @pytest.mark.parametrize(

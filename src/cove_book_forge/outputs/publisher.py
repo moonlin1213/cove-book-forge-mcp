@@ -53,6 +53,8 @@ _SECURE_PRIMITIVES_AVAILABLE: Final = (
         for function in (os.open, os.mkdir, os.stat, os.rename, os.link, os.unlink, os.rmdir)
     )
 )
+_EFFECTIVE_ACCESS_DIR_FD_SUPPORTED: Final = os.access in os.supports_dir_fd
+_EFFECTIVE_ACCESS_IDS_SUPPORTED: Final = os.access in os.supports_effective_ids
 
 _Identity = tuple[int, int]
 _Render = Callable[[ObsidianBookManifest | None], RenderedObsidianBook]
@@ -215,8 +217,25 @@ class _VaultAnchor:
 
 def check_obsidian_output_readiness(config: ObsidianOutputConfig) -> None:
     """Validate and close an enabled vault capability without creating output state."""
-    with _VaultAnchor.capture(config):
-        pass
+    with _VaultAnchor.capture(config) as anchor:
+        anchor.verify()
+        accessible = False
+        probe_failed = not (_EFFECTIVE_ACCESS_DIR_FD_SUPPORTED and _EFFECTIVE_ACCESS_IDS_SUPPORTED)
+        if not probe_failed:
+            try:
+                accessible = os.access(
+                    ".",
+                    os.W_OK | os.X_OK,
+                    dir_fd=anchor.descriptor,
+                    effective_ids=True,
+                )
+            except Exception:
+                probe_failed = True
+        anchor.verify()
+        if probe_failed:
+            raise _error(ForgeErrorCode.PATH_NOT_ALLOWED)
+        if not accessible:
+            raise _error(ForgeErrorCode.OUTPUT_PERMISSION_DENIED)
 
 
 @dataclass(frozen=True)

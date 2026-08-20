@@ -7,6 +7,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 from collections.abc import Callable, Iterable, Mapping
@@ -14,7 +15,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 from uuid import uuid4
 
 from cove_book_forge.config import ObsidianOutputConfig
@@ -40,8 +41,14 @@ _MAX_CANDIDATE_COUNT: Final = 10_000
 _MAX_MANAGED_CHAPTERS: Final = MAX_BOOK_CHAPTERS
 _MAX_MANAGED_CARDS: Final = MAX_OBSIDIAN_CARDS
 _MAX_TOTAL_TRANSACTION_BYTES: Final = 256 * 1024 * 1024
+_MAX_TRANSACTION_STATE_BYTES: Final = 16 * 1024 * 1024
+_MAX_TRANSACTION_COUNT: Final = 64
 _READ_CHUNK: Final = 1024 * 1024
 _TRANSACTIONS_PATH: Final = ".cove-book-forge/.transactions"
+_TRANSACTION_NAME = re.compile(r"^tx-[0-9a-f]{32}$")
+_RECOVERY_NAME = re.compile(r"^recovery-([0-9a-f]{32})\.json$")
+_ROLLBACK_NAME = re.compile(r"^r[0-9]{6}-[0-9a-f]{32}$")
+_HEX_64 = re.compile(r"^[0-9a-f]{64}$")
 _PUBLIC_OUTPUT_ERRORS: Final = frozenset(
     {
         ForgeErrorCode.OUTPUT_NOT_CONFIGURED,
@@ -335,6 +342,48 @@ class _RecoveryEntry:
     durable: bool = False
 
 
+class _TransactionPhase(StrEnum):
+    PREPARED = "prepared"
+    MANIFEST_PENDING = "manifest_pending"
+    COMMITTED = "committed"
+
+
+@dataclass(frozen=True)
+class _DurableOldFile:
+    path: str
+    exists: bool
+    parent_identity: _Identity
+    identity: _Identity | None
+    size: int | None
+    digest: str | None
+
+
+@dataclass(frozen=True)
+class _DurableWrite:
+    path: str
+    stage_name: str
+    parent_identity: _Identity
+    identity: _Identity
+    size: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class _TransactionJournal:
+    transaction_name: str
+    vault_identity: _Identity
+    transaction_identity: _Identity
+    stage_identity: _Identity
+    backup_identity: _Identity
+    manifest_path: str
+    old_manifest_checksum: str | None
+    new_manifest_checksum: str
+    old_manifest_digest: str | None
+    new_manifest_digest: str
+    old_files: tuple[_DurableOldFile, ...]
+    writes: tuple[_DurableWrite, ...]
+
+
 @dataclass
 class _Transaction:
     parent_fd: int
@@ -342,6 +391,9 @@ class _Transaction:
     fd: int
     stage_fd: int
     backup_fd: int
+    identity: _Identity
+    stage_identity: _Identity
+    backup_identity: _Identity
     created_directories: list[_CreatedDirectory]
     staged: dict[str, _StagedFile] = field(default_factory=dict)
     backups: list[_BackupFile] = field(default_factory=list)
@@ -349,6 +401,9 @@ class _Transaction:
     protected_entries: set[tuple[int, str]] = field(default_factory=set)
     recoveries: dict[tuple[int, str], _RecoveryEntry] = field(default_factory=dict)
     expected_writes: Mapping[str, bytes] = field(default_factory=dict)
+    journal: _TransactionJournal | None = None
+    phase: _TransactionPhase | None = None
+    state_records: dict[str, _Identity] = field(default_factory=dict)
     closed: bool = False
 
 
@@ -369,6 +424,288 @@ def _fsync_directory(descriptor: int) -> None:
     except OSError as exc:
         if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
             raise
+
+
+def _bounded_directory_names(descriptor: int, limit: int) -> tuple[str, ...]:
+    names: list[str] = []
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            if len(names) >= limit:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            names.append(entry.name)
+    return tuple(names)
+
+
+def _state_record_name(phase: _TransactionPhase) -> str:
+    return f"state-{phase.value}.json"
+
+
+def _journal_payload(journal: _TransactionJournal, phase: _TransactionPhase) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "backup_identity": list(journal.backup_identity),
+        "manifest": {
+            "new_checksum": journal.new_manifest_checksum,
+            "new_digest": journal.new_manifest_digest,
+            "old_checksum": journal.old_manifest_checksum,
+            "old_digest": journal.old_manifest_digest,
+            "path": journal.manifest_path,
+        },
+        "old_files": [
+            {
+                "digest": item.digest,
+                "exists": item.exists,
+                "identity": None if item.identity is None else list(item.identity),
+                "parent_identity": list(item.parent_identity),
+                "path": item.path,
+                "size": item.size,
+            }
+            for item in journal.old_files
+        ],
+        "phase": phase.value,
+        "schema": 1,
+        "stage_identity": list(journal.stage_identity),
+        "transaction_identity": list(journal.transaction_identity),
+        "transaction_name": journal.transaction_name,
+        "vault_identity": list(journal.vault_identity),
+        "writes": [
+            {
+                "digest": item.digest,
+                "identity": list(item.identity),
+                "parent_identity": list(item.parent_identity),
+                "path": item.path,
+                "size": item.size,
+                "stage_name": item.stage_name,
+            }
+            for item in journal.writes
+        ],
+    }
+    checksum_bytes = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload["checksum"] = hashlib.sha256(checksum_bytes).hexdigest()
+    return payload
+
+
+def _journal_bytes(journal: _TransactionJournal, phase: _TransactionPhase) -> bytes:
+    return json.dumps(
+        _journal_payload(journal, phase),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _load_unique_json(data: bytes) -> dict[str, Any]:
+    def unique(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate transaction state key")
+            result[key] = value
+        return result
+
+    value = json.loads(data.decode("utf-8"), object_pairs_hook=unique)
+    if not isinstance(value, dict):
+        raise ValueError("transaction state must be an object")
+    return value
+
+
+def _parse_identity(value: object) -> _Identity:
+    if (
+        not isinstance(value, list)
+        or len(value) != 2
+        or any(type(part) is not int or part < 0 for part in value)
+    ):
+        raise ValueError("invalid identity")
+    return value[0], value[1]
+
+
+def _parse_journal_record(data: bytes) -> tuple[_TransactionJournal, _TransactionPhase]:
+    payload = _load_unique_json(data)
+    if set(payload) != {
+        "backup_identity",
+        "checksum",
+        "manifest",
+        "old_files",
+        "phase",
+        "schema",
+        "stage_identity",
+        "transaction_identity",
+        "transaction_name",
+        "vault_identity",
+        "writes",
+    }:
+        raise ValueError("invalid transaction state fields")
+    checksum = payload.pop("checksum")
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if not isinstance(checksum, str) or checksum != hashlib.sha256(canonical).hexdigest():
+        raise ValueError("invalid transaction state checksum")
+    if payload["schema"] != 1:
+        raise ValueError("invalid transaction state schema")
+    phase = _TransactionPhase(payload["phase"])
+    transaction_name = payload["transaction_name"]
+    if not isinstance(transaction_name, str) or not _TRANSACTION_NAME.fullmatch(transaction_name):
+        raise ValueError("invalid transaction name")
+    manifest = payload["manifest"]
+    if not isinstance(manifest, dict) or set(manifest) != {
+        "new_checksum",
+        "new_digest",
+        "old_checksum",
+        "old_digest",
+        "path",
+    }:
+        raise ValueError("invalid transaction manifest state")
+    manifest_path = validate_relative_path(manifest["path"])
+    new_checksum = manifest["new_checksum"]
+    new_digest = manifest["new_digest"]
+    old_checksum = manifest["old_checksum"]
+    old_digest = manifest["old_digest"]
+    if (
+        not isinstance(new_checksum, str)
+        or not _HEX_64.fullmatch(new_checksum)
+        or not isinstance(new_digest, str)
+        or not _HEX_64.fullmatch(new_digest)
+        or (old_checksum is not None and not isinstance(old_checksum, str))
+        or (isinstance(old_checksum, str) and not _HEX_64.fullmatch(old_checksum))
+        or (old_digest is not None and not isinstance(old_digest, str))
+        or (isinstance(old_digest, str) and not _HEX_64.fullmatch(old_digest))
+    ):
+        raise ValueError("invalid transaction manifest digest")
+    raw_old_files = payload["old_files"]
+    raw_writes = payload["writes"]
+    if (
+        not isinstance(raw_old_files, list)
+        or not isinstance(raw_writes, list)
+        or len(raw_old_files) > _MAX_CANDIDATE_COUNT
+        or len(raw_writes) > _MAX_CANDIDATE_COUNT
+    ):
+        raise ValueError("invalid transaction file count")
+    old_files: list[_DurableOldFile] = []
+    old_paths: set[str] = set()
+    total_old_size = 0
+    for raw in raw_old_files:
+        if not isinstance(raw, dict) or set(raw) != {
+            "digest",
+            "exists",
+            "identity",
+            "parent_identity",
+            "path",
+            "size",
+        }:
+            raise ValueError("invalid old file state")
+        path = validate_relative_path(raw["path"])
+        exists = raw["exists"]
+        size = raw["size"]
+        digest = raw["digest"]
+        identity_value = raw["identity"]
+        if path in old_paths or type(exists) is not bool:
+            raise ValueError("duplicate old file state")
+        old_paths.add(path)
+        if exists:
+            if (
+                type(size) is not int
+                or size < 0
+                or not isinstance(digest, str)
+                or not _HEX_64.fullmatch(digest)
+            ):
+                raise ValueError("invalid old file digest")
+            identity = _parse_identity(identity_value)
+            per_file_limit = _MAX_MANIFEST_BYTES if path.endswith(".json") else _MAX_MARKDOWN_BYTES
+            if size > per_file_limit:
+                raise ValueError("old file exceeds transaction limit")
+            total_old_size += size
+        else:
+            if size is not None or digest is not None or identity_value is not None:
+                raise ValueError("invalid absent old file")
+            identity = None
+        old_files.append(
+            _DurableOldFile(
+                path,
+                exists,
+                _parse_identity(raw["parent_identity"]),
+                identity,
+                size,
+                digest,
+            )
+        )
+    writes: list[_DurableWrite] = []
+    write_paths: set[str] = set()
+    stage_names: set[str] = set()
+    total_write_size = 0
+    for raw in raw_writes:
+        if not isinstance(raw, dict) or set(raw) != {
+            "digest",
+            "identity",
+            "parent_identity",
+            "path",
+            "size",
+            "stage_name",
+        }:
+            raise ValueError("invalid write state")
+        path = validate_relative_path(raw["path"])
+        stage_name = raw["stage_name"]
+        size = raw["size"]
+        digest = raw["digest"]
+        if (
+            path in write_paths
+            or not isinstance(stage_name, str)
+            or not re.fullmatch(r"s[0-9]{6}", stage_name)
+            or stage_name in stage_names
+            or type(size) is not int
+            or size < 0
+            or not isinstance(digest, str)
+            or not _HEX_64.fullmatch(digest)
+        ):
+            raise ValueError("invalid write state values")
+        write_paths.add(path)
+        stage_names.add(stage_name)
+        per_file_limit = _MAX_MANIFEST_BYTES if path.endswith(".json") else _MAX_MARKDOWN_BYTES
+        if size > per_file_limit:
+            raise ValueError("write exceeds transaction limit")
+        total_write_size += size
+        writes.append(
+            _DurableWrite(
+                path,
+                stage_name,
+                _parse_identity(raw["parent_identity"]),
+                _parse_identity(raw["identity"]),
+                size,
+                digest,
+            )
+        )
+    if manifest_path not in old_paths or manifest_path not in write_paths:
+        raise ValueError("manifest is outside transaction file state")
+    old_manifest = next(item for item in old_files if item.path == manifest_path)
+    if (
+        total_old_size + total_write_size > _MAX_TOTAL_TRANSACTION_BYTES
+        or old_manifest.digest != old_digest
+        or old_manifest.exists != (old_checksum is not None)
+        or (old_checksum is None) != (old_digest is None)
+    ):
+        raise ValueError("invalid transaction aggregate state")
+    journal = _TransactionJournal(
+        transaction_name=transaction_name,
+        vault_identity=_parse_identity(payload["vault_identity"]),
+        transaction_identity=_parse_identity(payload["transaction_identity"]),
+        stage_identity=_parse_identity(payload["stage_identity"]),
+        backup_identity=_parse_identity(payload["backup_identity"]),
+        manifest_path=manifest_path,
+        old_manifest_checksum=old_checksum,
+        new_manifest_checksum=new_checksum,
+        old_manifest_digest=old_digest,
+        new_manifest_digest=new_digest,
+        old_files=tuple(old_files),
+        writes=tuple(writes),
+    )
+    return journal, phase
 
 
 def _read_descriptor(descriptor: int, size: int) -> bytes:
@@ -459,6 +796,7 @@ class GuardedPublisher:
     def _publish(self, render: _Render) -> PublisherReceipt:
         anchor = _VaultAnchor.capture(self._config)
         with anchor:
+            self._recover_transactions(anchor)
             initial = render(None)
             self._validate_rendered_budget(initial)
             initial_book_key = initial.manifest.book_key
@@ -550,6 +888,15 @@ class GuardedPublisher:
                     )
                     del snapshot
                 anchor.verify()
+                self._prepare_durable_transaction(
+                    anchor,
+                    transaction,
+                    snapshots,
+                    (*plan.writes, *plan.removals),
+                    manifest_path,
+                    previous,
+                    rendered,
+                )
                 self._commit(
                     anchor,
                     transaction,
@@ -561,6 +908,7 @@ class GuardedPublisher:
                 anchor.verify()
                 self._verify_published_files(anchor, transaction)
                 anchor.verify()
+                self._persist_transaction_phase(transaction, _TransactionPhase.COMMITTED)
                 committed = True
                 self._cleanup_committed(transaction)
                 self._close_transaction(transaction)
@@ -577,7 +925,13 @@ class GuardedPublisher:
                         anchor,
                         transaction,
                         created,
-                        exc if not isinstance(exc, Exception) else None,
+                        (
+                            exc
+                            if not isinstance(exc, Exception)
+                            or isinstance(exc, OSError)
+                            and exc.errno == errno.EBADF
+                            else None
+                        ),
                     )
                     if cleanup_signal is not None:
                         raise cleanup_signal from None
@@ -637,8 +991,28 @@ class GuardedPublisher:
         created: list[_CreatedDirectory],
         pending_signal: BaseException | None,
     ) -> BaseException | None:
+        cleanup_complete = False
+        last_cleanup_error: BaseException | None = None
+        for _attempt in range(2):
+            try:
+                self._cleanup_committed(transaction)
+            except BaseException as cleanup_exc:
+                last_cleanup_error = cleanup_exc
+                if pending_signal is None and (
+                    not isinstance(cleanup_exc, Exception)
+                    or isinstance(cleanup_exc, OSError)
+                    and cleanup_exc.errno == errno.EBADF
+                ):
+                    pending_signal = cleanup_exc
+                continue
+            cleanup_complete = True
+            break
+        if not cleanup_complete:
+            self._close_recovery_descriptors(transaction)
+            return (
+                pending_signal or last_cleanup_error or _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            )
         cleanups: tuple[Callable[[], None], ...] = (
-            lambda: self._cleanup_committed(transaction),
             lambda: self._close_transaction(transaction),
             lambda: self._cleanup_created(anchor, created),
         )
@@ -647,11 +1021,559 @@ class GuardedPublisher:
                 try:
                     cleanup()
                 except BaseException as cleanup_exc:
-                    if not isinstance(cleanup_exc, Exception) and pending_signal is None:
+                    if pending_signal is None and (
+                        not isinstance(cleanup_exc, Exception)
+                        or isinstance(cleanup_exc, OSError)
+                        and cleanup_exc.errno == errno.EBADF
+                    ):
                         pending_signal = cleanup_exc
                     continue
                 break
         return pending_signal
+
+    def _recover_transactions(self, anchor: _VaultAnchor) -> None:
+        anchor.verify()
+        parent = self._open_directory(anchor, _TRANSACTIONS_PATH, create=False)
+        if parent is None:
+            return
+        try:
+            names = _bounded_directory_names(parent, _MAX_TRANSACTION_COUNT)
+            for name in sorted(names):
+                if not _TRANSACTION_NAME.fullmatch(name):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                transaction = self._open_recovery_transaction(anchor, parent, name)
+                try:
+                    self._recover_transaction(anchor, transaction)
+                except BaseException:
+                    self._close_recovery_descriptors(transaction)
+                    raise
+                try:
+                    os.stat(name, dir_fd=parent, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            anchor.verify()
+        except ForgeException:
+            raise
+        except PermissionError:
+            raise _error(ForgeErrorCode.OUTPUT_PERMISSION_DENIED) from None
+        except (OSError, RuntimeError, ValueError, UnicodeError, json.JSONDecodeError):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+        finally:
+            with suppress(OSError):
+                os.close(parent)
+
+    def _open_recovery_transaction(
+        self, anchor: _VaultAnchor, parent_fd: int, name: str
+    ) -> _Transaction:
+        tx_fd: int | None = None
+        stage_fd: int | None = None
+        backup_fd: int | None = None
+        owned_parent: int | None = None
+        try:
+            entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(entry.st_mode):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            tx_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_fd)
+            tx_identity = _identity(os.fstat(tx_fd))
+            if tx_identity != _identity(entry):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            stage_fd = os.open("stage", _DIRECTORY_FLAGS, dir_fd=tx_fd)
+            backup_fd = os.open("backup", _DIRECTORY_FLAGS, dir_fd=tx_fd)
+            stage_identity = _identity(os.fstat(stage_fd))
+            backup_identity = _identity(os.fstat(backup_fd))
+            state_records: dict[str, _Identity] = {}
+            found_phases: set[_TransactionPhase] = set()
+            selected_journal: _TransactionJournal | None = None
+            selected_phase: _TransactionPhase | None = None
+            for phase in _TransactionPhase:
+                record_name = _state_record_name(phase)
+                try:
+                    snapshot = self._snapshot_in_directory(tx_fd, record_name)
+                except FileNotFoundError:
+                    continue
+                if snapshot.size is None or snapshot.size > _MAX_TRANSACTION_STATE_BYTES:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                assert snapshot.data is not None and snapshot.identity is not None
+                journal, parsed_phase = _parse_journal_record(snapshot.data)
+                if parsed_phase is not phase:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                if selected_journal is not None and journal != selected_journal:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                selected_journal = journal
+                selected_phase = phase
+                found_phases.add(phase)
+                state_records[record_name] = snapshot.identity
+            if selected_journal is None or selected_phase is None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            required_phases = {_TransactionPhase.PREPARED}
+            if selected_phase in {
+                _TransactionPhase.MANIFEST_PENDING,
+                _TransactionPhase.COMMITTED,
+            }:
+                required_phases.add(_TransactionPhase.MANIFEST_PENDING)
+            if selected_phase is _TransactionPhase.COMMITTED:
+                required_phases.add(_TransactionPhase.COMMITTED)
+            if found_phases != required_phases:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            if (
+                selected_journal.transaction_name != name
+                or selected_journal.vault_identity != anchor.identity
+                or selected_journal.transaction_identity != tx_identity
+                or selected_journal.stage_identity != stage_identity
+                or selected_journal.backup_identity != backup_identity
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            owned_parent = os.dup(parent_fd)
+            transaction = _Transaction(
+                parent_fd=owned_parent,
+                name=name,
+                fd=tx_fd,
+                stage_fd=stage_fd,
+                backup_fd=backup_fd,
+                identity=tx_identity,
+                stage_identity=stage_identity,
+                backup_identity=backup_identity,
+                created_directories=[],
+                journal=selected_journal,
+                phase=selected_phase,
+                state_records=state_records,
+            )
+            owned_parent = None
+            tx_fd = None
+            stage_fd = None
+            backup_fd = None
+            try:
+                self._load_recovery_entries(transaction)
+                self._validate_recovery_directory_entries(transaction)
+            except BaseException:
+                self._close_recovery_descriptors(transaction)
+                raise
+            return transaction
+        finally:
+            for descriptor in (backup_fd, stage_fd, tx_fd, owned_parent):
+                if descriptor is not None:
+                    with suppress(OSError):
+                        os.close(descriptor)
+
+    def _load_recovery_entries(self, transaction: _Transaction) -> None:
+        journal = transaction.journal
+        assert journal is not None
+        old_by_path = {item.path: item for item in journal.old_files}
+        writes_by_path = {item.path: item for item in journal.writes}
+        allowed_root = {"stage", "backup", *transaction.state_records}
+        root_names = _bounded_directory_names(
+            transaction.fd, _MAX_CANDIDATE_COUNT + len(transaction.state_records) + 2
+        )
+        for name in root_names:
+            if name in allowed_root:
+                continue
+            if _ROLLBACK_NAME.fullmatch(name):
+                continue
+            match = _RECOVERY_NAME.fullmatch(name)
+            if match is None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            snapshot = self._snapshot_in_directory(transaction.fd, name)
+            if snapshot.data is None or snapshot.identity is None or snapshot.size is None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            if snapshot.size > _MAX_TRANSACTION_STATE_BYTES:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            payload = _load_unique_json(snapshot.data)
+            if set(payload) != {
+                "container",
+                "moved_name",
+                "original_path",
+                "recovery_id",
+                "schema",
+            }:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            recovery_id = payload["recovery_id"]
+            container = payload["container"]
+            moved_name = payload["moved_name"]
+            original_path = validate_relative_path(payload["original_path"])
+            if (
+                payload["schema"] != 1
+                or recovery_id != match.group(1)
+                or container not in {"backup", "transaction"}
+                or not isinstance(moved_name, str)
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            if container == "backup":
+                valid_mapping = (
+                    re.fullmatch(r"b[0-9]{6}", moved_name) is not None
+                    and original_path in old_by_path
+                    and old_by_path[original_path].exists
+                )
+                directory_fd = transaction.backup_fd
+            else:
+                valid_mapping = (
+                    _ROLLBACK_NAME.fullmatch(moved_name) is not None
+                    and original_path in writes_by_path
+                )
+                directory_fd = transaction.fd
+            if not valid_mapping:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            key = (directory_fd, moved_name)
+            if key in transaction.recoveries:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            recovery = _RecoveryEntry(
+                original_path=original_path,
+                container=container,
+                moved_name=moved_name,
+                record_name=name,
+                record_identity=snapshot.identity,
+                durable=True,
+            )
+            transaction.recoveries[key] = recovery
+            transaction.protected_entries.add(key)
+        allowed_rollback_entries = {
+            moved_name
+            for directory_fd, moved_name in transaction.recoveries
+            if directory_fd == transaction.fd
+        }
+        if {
+            name for name in root_names if _ROLLBACK_NAME.fullmatch(name)
+        } - allowed_rollback_entries:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        for (directory_fd, moved_name), recovery in tuple(transaction.recoveries.items()):
+            try:
+                stored = self._snapshot_in_directory(directory_fd, moved_name)
+            except FileNotFoundError:
+                continue
+            if directory_fd == transaction.fd:
+                write = writes_by_path[recovery.original_path]
+                if not self._snapshot_matches_write(stored, write, allow_missing_parent=True):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                continue
+            old = old_by_path[recovery.original_path]
+            if not self._snapshot_matches_old(stored, old, allow_missing_parent=True):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            assert old.identity is not None and old.size is not None and old.digest is not None
+            parent_path, _, source_name = old.path.rpartition("/")
+            transaction.backups.append(
+                _BackupFile(
+                    path=old.path,
+                    parent_path=parent_path,
+                    source_name=source_name,
+                    name=moved_name,
+                    parent_identity=old.parent_identity,
+                    identity=old.identity,
+                    digest=old.digest,
+                    size=old.size,
+                    status=_BackupStatus.VERIFIED,
+                )
+            )
+
+    def _validate_recovery_directory_entries(self, transaction: _Transaction) -> None:
+        journal = transaction.journal
+        assert journal is not None
+        allowed_stage = {item.stage_name for item in journal.writes}
+        stage_entries = set(_bounded_directory_names(transaction.stage_fd, _MAX_CANDIDATE_COUNT))
+        if not stage_entries <= allowed_stage:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        allowed_backup = {
+            moved_name
+            for directory_fd, moved_name in transaction.recoveries
+            if directory_fd == transaction.backup_fd
+        }
+        if (
+            not set(_bounded_directory_names(transaction.backup_fd, _MAX_CANDIDATE_COUNT))
+            <= allowed_backup
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+    def _recover_transaction(self, anchor: _VaultAnchor, transaction: _Transaction) -> None:
+        journal = transaction.journal
+        phase = transaction.phase
+        assert journal is not None and phase is not None
+        stage_bytes = self._recovery_stage_bytes(
+            transaction, require_all=phase is not _TransactionPhase.COMMITTED
+        )
+        commit_visible = self._new_bundle_is_complete(anchor, journal, stage_bytes)
+        if phase is _TransactionPhase.COMMITTED:
+            if not commit_visible:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            self._recover_committed_transaction(transaction)
+        elif phase is _TransactionPhase.MANIFEST_PENDING and commit_visible:
+            self._recover_committed_transaction(transaction)
+        else:
+            self._recover_precommit_transaction(anchor, transaction, stage_bytes)
+        self._close_transaction(transaction)
+
+    def _recovery_stage_bytes(
+        self, transaction: _Transaction, *, require_all: bool
+    ) -> dict[str, bytes]:
+        journal = transaction.journal
+        assert journal is not None
+        result: dict[str, bytes] = {}
+        transaction.expected_writes = {}
+        for item in journal.writes:
+            transaction.staged[item.path] = _StagedFile(
+                item.path, item.stage_name, item.identity, item.digest
+            )
+            try:
+                snapshot = self._snapshot_in_directory(transaction.stage_fd, item.stage_name)
+            except FileNotFoundError:
+                if require_all:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+                continue
+            if not self._snapshot_matches_write(snapshot, item, allow_missing_parent=True):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            assert snapshot.data is not None
+            result[item.path] = snapshot.data
+        transaction.expected_writes = result
+        return result
+
+    def _new_bundle_is_complete(
+        self,
+        anchor: _VaultAnchor,
+        journal: _TransactionJournal,
+        stage_bytes: Mapping[str, bytes],
+    ) -> bool:
+        writes = {item.path: item for item in journal.writes}
+        for path, item in writes.items():
+            try:
+                current = self._read_snapshot(anchor, path)
+            except ForgeException:
+                return False
+            if not self._snapshot_matches_write(current, item):
+                return False
+            expected = stage_bytes.get(path)
+            if expected is not None and current.data != expected:
+                return False
+        for old in journal.old_files:
+            if old.path in writes:
+                continue
+            try:
+                current = self._read_snapshot(anchor, old.path)
+            except ForgeException:
+                return False
+            if current.exists:
+                return False
+        manifest = writes[journal.manifest_path]
+        if manifest.digest != journal.new_manifest_digest:
+            return False
+        try:
+            manifest_snapshot = self._read_snapshot(anchor, journal.manifest_path)
+            assert manifest_snapshot.data is not None
+            parsed = parse_obsidian_manifest(manifest_snapshot.data)
+        except (AssertionError, ForgeException):
+            return False
+        return parsed.checksum == journal.new_manifest_checksum
+
+    def _recover_precommit_transaction(
+        self,
+        anchor: _VaultAnchor,
+        transaction: _Transaction,
+        stage_bytes: Mapping[str, bytes],
+    ) -> None:
+        journal = transaction.journal
+        assert journal is not None
+        self._reconcile_recovery_rollback_intents(anchor, transaction, stage_bytes)
+        old_by_path = {item.path: item for item in journal.old_files}
+        recoverable_paths = {item.path for item in transaction.backups}
+        for write in reversed(journal.writes):
+            current = self._read_snapshot(anchor, write.path)
+            old = old_by_path[write.path]
+            if self._snapshot_matches_write(current, write):
+                expected = stage_bytes.get(write.path)
+                if expected is None or current.data != expected:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                published = _PublishedFile(
+                    path=write.path,
+                    parent_path=write.path.rpartition("/")[0],
+                    name=write.path.rpartition("/")[2],
+                    parent_identity=write.parent_identity,
+                    identity=write.identity,
+                    digest=write.digest,
+                    size=write.size,
+                    data=expected,
+                    status=_PublishedStatus.PUBLISHED,
+                )
+                transaction.published.append(published)
+                removed = False
+                for _attempt in range(3):
+                    if self._remove_published(anchor, transaction, published):
+                        removed = True
+                        break
+                if not removed:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            elif not self._snapshot_matches_old(current, old) and not (
+                old.exists and not current.exists and old.path in recoverable_paths
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        backups_by_path = {item.path: item for item in transaction.backups}
+        for old in journal.old_files:
+            current = self._read_snapshot(anchor, old.path)
+            backup = backups_by_path.get(old.path)
+            if old.exists:
+                if self._snapshot_matches_old(current, old):
+                    if backup is not None:
+                        backup.status = _BackupStatus.RESTORED
+                        if not self._forget_moved(transaction, transaction.backup_fd, backup.name):
+                            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    else:
+                        self._forget_absent_backup_record(transaction, old.path)
+                    continue
+                if (
+                    current.exists
+                    or backup is None
+                    or not self._restore_backup(anchor, transaction, backup)
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            elif current.exists:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        for old in journal.old_files:
+            if not self._snapshot_matches_old(self._read_snapshot(anchor, old.path), old):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        old_manifest = old_by_path[journal.manifest_path]
+        manifest_snapshot = self._read_snapshot(anchor, journal.manifest_path)
+        if old_manifest.exists:
+            try:
+                assert manifest_snapshot.data is not None
+                parsed = parse_obsidian_manifest(manifest_snapshot.data)
+            except (AssertionError, ForgeException):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+            if parsed.checksum != journal.old_manifest_checksum:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        elif journal.old_manifest_checksum is not None or manifest_snapshot.exists:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        self._cleanup_failed(transaction)
+        if transaction.protected_entries or transaction.recoveries:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+    def _reconcile_recovery_rollback_intents(
+        self,
+        anchor: _VaultAnchor,
+        transaction: _Transaction,
+        stage_bytes: Mapping[str, bytes],
+    ) -> None:
+        journal = transaction.journal
+        assert journal is not None
+        writes = {item.path: item for item in journal.writes}
+        for (directory_fd, moved_name), recovery in tuple(transaction.recoveries.items()):
+            if directory_fd != transaction.fd:
+                continue
+            write = writes[recovery.original_path]
+            expected = stage_bytes[write.path]
+            current = self._read_snapshot(anchor, write.path)
+            if current.parent_identity != write.parent_identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            current_is_write = self._snapshot_matches_write(current, write)
+            if current_is_write and current.data != expected:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            try:
+                moved = self._snapshot_in_directory(transaction.fd, moved_name)
+            except FileNotFoundError:
+                moved = _FileSnapshot(False)
+            moved_is_write = self._snapshot_matches_write(moved, write, allow_missing_parent=True)
+            if moved.exists and (not moved_is_write or moved.data != expected):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            if current_is_write:
+                if moved.exists:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                if not self._forget_moved(transaction, transaction.fd, moved_name):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                continue
+            if current.exists:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            if not moved.exists:
+                if not self._forget_moved(transaction, transaction.fd, moved_name):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                continue
+            published = _PublishedFile(
+                path=write.path,
+                parent_path=write.path.rpartition("/")[0],
+                name=write.path.rpartition("/")[2],
+                parent_identity=write.parent_identity,
+                identity=write.identity,
+                digest=write.digest,
+                size=write.size,
+                data=expected,
+                status=_PublishedStatus.PUBLISHED,
+                rollback_name=moved_name,
+                rollback_status=_RollbackMoveStatus.MOVED,
+            )
+            parent = self._open_directory(anchor, published.parent_path, create=False)
+            if parent is None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            try:
+                if _identity(
+                    os.fstat(parent)
+                ) != write.parent_identity or not self._settle_published_move(
+                    transaction, published, parent
+                ):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            finally:
+                os.close(parent)
+
+    def _forget_absent_backup_record(self, transaction: _Transaction, path: str) -> None:
+        for (directory_fd, moved_name), recovery in tuple(transaction.recoveries.items()):
+            if recovery.original_path != path:
+                continue
+            if self._entry_exists(directory_fd, moved_name):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            if not self._forget_moved(transaction, directory_fd, moved_name):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+    def _recover_committed_transaction(self, transaction: _Transaction) -> None:
+        for (directory_fd, moved_name), _recovery in tuple(transaction.recoveries.items()):
+            if not self._entry_exists(directory_fd, moved_name) and not self._forget_moved(
+                transaction, directory_fd, moved_name
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        self._cleanup_committed(transaction)
+        if transaction.protected_entries or transaction.recoveries:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+    @staticmethod
+    def _snapshot_matches_old(
+        snapshot: _FileSnapshot,
+        old: _DurableOldFile,
+        *,
+        allow_missing_parent: bool = False,
+    ) -> bool:
+        if not old.exists:
+            return not snapshot.exists
+        return (
+            snapshot.exists
+            and (allow_missing_parent or snapshot.parent_identity == old.parent_identity)
+            and snapshot.identity == old.identity
+            and snapshot.size == old.size
+            and snapshot.digest == old.digest
+            and snapshot.data is not None
+        )
+
+    @staticmethod
+    def _snapshot_matches_write(
+        snapshot: _FileSnapshot,
+        write: _DurableWrite,
+        *,
+        allow_missing_parent: bool = False,
+    ) -> bool:
+        return (
+            snapshot.exists
+            and (allow_missing_parent or snapshot.parent_identity == write.parent_identity)
+            and snapshot.identity == write.identity
+            and snapshot.size == write.size
+            and snapshot.digest == write.digest
+            and snapshot.data is not None
+        )
+
+    @staticmethod
+    def _close_recovery_descriptors(transaction: _Transaction) -> None:
+        if transaction.closed:
+            return
+        transaction.closed = True
+        for descriptor in (
+            transaction.stage_fd,
+            transaction.backup_fd,
+            transaction.fd,
+            transaction.parent_fd,
+        ):
+            with suppress(OSError):
+                os.close(descriptor)
 
     @staticmethod
     def _manifest_path(book_key: str) -> str:
@@ -874,8 +1796,21 @@ class GuardedPublisher:
             os.mkdir("backup", mode=0o700, dir_fd=tx_fd)
             stage_fd = os.open("stage", _DIRECTORY_FLAGS, dir_fd=tx_fd)
             backup_fd = os.open("backup", _DIRECTORY_FLAGS, dir_fd=tx_fd)
+            stage_identity = _identity(os.fstat(stage_fd))
+            backup_identity = _identity(os.fstat(backup_fd))
             _fsync_directory(parent_fd)
-            return _Transaction(parent_fd, name, tx_fd, stage_fd, backup_fd, created)
+            assert tx_identity is not None
+            return _Transaction(
+                parent_fd,
+                name,
+                tx_fd,
+                stage_fd,
+                backup_fd,
+                tx_identity,
+                stage_identity,
+                backup_identity,
+                created,
+            )
         except BaseException as exc:
             for descriptor in (backup_fd, stage_fd):
                 if descriptor is not None:
@@ -940,6 +1875,108 @@ class GuardedPublisher:
                         os.close(descriptor)
         _fsync_directory(transaction.stage_fd)
 
+    def _prepare_durable_transaction(
+        self,
+        anchor: _VaultAnchor,
+        transaction: _Transaction,
+        snapshots: Mapping[str, _FileSnapshot],
+        mutation_paths: Iterable[str],
+        manifest_path: str,
+        previous: ObsidianBookManifest | None,
+        rendered: RenderedObsidianBook,
+    ) -> None:
+        old_files: list[_DurableOldFile] = []
+        for path in sorted(set(mutation_paths)):
+            snapshot = snapshots[path]
+            if snapshot.parent_identity is None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            old_files.append(
+                _DurableOldFile(
+                    path=path,
+                    exists=snapshot.exists,
+                    parent_identity=snapshot.parent_identity,
+                    identity=snapshot.identity,
+                    size=snapshot.size,
+                    digest=snapshot.digest,
+                )
+            )
+        writes: list[_DurableWrite] = []
+        for path, staged in sorted(transaction.staged.items()):
+            snapshot = snapshots[path]
+            if snapshot.parent_identity is None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            payload = transaction.expected_writes[path]
+            writes.append(
+                _DurableWrite(
+                    path=path,
+                    stage_name=staged.name,
+                    parent_identity=snapshot.parent_identity,
+                    identity=staged.identity,
+                    size=len(payload),
+                    digest=staged.digest,
+                )
+            )
+        manifest_write = next((item for item in writes if item.path == manifest_path), None)
+        if manifest_write is None:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        old_manifest = snapshots[manifest_path]
+        if old_manifest.exists != (previous is not None) or (
+            previous is not None and old_manifest.digest is None
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        transaction.journal = _TransactionJournal(
+            transaction_name=transaction.name,
+            vault_identity=anchor.identity,
+            transaction_identity=transaction.identity,
+            stage_identity=transaction.stage_identity,
+            backup_identity=transaction.backup_identity,
+            manifest_path=manifest_path,
+            old_manifest_checksum=None if previous is None else previous.checksum,
+            new_manifest_checksum=rendered.manifest.checksum,
+            old_manifest_digest=old_manifest.digest,
+            new_manifest_digest=manifest_write.digest,
+            old_files=tuple(old_files),
+            writes=tuple(writes),
+        )
+        self._persist_transaction_phase(transaction, _TransactionPhase.PREPARED)
+
+    def _persist_transaction_phase(
+        self, transaction: _Transaction, phase: _TransactionPhase
+    ) -> None:
+        journal = transaction.journal
+        if journal is None:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        phases = {
+            None: _TransactionPhase.PREPARED,
+            _TransactionPhase.PREPARED: _TransactionPhase.MANIFEST_PENDING,
+            _TransactionPhase.MANIFEST_PENDING: _TransactionPhase.COMMITTED,
+        }
+        if phases.get(transaction.phase) is not phase:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        record_name = _state_record_name(phase)
+        payload = _journal_bytes(journal, phase)
+        if len(payload) > _MAX_TRANSACTION_STATE_BYTES:
+            raise _error(ForgeErrorCode.PATH_NOT_ALLOWED)
+        descriptor: int | None = None
+        identity: _Identity | None = None
+        try:
+            descriptor = os.open(record_name, _WRITE_FLAGS, 0o600, dir_fd=transaction.fd)
+            identity = _identity(os.fstat(descriptor))
+            transaction.state_records[record_name] = identity
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("short transaction state write")
+                offset += written
+            _fsync_file(descriptor)
+            _fsync_directory(transaction.fd)
+            transaction.phase = phase
+        finally:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+
     def _require_snapshot(self, anchor: _VaultAnchor, path: str, expected: _FileSnapshot) -> None:
         current = self._read_snapshot(anchor, path)
         if (
@@ -973,6 +2010,7 @@ class GuardedPublisher:
                 self._backup(anchor, transaction, path, expected)
             if path == manifest_path:
                 self._verify_published_files(anchor, transaction)
+                self._persist_transaction_phase(transaction, _TransactionPhase.MANIFEST_PENDING)
             self._publish_stage(anchor, transaction, path, expected)
 
     def _backup(
@@ -1125,6 +2163,7 @@ class GuardedPublisher:
             )
             if not removed:
                 return False
+            _fsync_directory(transaction.fd)
             transaction.recoveries.pop(key, None)
         transaction.protected_entries.discard(key)
         return key not in transaction.recoveries and key not in transaction.protected_entries
@@ -1148,9 +2187,9 @@ class GuardedPublisher:
             return False
         if not restored:
             return False
-        self._forget_moved(transaction, directory_fd, moved_name)
         _fsync_directory(directory_fd)
         _fsync_directory(parent_fd)
+        self._forget_moved(transaction, directory_fd, moved_name)
         return True
 
     def _snapshot_in_directory(self, directory_fd: int, name: str) -> _FileSnapshot:
@@ -1239,8 +2278,6 @@ class GuardedPublisher:
             stage_status = os.stat(staged.name, dir_fd=transaction.stage_fd, follow_symlinks=False)
             if _identity(stage_status) != staged.identity:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            os.unlink(staged.name, dir_fd=transaction.stage_fd)
-            _fsync_directory(transaction.stage_fd)
             _fsync_directory(parent)
         except FileExistsError:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
@@ -1602,6 +2639,7 @@ class GuardedPublisher:
         ):
             return False
         os.unlink(rollback_name, dir_fd=transaction.fd)
+        _fsync_directory(transaction.fd)
         self._forget_moved(transaction, transaction.fd, rollback_name)
         return True
 
@@ -1643,13 +2681,14 @@ class GuardedPublisher:
                     visible.identity == backup.identity
                     and visible.digest == backup.digest
                     and visible.size == backup.size
+                    and visible.data == stored.data
                 )
                 if not restored:
                     self._unlink_named_identity(parent, name, backup.identity)
                     return False
                 backup.status = _BackupStatus.RESTORED
-                self._forget_moved(transaction, transaction.backup_fd, backup.name)
                 _fsync_directory(parent)
+                self._forget_moved(transaction, transaction.backup_fd, backup.name)
                 return True
             except FileExistsError:
                 return False
@@ -1669,9 +2708,11 @@ class GuardedPublisher:
 
     def _cleanup_committed(self, transaction: _Transaction) -> None:
         for staged in transaction.staged.values():
-            self._unlink_if_identity(
+            removed = self._unlink_if_identity(
                 transaction, transaction.stage_fd, staged.name, staged.identity
             )
+            if removed:
+                _fsync_directory(transaction.stage_fd)
         for backup in transaction.backups:
             removed = self._unlink_identity_without_protection(
                 transaction.backup_fd,
@@ -1679,6 +2720,7 @@ class GuardedPublisher:
                 backup.identity,
             )
             if removed:
+                _fsync_directory(transaction.backup_fd)
                 self._forget_moved(transaction, transaction.backup_fd, backup.name)
         _fsync_directory(transaction.stage_fd)
         _fsync_directory(transaction.backup_fd)
@@ -1734,20 +2776,30 @@ class GuardedPublisher:
         if transaction.closed:
             return
         pending_signal: BaseException | None = None
-        actions: tuple[Callable[[], None], ...] = (
-            lambda: os.close(transaction.stage_fd),
-            lambda: os.close(transaction.backup_fd),
-            lambda: os.rmdir("stage", dir_fd=transaction.fd),
-            lambda: os.rmdir("backup", dir_fd=transaction.fd),
-            lambda: os.close(transaction.fd),
-            lambda: os.rmdir(transaction.name, dir_fd=transaction.parent_fd),
-            lambda: os.close(transaction.parent_fd),
+        for name, identity in tuple(transaction.state_records.items()):
+            if self._unlink_if_identity(transaction, transaction.fd, name, identity):
+                transaction.state_records.pop(name, None)
+        if transaction.state_records:
+            return
+        _fsync_directory(transaction.fd)
+        actions: tuple[tuple[Callable[[], None], bool], ...] = (
+            (lambda: os.close(transaction.stage_fd), False),
+            (lambda: os.close(transaction.backup_fd), False),
+            (lambda: os.rmdir("stage", dir_fd=transaction.fd), False),
+            (lambda: os.rmdir("backup", dir_fd=transaction.fd), False),
+            (lambda: _fsync_directory(transaction.fd), True),
+            (lambda: os.close(transaction.fd), False),
+            (lambda: os.rmdir(transaction.name, dir_fd=transaction.parent_fd), False),
+            (lambda: _fsync_directory(transaction.parent_fd), True),
+            (lambda: os.close(transaction.parent_fd), False),
         )
-        for action in actions:
+        for action, durability_required in actions:
             for _attempt in range(2):
                 try:
                     action()
                 except OSError:
+                    if durability_required:
+                        raise
                     break
                 except BaseException as exc:
                     if pending_signal is None:

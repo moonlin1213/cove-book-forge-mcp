@@ -17,10 +17,8 @@ from cove_book_forge.providers.base import ModelProvider
 
 
 @dataclass
-class _LockEntry:
-    lock: asyncio.Lock
-    users: int = 0
-    completed_generations: int = 0
+class _InflightAttempt:
+    task: asyncio.Task[ChapterAnalysis]
 
 
 class ChapterAnalyzer:
@@ -37,7 +35,7 @@ class ChapterAnalyzer:
         self._cache = cache
         self._analysis_config = analysis_config
         self._model_config = model_config
-        self._lock_entries: dict[tuple[str, str, int, str], _LockEntry] = {}
+        self._lock_entries: dict[tuple[str, str, int, str], _InflightAttempt] = {}
         self._lock_entries_guard = asyncio.Lock()
 
     async def analyze(self, snapshot: ChapterSnapshot, *, force: bool = False) -> AnalyzedChapter:
@@ -61,28 +59,38 @@ class ChapterAnalyzer:
                     cache_hit=True,
                 )
 
-        entry, joined_generation = await self._reserve_lock(key)
-        try:
-            async with entry.lock:
-                if not force or entry.completed_generations > joined_generation:
-                    cached = self._cache.load_chapter_analysis(*key)
-                    if cached is not None:
-                        return AnalyzedChapter(
-                            analysis=cached,
-                            input_fingerprint=input_fingerprint,
-                            cache_hit=True,
-                        )
+        entry, started_attempt = await self._join_attempt(key, snapshot)
+        analysis = await asyncio.shield(entry.task)
+        return AnalyzedChapter(
+            analysis=analysis,
+            input_fingerprint=input_fingerprint,
+            cache_hit=not started_attempt,
+        )
 
-                analysis = await self._generate_valid_analysis(snapshot)
-                self._cache.store_chapter_analysis(*key, analysis)
-                entry.completed_generations += 1
-                return AnalyzedChapter(
-                    analysis=analysis,
-                    input_fingerprint=input_fingerprint,
-                    cache_hit=False,
-                )
-        finally:
-            await self._release_lock(key, entry)
+    async def _join_attempt(
+        self,
+        key: tuple[str, str, int, str],
+        snapshot: ChapterSnapshot,
+    ) -> tuple[_InflightAttempt, bool]:
+        async with self._lock_entries_guard:
+            existing = self._lock_entries.get(key)
+            if existing is not None and not existing.task.done():
+                return existing, False
+
+            task = asyncio.create_task(self._generate_and_store(snapshot, key))
+            entry = _InflightAttempt(task=task)
+            self._lock_entries[key] = entry
+            task.add_done_callback(lambda completed: self._on_attempt_done(key, entry, completed))
+            return entry, True
+
+    async def _generate_and_store(
+        self,
+        snapshot: ChapterSnapshot,
+        key: tuple[str, str, int, str],
+    ) -> ChapterAnalysis:
+        analysis = await self._generate_valid_analysis(snapshot)
+        self._cache.store_chapter_analysis(*key, analysis)
+        return analysis
 
     async def _generate_valid_analysis(self, snapshot: ChapterSnapshot) -> ChapterAnalysis:
         system_prompt, user_prompt = build_chapter_analysis_prompts(snapshot)
@@ -98,6 +106,11 @@ class ChapterAnalyzer:
             except ForgeException as exc:
                 if exc.code is not ForgeErrorCode.MODEL_OUTPUT_INVALID:
                     raise
+            except Exception:
+                raise ForgeException(
+                    ForgeErrorCode.MODEL_UNAVAILABLE,
+                    "Chapter analysis provider call failed.",
+                ) from None
             else:
                 try:
                     return ChapterAnalysis.model_validate_json(
@@ -113,21 +126,21 @@ class ChapterAnalyzer:
                 )
         raise AssertionError("bounded analysis attempts must return or raise")
 
-    async def _reserve_lock(self, key: tuple[str, str, int, str]) -> tuple[_LockEntry, int]:
-        async with self._lock_entries_guard:
-            entry = self._lock_entries.get(key)
-            if entry is None:
-                entry = _LockEntry(lock=asyncio.Lock())
-                self._lock_entries[key] = entry
-            entry.users += 1
-            return entry, entry.completed_generations
+    def _on_attempt_done(
+        self,
+        key: tuple[str, str, int, str],
+        entry: _InflightAttempt,
+        completed: asyncio.Task[ChapterAnalysis],
+    ) -> None:
+        if not completed.cancelled():
+            completed.exception()
+        asyncio.create_task(self._discard_finished_attempt(key, entry))
 
-    async def _release_lock(self, key: tuple[str, str, int, str], entry: _LockEntry) -> None:
+    async def _discard_finished_attempt(
+        self,
+        key: tuple[str, str, int, str],
+        entry: _InflightAttempt,
+    ) -> None:
         async with self._lock_entries_guard:
-            entry.users -= 1
-            if (
-                entry.users == 0
-                and not entry.lock.locked()
-                and self._lock_entries.get(key) is entry
-            ):
+            if self._lock_entries.get(key) is entry:
                 del self._lock_entries[key]

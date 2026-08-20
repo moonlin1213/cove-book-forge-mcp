@@ -395,13 +395,22 @@ async def test_analyze_non_output_provider_errors_propagate_without_repair(
 
 
 @pytest.mark.anyio
-async def test_analyze_does_not_treat_unexpected_provider_exception_as_repairable_output() -> None:
-    provider = FakeProvider([ValueError("provider implementation bug")])
+@pytest.mark.parametrize("exception_type", [ValueError, RuntimeError])
+async def test_analyze_sanitizes_unexpected_provider_exceptions_without_repair(
+    exception_type: type[Exception],
+) -> None:
+    private_error = "RAW_MODEL prompt=PRIVATE_PROMPT secret=PRIVATE_SECRET"
+    provider = FakeProvider([exception_type(private_error)])
     cache = FakeCache()
 
-    with pytest.raises(ValueError, match="provider implementation bug"):
-        await _analyzer(provider, cache).analyze(_snapshot())
+    with pytest.raises(ForgeException) as raised:
+        await _analyzer(provider, cache).analyze(_snapshot(content="PRIVATE SOURCE"))
 
+    assert raised.value.code is ForgeErrorCode.MODEL_UNAVAILABLE
+    assert str(raised.value) == "Model provider is unavailable."
+    assert raised.value.details == {}
+    assert private_error not in str(raised.value)
+    assert private_error not in str(raised.value.as_detail().model_dump(mode="json"))
     assert len(provider.calls) == 1
     assert cache.store_calls == 0
 
@@ -467,3 +476,172 @@ async def test_analyze_failure_removes_idle_singleflight_lock_and_later_call_ret
     assert retried.analysis.core_idea == "The central idea."
     assert len(provider.calls) == 2
     assert cache.store_calls == 1
+
+
+@pytest.mark.anyio
+async def test_analyze_non_force_failure_cohort_shares_one_closed_outcome() -> None:
+    provider = FakeProvider([ForgeException(ForgeErrorCode.MODEL_UNAVAILABLE, "private failure")])
+    provider.release = asyncio.Event()
+    cache = FakeCache()
+    analyzer = _analyzer(provider, cache)
+
+    tasks = [asyncio.create_task(analyzer.analyze(_snapshot())) for _ in range(3)]
+    await provider.started.wait()
+    await asyncio.sleep(0)
+    assert len(provider.calls) == 1
+    provider.release.set()
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert len(provider.calls) == 1
+    assert cache.store_calls == 0
+    assert all(
+        isinstance(outcome, ForgeException)
+        and outcome.code is ForgeErrorCode.MODEL_UNAVAILABLE
+        and str(outcome) == "Model provider is unavailable."
+        for outcome in outcomes
+    )
+
+
+@pytest.mark.anyio
+async def test_analyze_force_failure_cohort_shares_one_closed_outcome() -> None:
+    provider = FakeProvider([ForgeException(ForgeErrorCode.MODEL_UNAVAILABLE, "private failure")])
+    provider.release = asyncio.Event()
+    cache = FakeCache()
+    analyzer = _analyzer(provider, cache)
+
+    tasks = [asyncio.create_task(analyzer.analyze(_snapshot(), force=True)) for _ in range(3)]
+    await provider.started.wait()
+    await asyncio.sleep(0)
+    assert len(provider.calls) == 1
+    provider.release.set()
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert len(provider.calls) == 1
+    assert cache.store_calls == 0
+    assert all(
+        isinstance(outcome, ForgeException) and outcome.code is ForgeErrorCode.MODEL_UNAVAILABLE
+        for outcome in outcomes
+    )
+
+
+@pytest.mark.anyio
+async def test_analyze_mixed_force_failure_cohort_shares_one_closed_outcome() -> None:
+    provider = FakeProvider([ForgeException(ForgeErrorCode.MODEL_UNAVAILABLE, "private failure")])
+    provider.release = asyncio.Event()
+    cache = FakeCache()
+    analyzer = _analyzer(provider, cache)
+
+    tasks = [
+        asyncio.create_task(analyzer.analyze(_snapshot(), force=True)),
+        asyncio.create_task(analyzer.analyze(_snapshot())),
+        asyncio.create_task(analyzer.analyze(_snapshot(), force=True)),
+    ]
+    await provider.started.wait()
+    await asyncio.sleep(0)
+    assert len(provider.calls) == 1
+    provider.release.set()
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert len(provider.calls) == 1
+    assert cache.store_calls == 0
+    assert all(
+        isinstance(outcome, ForgeException) and outcome.code is ForgeErrorCode.MODEL_UNAVAILABLE
+        for outcome in outcomes
+    )
+
+
+@pytest.mark.anyio
+async def test_analyze_failure_cohort_can_retry_after_all_waiters_exit() -> None:
+    provider = FakeProvider(
+        [ForgeException(ForgeErrorCode.MODEL_UNAVAILABLE, "private failure"), _valid_value()]
+    )
+    provider.release = asyncio.Event()
+    cache = FakeCache()
+    analyzer = _analyzer(provider, cache)
+
+    tasks = [asyncio.create_task(analyzer.analyze(_snapshot())) for _ in range(3)]
+    await provider.started.wait()
+    provider.release.set()
+    first_outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    retried = await analyzer.analyze(_snapshot())
+
+    assert all(
+        isinstance(outcome, ForgeException) and outcome.code is ForgeErrorCode.MODEL_UNAVAILABLE
+        for outcome in first_outcomes
+    )
+    assert retried.analysis == ChapterAnalysis(core_idea="The central idea.")
+    assert retried.cache_hit is False
+    assert len(provider.calls) == 2
+    assert cache.store_calls == 1
+
+
+@pytest.mark.anyio
+async def test_analyze_cancelled_waiter_does_not_cancel_shared_attempt_or_leave_registry() -> None:
+    provider = FakeProvider([_valid_value()])
+    provider.release = asyncio.Event()
+    cache = FakeCache()
+    analyzer = _analyzer(provider, cache)
+
+    first = asyncio.create_task(analyzer.analyze(_snapshot()))
+    await provider.started.wait()
+    cancelled_waiter = asyncio.create_task(analyzer.analyze(_snapshot()))
+    await asyncio.sleep(0)
+    cancelled_waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled_waiter
+    provider.release.set()
+    completed = await first
+    await asyncio.sleep(0)
+
+    assert completed.analysis == ChapterAnalysis(core_idea="The central idea.")
+    assert len(provider.calls) == 1
+    assert cache.store_calls == 1
+    assert analyzer._lock_entries == {}  # noqa: SLF001 - lifecycle regression assertion
+
+
+@pytest.mark.anyio
+async def test_analyze_cancelled_initiator_keeps_shared_attempt_for_other_waiter() -> None:
+    provider = FakeProvider([_valid_value()])
+    provider.release = asyncio.Event()
+    cache = FakeCache()
+    analyzer = _analyzer(provider, cache)
+
+    initiating = asyncio.create_task(analyzer.analyze(_snapshot()))
+    await provider.started.wait()
+    joined_waiter = asyncio.create_task(analyzer.analyze(_snapshot()))
+    await asyncio.sleep(0)
+    initiating.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await initiating
+    provider.release.set()
+    completed = await joined_waiter
+    await asyncio.sleep(0)
+
+    assert completed.analysis == ChapterAnalysis(core_idea="The central idea.")
+    assert len(provider.calls) == 1
+    assert cache.store_calls == 1
+    assert analyzer._lock_entries == {}  # noqa: SLF001 - lifecycle regression assertion
+
+
+@pytest.mark.anyio
+async def test_analyze_cancelled_only_initiator_finishes_and_cleans_shared_attempt() -> None:
+    provider = FakeProvider([_valid_value()])
+    provider.release = asyncio.Event()
+    cache = FakeCache()
+    analyzer = _analyzer(provider, cache)
+
+    initiating = asyncio.create_task(analyzer.analyze(_snapshot()))
+    await provider.started.wait()
+    initiating.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await initiating
+    provider.release.set()
+    for _ in range(3):
+        await asyncio.sleep(0)
+    reused = await analyzer.analyze(_snapshot())
+
+    assert reused.analysis == ChapterAnalysis(core_idea="The central idea.")
+    assert reused.cache_hit is True
+    assert len(provider.calls) == 1
+    assert cache.store_calls == 1
+    assert analyzer._lock_entries == {}  # noqa: SLF001 - lifecycle regression assertion

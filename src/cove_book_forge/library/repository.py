@@ -72,11 +72,17 @@ def _invalid_cache_key() -> ForgeException:
     return ForgeException(ForgeErrorCode.CONFIG_INVALID, "Chapter analysis cache key is invalid.")
 
 
-def _invalid_cached_analysis(cause: BaseException) -> ForgeException:
+def _invalid_cached_analysis() -> ForgeException:
     return ForgeException(
         ForgeErrorCode.MODEL_OUTPUT_INVALID,
         "Stored chapter analysis is invalid.",
-        cause=cause,
+    )
+
+
+def _analysis_cache_storage_error() -> ForgeException:
+    return ForgeException(
+        ForgeErrorCode.OUTPUT_PERMISSION_DENIED,
+        "Library storage is unavailable.",
     )
 
 
@@ -156,12 +162,12 @@ class LibraryRepository:
                 return None
             try:
                 return ChapterAnalysis.model_validate(json.loads(str(row["analysis_json"])))
-            except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as exc:
-                raise _invalid_cached_analysis(exc) from exc
+            except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
+                raise _invalid_cached_analysis() from None
         except ForgeException:
             raise
-        except sqlite3.Error as exc:
-            raise _storage_error(exc) from exc
+        except sqlite3.Error:
+            raise _analysis_cache_storage_error() from None
 
     def store_chapter_analysis(
         self,
@@ -204,8 +210,8 @@ class LibraryRepository:
                 )
         except ForgeException:
             raise
-        except (sqlite3.Error, TypeError, ValueError) as exc:
-            raise _storage_error(exc) from exc
+        except (sqlite3.Error, TypeError, ValueError):
+            raise _analysis_cache_storage_error() from None
 
     def find_managed_book(
         self,

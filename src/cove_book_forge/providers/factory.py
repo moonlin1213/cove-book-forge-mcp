@@ -4,12 +4,12 @@ from collections.abc import Callable, Mapping
 from importlib import import_module
 from types import MappingProxyType
 from typing import TypeAlias, cast
-from urllib.parse import urlsplit
 
 from cove_book_forge.config.models import ModelConfig
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.providers.base import ModelProvider
 from cove_book_forge.providers.credentials import resolve_provider_credential
+from cove_book_forge.providers.routes import canonical_provider_route_identity
 from cove_book_forge.providers.transport import _RequestLimits
 
 ProviderFactory: TypeAlias = Callable[[ModelConfig, str | None], ModelProvider]
@@ -57,30 +57,12 @@ _BUILTIN_FACTORIES: Mapping[str, ProviderFactory] = MappingProxyType(
     }
 )
 
-_DEFAULT_ROUTES = {
-    "openai": "https://api.openai.com/v1",
-    "deepseek": "https://api.deepseek.com",
-    "anthropic": "https://api.anthropic.com",
-}
-
 
 def _route_identity(config: ModelConfig) -> tuple[object, ...]:
-    raw_route = (
-        str(config.base_url)
-        if config.base_url is not None
-        else _DEFAULT_ROUTES.get(config.provider, "")
-    )
-    parsed = urlsplit(raw_route)
-    route = (
-        parsed.scheme.lower(),
-        (parsed.hostname or "").lower(),
-        parsed.port,
-        parsed.path.rstrip("/"),
-    )
     protocol = "anthropic" if config.provider == "anthropic" else "openai-compatible"
     return (
         protocol,
-        route,
+        canonical_provider_route_identity(config),
         config.api_key_env,
         config.max_concurrency,
         config.requests_per_minute,

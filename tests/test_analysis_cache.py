@@ -1,4 +1,5 @@
 import json
+import traceback
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,18 @@ def _library(data_dir: Path, *, enabled: bool = False) -> BookLibrary:
 
 def _analysis(core_idea: str = "A validated insight.") -> ChapterAnalysis:
     return ChapterAnalysis(core_idea=core_idea, topic_tags=("cache",))
+
+
+def _assert_sealed_public_error(exc: ForgeException, sentinel: str) -> None:
+    rendered_traceback = "".join(traceback.format_exception(exc))
+
+    assert sentinel not in str(exc)
+    assert sentinel not in repr(exc)
+    assert sentinel not in repr(exc.details)
+    assert sentinel not in repr(exc.as_result())
+    assert sentinel not in rendered_traceback
+    assert exc.__cause__ is None
+    assert exc.__suppress_context__ is True
 
 
 def test_disabled_library_persists_and_reuses_a_validated_analysis_by_full_key(
@@ -56,8 +69,17 @@ def test_changed_fingerprint_replaces_one_chapter_cache_entry(tmp_path: Path) ->
     assert library.load_chapter_analysis("reader", "book-1", 0, new_fingerprint) == replacement
 
 
+@pytest.mark.parametrize(
+    "corrupt_analysis_json",
+    [
+        '{"core_idea":"PRIVATE_ROW_SENTINEL"',
+        '{"core_idea":["PRIVATE_ROW_SENTINEL"]}',
+    ],
+    ids=("json_decode", "pydantic_validation"),
+)
 def test_cache_storage_is_canonical_and_corruption_fails_closed_without_content(
     tmp_path: Path,
+    corrupt_analysis_json: str,
 ) -> None:
     """Removing strict stored-JSON validation must expose malformed rows as valid analyses."""
     library = _library(tmp_path / "cache")
@@ -76,7 +98,7 @@ def test_cache_storage_is_canonical_and_corruption_fails_closed_without_content(
         )
         connection.execute(
             "UPDATE chapter_analyses SET analysis_json = ?",
-            ('{"core_idea":"","private":"Private chapter content must not leak"}',),
+            (corrupt_analysis_json,),
         )
 
     with pytest.raises(ForgeException) as exc_info:
@@ -85,7 +107,7 @@ def test_cache_storage_is_canonical_and_corruption_fails_closed_without_content(
     assert exc_info.value.code is ForgeErrorCode.MODEL_OUTPUT_INVALID
     assert "core_idea" not in str(exc_info.value)
     assert "reader" not in str(exc_info.value)
-    assert "Private chapter content" not in str(exc_info.value)
+    _assert_sealed_public_error(exc_info.value, "PRIVATE_ROW_SENTINEL")
 
 
 def test_failed_cache_upsert_rolls_back_without_exposing_database_details(tmp_path: Path) -> None:
@@ -102,7 +124,7 @@ def test_failed_cache_upsert_rolls_back_without_exposing_database_details(tmp_pa
             CREATE TRIGGER fail_cache_update
             BEFORE UPDATE ON chapter_analyses
             BEGIN
-                SELECT RAISE(ABORT, 'private cache SQL detail');
+                SELECT PRIVATE_SQL_SENTINEL();
             END
             """
         )
@@ -117,7 +139,7 @@ def test_failed_cache_upsert_rolls_back_without_exposing_database_details(tmp_pa
         )
 
     assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
-    assert "private cache SQL detail" not in str(exc_info.value)
+    _assert_sealed_public_error(exc_info.value, "PRIVATE_SQL_SENTINEL")
     assert library.load_chapter_analysis("reader", "book-1", 0, old_fingerprint) == old_analysis
 
 

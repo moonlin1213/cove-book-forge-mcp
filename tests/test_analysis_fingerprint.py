@@ -247,6 +247,75 @@ def test_api_key_environment_name_never_affects_or_appears_in_canonical_payload(
     assert "A_DIFFERENT_KEY" not in serialized
 
 
+def test_opted_in_provider_route_excludes_url_credentials_query_and_fragment() -> None:
+    opted_in = AnalysisConfig(include_provider_in_fingerprint=True)
+    private_route = _model(
+        base_url=(
+            "https://PRIVATE_USER:PRIVATE_PASSWORD@Exämple.test:443/v1/"
+            "?PRIVATE_QUERY_SENTINEL#PRIVATE_FRAGMENT_SENTINEL"
+        )
+    )
+    equivalent_route = _model(
+        base_url=(
+            "https://OTHER_USER:OTHER_PASSWORD@xn--exmple-cua.test/v1?OTHER_QUERY#OTHER_FRAGMENT"
+        )
+    )
+
+    private_fingerprint = chapter_input_fingerprint(_snapshot(), opted_in, private_route)
+    serialized = json.dumps(
+        (
+            canonical_chapter_input_payload(_snapshot(), opted_in, private_route),
+            canonical_chapter_input_payload(_snapshot(), opted_in, equivalent_route),
+        ),
+        ensure_ascii=False,
+    )
+
+    assert private_fingerprint == chapter_input_fingerprint(_snapshot(), opted_in, equivalent_route)
+    for private_value in (
+        "PRIVATE_USER",
+        "PRIVATE_PASSWORD",
+        "PRIVATE_QUERY_SENTINEL",
+        "PRIVATE_FRAGMENT_SENTINEL",
+        "OTHER_USER",
+        "OTHER_PASSWORD",
+    ):
+        assert private_value not in serialized
+
+
+@pytest.mark.parametrize(
+    "changed_base_url",
+    [
+        "https://other.example.test/v1",
+        "https://models.example.test:8443/v1",
+        "https://models.example.test/v2",
+    ],
+    ids=("host", "explicit_nondefault_port", "path"),
+)
+def test_each_safe_provider_route_component_invalidates_an_opted_in_fingerprint(
+    changed_base_url: str,
+) -> None:
+    opted_in = AnalysisConfig(include_provider_in_fingerprint=True)
+
+    assert chapter_input_fingerprint(_snapshot(), opted_in, _model()) != chapter_input_fingerprint(
+        _snapshot(), opted_in, _model(base_url=changed_base_url)
+    )
+
+
+def test_provider_route_identity_normalizes_defaults_ipv6_and_empty_paths() -> None:
+    opted_in = AnalysisConfig(include_provider_in_fingerprint=True)
+
+    assert chapter_input_fingerprint(
+        _snapshot(), opted_in, _model(provider="openai", base_url=None)
+    ) == chapter_input_fingerprint(
+        _snapshot(), opted_in, _model(provider="openai", base_url="https://api.openai.com:443/v1/")
+    )
+    assert chapter_input_fingerprint(
+        _snapshot(), opted_in, _model(base_url="https://[2001:db8::1]:443")
+    ) == chapter_input_fingerprint(
+        _snapshot(), opted_in, _model(base_url="https://[2001:0db8:0:0:0:0:0:1]/")
+    )
+
+
 @pytest.mark.parametrize("field", ["highlights", "user_notes", "annotations", "reflections"])
 def test_each_supplemental_collection_invalidates_the_fingerprint_when_its_content_changes(
     field: str,

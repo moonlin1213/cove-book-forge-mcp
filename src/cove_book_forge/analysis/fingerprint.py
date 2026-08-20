@@ -8,6 +8,7 @@ from typing import Any
 from cove_book_forge.config.models import AnalysisConfig, ModelConfig
 from cove_book_forge.contracts.analysis import ChapterAnalysis
 from cove_book_forge.contracts.books import ChapterSnapshot
+from cove_book_forge.providers.routes import canonical_provider_route_identity
 
 
 def chapter_input_fingerprint(
@@ -37,9 +38,9 @@ def canonical_chapter_input_payload(
     }
     if analysis_config.include_provider_in_fingerprint:
         payload["provider"] = {
-            "base_url": str(model_config.base_url) if model_config.base_url is not None else None,
             "model": _normalize_text(model_config.model),
             "provider": _normalize_text(model_config.provider),
+            "route": canonical_provider_route_identity(model_config),
         }
     return payload
 

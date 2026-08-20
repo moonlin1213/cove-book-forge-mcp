@@ -3,6 +3,7 @@
 import re
 
 _FENCE_OPENING = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})")
+_TABLE_DELIMITER_CELL = re.compile(r":?-+:?")
 
 def split_chapter_content(content: str, max_characters: int) -> tuple[str, ...]:
     """Greedily pack whole Markdown blocks without truncating atomic blocks."""
@@ -54,7 +55,7 @@ def _blocks(content: str) -> tuple[tuple[str, bool], ...]:
         if _fence_marker(line) is not None:
             block, index = _fenced_block(lines, index)
             is_atomic = True
-        elif _is_table_line(line):
+        elif _is_table_start(lines, index):
             block, index = _table_block(lines, index)
             is_atomic = True
         elif line.lstrip().startswith("#"):
@@ -72,6 +73,8 @@ def _fence_marker(line: str) -> tuple[str, int] | None:
     if match is None:
         return None
     marker = match.group("marker")
+    if marker[0] == "`" and "`" in line[match.end() :].rstrip("\r\n"):
+        return None
     return marker[0], len(marker)
 
 
@@ -88,8 +91,8 @@ def _fenced_block(lines: list[str], index: int) -> tuple[str, int]:
 
 
 def _table_block(lines: list[str], index: int) -> tuple[str, int]:
-    end = index
-    while end < len(lines) and _is_table_line(lines[end]):
+    end = index + 2
+    while end < len(lines) and _is_table_row(lines[end]):
         end += 1
     return _with_trailing_blank_lines(lines, index, end)
 
@@ -101,7 +104,7 @@ def _heading_block(lines: list[str], index: int) -> tuple[str, int]:
 def _paragraph_block(lines: list[str], index: int) -> tuple[str, int]:
     end = index + 1
     while end < len(lines) and lines[end].strip():
-        if _fence_marker(lines[end]) is not None or _is_table_line(lines[end]):
+        if _fence_marker(lines[end]) is not None or _is_table_start(lines, end):
             break
         if lines[end].lstrip().startswith("#"):
             break
@@ -115,8 +118,31 @@ def _with_trailing_blank_lines(lines: list[str], start: int, end: int) -> tuple[
     return "".join(lines[start:end]), end
 
 
-def _is_table_line(line: str) -> bool:
-    return line.lstrip().startswith("|")
+def _is_table_start(lines: list[str], index: int) -> bool:
+    if index + 1 >= len(lines):
+        return False
+    header_cells = _table_cells(lines[index])
+    delimiter_cells = _table_cells(lines[index + 1])
+    return (
+        bool(header_cells)
+        and len(header_cells) == len(delimiter_cells)
+        and all(_TABLE_DELIMITER_CELL.fullmatch(cell) for cell in delimiter_cells)
+    )
+
+
+def _is_table_row(line: str) -> bool:
+    return bool(_table_cells(line))
+
+
+def _table_cells(line: str) -> tuple[str, ...]:
+    candidate = line.rstrip("\r\n").strip()
+    if candidate.startswith("|"):
+        candidate = candidate[1:]
+    if candidate.endswith("|"):
+        candidate = candidate[:-1]
+    if "|" not in candidate:
+        return ()
+    return tuple(cell.strip() for cell in candidate.split("|"))
 
 
 def _is_closing_fence(line: str, opener: tuple[str, int]) -> bool:

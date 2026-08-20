@@ -141,7 +141,14 @@ def test_equivalent_supplemental_ids_have_a_total_canonical_sort_order() -> None
         ]
     )
 
-    assert canonical_analysis_source_payload(first) == canonical_analysis_source_payload(reversed_items)
+    canonical_source = canonical_analysis_source_payload(first)
+
+    assert canonical_source == canonical_analysis_source_payload(reversed_items)
+    assert len(canonical_source["highlights"]) == 2
+    assert {item["text"] for item in canonical_source["highlights"]} == {
+        "first variant",
+        "second variant",
+    }
     assert chapter_input_fingerprint(first, AnalysisConfig(), _model()) == chapter_input_fingerprint(
         reversed_items, AnalysisConfig(), _model()
     )

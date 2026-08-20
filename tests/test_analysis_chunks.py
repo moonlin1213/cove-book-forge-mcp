@@ -84,3 +84,37 @@ def test_splitter_accepts_a_legally_indented_matching_fence_closer() -> None:
         "  ```python\n  inside\n  ```\n\n",
         "After",
     )
+
+
+def test_splitter_keeps_a_gfm_table_without_outer_pipes_atomic() -> None:
+    content = "Before\n\nName | Value\n--- | ---\na | 1\nb | 2\n\nAfter"
+
+    chunks = split_chapter_content(content, max_characters=16)
+
+    assert chunks == ("Before\n\n", "Name | Value\n--- | ---\na | 1\nb | 2\n\n", "After")
+    assert "".join(chunks) == content
+
+
+def test_splitter_does_not_treat_pipe_prefixed_non_table_text_as_atomic() -> None:
+    content = "| ordinary text"
+
+    chunks = split_chapter_content(content, max_characters=5)
+
+    assert chunks == ("| ord", "inary", " text")
+    assert "".join(chunks) == content
+    assert all(len(chunk) <= 5 for chunk in chunks)
+
+
+def test_splitter_treats_a_backtick_fence_with_a_backtick_info_string_as_plain_text() -> None:
+    content = "```python`invalid\nnormal text"
+
+    chunks = split_chapter_content(content, max_characters=7)
+
+    assert "".join(chunks) == content
+    assert all(len(chunk) <= 7 for chunk in chunks)
+
+
+def test_splitter_allows_backticks_in_a_tilde_fence_info_string() -> None:
+    content = "~~~python`allowed\ninside\n~~~"
+
+    assert split_chapter_content(content, max_characters=7) == (content,)

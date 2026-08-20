@@ -30,5 +30,12 @@
 - Added lossless long-chapter analysis: ordered content-only chunks preserve
   fenced code and Markdown tables, then exactly one validated merge combines the
   canonical chunk analyses with supplemental reader data. Only the final merged
-  analysis is cached; Obsidian/Agent Skill rendering, whole-book jobs, and MCP
-  transport remain future work.
+  analysis is cached.
+- Added guarded single-chapter Obsidian output with deterministic managed chapter
+  notes, stable concept/rule cards, aggregate book MOCs, checksummed manifests,
+  external-modification detection, unchanged no-rewrite publication, and
+  recoverable atomic bundle updates inside an explicitly authorized vault.
+- Extended `doctor` with a read-only, path-safe Obsidian readiness check that
+  reuses the publisher's narrow vault validation without rendering, staging, or
+  writing. Agent Skill output, whole-book jobs, and MCP tools/transports remain
+  future work; Cove will integrate later through the planned MCP boundary.

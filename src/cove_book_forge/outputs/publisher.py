@@ -213,6 +213,12 @@ class _VaultAnchor:
         self.close()
 
 
+def check_obsidian_output_readiness(config: ObsidianOutputConfig) -> None:
+    """Validate and close an enabled vault capability without creating output state."""
+    with _VaultAnchor.capture(config):
+        pass
+
+
 @dataclass(frozen=True)
 class _FileSnapshot:
     exists: bool

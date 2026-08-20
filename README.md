@@ -7,9 +7,10 @@ explicit model Provider adapters, and reusable structured chapter analysis.
 
 > **Status boundary:** standards-valid EPUB ingestion, text-layer PDF ingestion,
 > the optional SQLite library, external `ChapterSnapshot` caching, model Provider
-> adapters, and validated per-chapter analysis with persistent fingerprint reuse
-> are implemented. Forge/jobs, Obsidian output, Agent Skill generation or
-> installation, and MCP transport remain planned and are **not implemented**.
+> adapters, validated per-chapter analysis with persistent fingerprint reuse, and
+> guarded single-chapter Obsidian publication are implemented. Agent Skill
+> generation/installation, whole-book jobs, and MCP tools/transports remain
+> planned and are **not implemented**.
 
 This repository is independent of private Cove/栖渡 code and does not include an
 official reading UI.
@@ -164,9 +165,83 @@ analyzed = await analyzer.analyze(snapshot)
 print(analyzed.analysis.core_idea, analyzed.cache_hit)
 ```
 
-The same `analyzed.analysis` is intended to feed future Obsidian and Agent Skill
-renderers without re-analysis. Those renderers, output publication, whole-book
-job orchestration, and MCP endpoints are outside the currently implemented phase.
+The same `AnalyzedChapter` feeds the implemented Obsidian output without
+re-analysis and is the future input boundary for Agent Skill rendering. Agent
+Skill rendering, whole-book job orchestration, and MCP endpoints are outside the
+currently implemented phase.
+
+## Safe Obsidian output
+
+`ObsidianOutput` publishes one already analyzed chapter synchronously. The vault
+must already exist and be explicitly configured; disk roots, the home directory,
+the current working directory and its broad ancestors, symlinked paths, and
+unwritable locations fail closed. Publication does not call a Provider or repair
+an analysis.
+
+This application-layer function is a type-valid composition of the public async
+analysis boundary and synchronous output boundary:
+
+```python
+from cove_book_forge.analysis import ChapterAnalyzer
+from cove_book_forge.config import AppConfig
+from cove_book_forge.contracts import ChapterSnapshot, ObsidianPublishResult
+from cove_book_forge.library import BookLibrary
+from cove_book_forge.outputs import ObsidianOutput
+from cove_book_forge.providers import ModelProvider
+
+
+async def publish_chapter_to_obsidian(
+    provider: ModelProvider,
+    library: BookLibrary,
+    config: AppConfig,
+    snapshot: ChapterSnapshot,
+) -> ObsidianPublishResult:
+    analyzer = ChapterAnalyzer(provider, library, config.analysis, config.model)
+    analyzed = await analyzer.analyze(snapshot)
+    return ObsidianOutput(config.outputs.obsidian).publish(snapshot, analyzed)
+```
+
+A matching persistent input fingerprint makes `analyzer.analyze(...)` a
+zero-call cache hit, including after the application recreates its library,
+analyzer, and output services. Publishing the unchanged result performs no file
+rewrite. Provider/model/base identity is excluded from the fingerprint by
+default; set `analysis.include_provider_in_fingerprint: true` when an application
+requires provider changes to invalidate cached analysis.
+
+The deterministic managed layout is:
+
+```text
+<Vault>/
+├── Books/<safe book title>--<stable book key>/
+│   ├── <initial safe book title> MOC.md
+│   └── Chapters/<01-based index> <safe chapter title>.md
+├── Cards/<safe concept or rule title>--<stable card id>.md
+└── .cove-book-forge/obsidian/<stable book key>.json
+```
+
+The checksummed manifest preserves chapter coverage, index entries, cards,
+frameworks, and topics across separate chapter publications and process
+restarts. Human-facing title changes update managed display metadata while the
+physical book root and MOC path remain stable. The manifest stores controlled
+identities, summaries, relative paths, and hashes—not source chapter bodies,
+private notes, prompts, Provider responses, credentials, or absolute paths.
+
+Every managed Markdown file has fixed `cove_*` frontmatter, including its
+ownership identity and body hash. Cove Book Forge updates only files whose
+managed marker, identity, and recorded hash still match. Editing a managed note
+outside the application causes `EXTERNAL_MODIFICATION`; v0.1 does not merge
+arbitrary Markdown and has no overwrite flag. Keep personal prose in separate,
+non-managed notes and link to the generated material.
+
+Chapter notes, relevant concept/rule cards, the aggregate MOC, and manifest are
+staged and committed as one recoverable bundle, with the manifest last. A failed
+publication restores the last successful visible bundle when it can prove
+ownership and never adopts or deletes a competing file. Successful unchanged
+publication is a byte-for-byte no-op.
+
+The future Cove integration will call the planned MCP application boundary;
+this repository does not yet expose MCP tools or transports. It also does not
+generate or install Agent Skills and does not run whole-book jobs.
 
 ## Model Providers
 
@@ -268,15 +343,19 @@ application owns readiness checks for its explicitly registered custom Providers
 - Telemetry, cloud sync, remote logging, and hidden network fallbacks are
   disabled.
 - API-key values come from environment variables and are never stored in YAML.
-- Configured output roots require explicit authorization, although output
-  generation is not part of the implemented phase.
+- Configured output roots require explicit authorization. Obsidian publication
+  remains local and writes only its validated managed bundle beneath that vault.
 
 The `doctor` command is read-only and network-free. It checks configuration,
 built-in Provider/base readiness, required environment-variable presence,
-EPUB/PDF parser dependencies, configured library-directory readiness, and any
-existing `library.sqlite3` through a read-only SQLite integrity check. It never
-calls Provider generation or health-check APIs, and does not create directories,
-databases, journals, WAL files, temporary files, or migrations.
+EPUB/PDF parser dependencies, configured library-directory readiness, any
+existing `library.sqlite3` through a read-only SQLite integrity check, and the
+enabled Obsidian vault through the same narrow no-follow readiness boundary used
+by publication. It never renders or publishes output, calls Provider generation
+or health-check APIs, or creates directories, databases, journals, WAL files,
+temporary files, manifests, or migrations. Disabled Obsidian output is a
+non-failing warning; a configured missing, broad, linked, or unwritable vault is
+a safe path-free failure.
 
 ```bash
 uv sync --group dev

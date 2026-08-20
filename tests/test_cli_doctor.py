@@ -20,6 +20,9 @@ from cove_book_forge.doctor import CheckStatus, run_doctor
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.library import BookLibrary, LibraryDatabase
 from cove_book_forge.library import database as library_database
+from cove_book_forge.outputs import ObsidianOutput
+from cove_book_forge.outputs.obsidian_render import ObsidianRenderer
+from cove_book_forge.outputs.publisher import GuardedPublisher
 from cove_book_forge.providers.anthropic import AnthropicProvider
 from cove_book_forge.providers.factory import ProviderRegistry
 from cove_book_forge.providers.openai_compatible import OpenAICompatibleProvider
@@ -38,6 +41,32 @@ model:
   provider: openai-compatible
   model: test
   base_url: http://localhost:11434/v1
+""".strip(),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_obsidian_config(
+    path: Path,
+    data_dir: Path,
+    *,
+    enabled: bool,
+    vault_path: Path | None = None,
+) -> Path:
+    vault_line = f"\n    vault_path: {vault_path}" if vault_path is not None else ""
+    path.write_text(
+        f"""
+library:
+  enabled: false
+  data_dir: {data_dir}
+model:
+  provider: openai-compatible
+  model: local-model
+  base_url: http://localhost:11434/v1
+outputs:
+  obsidian:
+    enabled: {str(enabled).lower()}{vault_line}
 """.strip(),
         encoding="utf-8",
     )
@@ -202,6 +231,126 @@ outputs:
     assert _check(payload, "defusedxml")["status"] == "pass"
     assert _check(payload, "pypdf")["status"] == "pass"
     assert _check(payload, "library_database")["status"] == "pass"
+
+
+def test_doctor_reports_disabled_obsidian_output_as_non_blocking(tmp_path: Path) -> None:
+    """Omitting disabled output status would hide an intentional readiness boundary."""
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    config = _write_obsidian_config(
+        tmp_path / "config.yaml",
+        data_dir,
+        enabled=False,
+    )
+    before = _filesystem_metadata_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert _check(payload, "obsidian_output") == {
+        "name": "obsidian_output",
+        "status": "warn",
+        "message": "Obsidian output is disabled.",
+    }
+    assert _filesystem_metadata_snapshot(tmp_path) == before
+
+
+def test_doctor_checks_enabled_obsidian_vault_read_only_without_render_or_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calling the publisher would create managed directories during a readiness check."""
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    vault = tmp_path / "private-vault"
+    vault.mkdir()
+    existing = vault / "existing.md"
+    existing.write_bytes(b"existing user note")
+    config = _write_obsidian_config(
+        tmp_path / "config.yaml",
+        data_dir,
+        enabled=True,
+        vault_path=vault,
+    )
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("doctor must not render, stage, or publish")
+
+    monkeypatch.setattr(ObsidianOutput, "publish", forbidden)
+    monkeypatch.setattr(ObsidianRenderer, "render", forbidden)
+    monkeypatch.setattr(GuardedPublisher, "publish", forbidden)
+    before = _filesystem_snapshot(tmp_path)
+    before_metadata = _filesystem_metadata_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert _check(payload, "obsidian_output") == {
+        "name": "obsidian_output",
+        "status": "pass",
+        "message": "Obsidian output directory is ready.",
+    }
+    assert str(vault) not in result.stdout
+    assert _filesystem_snapshot(tmp_path) == before
+    assert _filesystem_metadata_snapshot(tmp_path) == before_metadata
+    assert not (vault / ".cove-book-forge").exists()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["missing", "file", "symlink", "root", "home", "cwd", "lexical-alias", "unwritable"],
+)
+def test_doctor_fails_unsafe_obsidian_vaults_without_writing_or_revealing_paths(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """Accepting a broad, linked, absent, or unwritable vault would overstate safe readiness."""
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    vault = tmp_path / f"private-{kind}-vault"
+    if kind == "file":
+        vault.write_bytes(b"not a directory")
+    elif kind == "symlink":
+        target = tmp_path / "private-real-vault"
+        target.mkdir()
+        vault.symlink_to(target, target_is_directory=True)
+    elif kind == "root":
+        vault = Path(vault.anchor)
+    elif kind == "home":
+        vault = Path.home()
+    elif kind == "cwd":
+        vault = Path.cwd()
+    elif kind == "lexical-alias":
+        real = tmp_path / "private-real-vault"
+        real.mkdir()
+        vault = real / ".." / real.name
+    elif kind == "unwritable":
+        vault.mkdir()
+        vault.chmod(0o500)
+    config = _write_obsidian_config(
+        tmp_path / "config.yaml",
+        data_dir,
+        enabled=True,
+        vault_path=vault,
+    )
+    before = _filesystem_snapshot(tmp_path)
+    before_metadata = _filesystem_metadata_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert _check(payload, "obsidian_output") == {
+        "name": "obsidian_output",
+        "status": "fail",
+        "message": "Obsidian output directory is not ready.",
+    }
+    if kind not in {"root", "home", "cwd"}:
+        assert str(vault) not in result.stdout
+    assert _filesystem_snapshot(tmp_path) == before
+    assert _filesystem_metadata_snapshot(tmp_path) == before_metadata
 
 
 def test_doctor_fails_when_an_ingestion_dependency_cannot_be_imported(

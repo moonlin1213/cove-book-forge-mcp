@@ -14,6 +14,7 @@ from cove_book_forge.config.paths import AuthorizedPathPolicy
 from cove_book_forge.errors import ForgeException
 from cove_book_forge.library.database import _inspect_library_schema, _LibrarySchemaReadiness
 from cove_book_forge.library.service import _validate_data_root
+from cove_book_forge.outputs.publisher import check_obsidian_output_readiness
 from cove_book_forge.providers import ProviderRegistry
 from cove_book_forge.providers.credentials import resolve_provider_credential
 
@@ -471,6 +472,29 @@ def _authorized_directory_check(name: str, path: Path) -> DoctorCheck:
     return DoctorCheck(name=name, status=CheckStatus.PASS, message="Directory is ready.")
 
 
+def _obsidian_output_check(config: AppConfig) -> DoctorCheck:
+    output_config = config.outputs.obsidian
+    if not output_config.enabled:
+        return DoctorCheck(
+            name="obsidian_output",
+            status=CheckStatus.WARN,
+            message="Obsidian output is disabled.",
+        )
+    try:
+        check_obsidian_output_readiness(output_config)
+    except ForgeException:
+        return DoctorCheck(
+            name="obsidian_output",
+            status=CheckStatus.FAIL,
+            message="Obsidian output directory is not ready.",
+        )
+    return DoctorCheck(
+        name="obsidian_output",
+        status=CheckStatus.PASS,
+        message="Obsidian output directory is ready.",
+    )
+
+
 def _checks_for_config(config: AppConfig) -> list[DoctorCheck]:
     checks = [
         DoctorCheck(
@@ -498,10 +522,7 @@ def _checks_for_config(config: AppConfig) -> list[DoctorCheck]:
         if directory_check.status is CheckStatus.FAIL
         else _database_check(data_path, enabled=config.library.enabled)
     )
-    if config.outputs.obsidian.enabled and config.outputs.obsidian.vault_path is not None:
-        checks.append(
-            _authorized_directory_check("obsidian_vault", config.outputs.obsidian.vault_path)
-        )
+    checks.append(_obsidian_output_check(config))
     if config.outputs.skills.enabled and config.outputs.skills.canonical_path is not None:
         checks.append(
             _authorized_directory_check("skill_root", config.outputs.skills.canonical_path)

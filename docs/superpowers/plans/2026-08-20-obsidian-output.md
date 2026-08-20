@@ -37,6 +37,7 @@ class ObsidianPublishResult(ContractModel):
     changed_paths: tuple[str, ...] = ()
     unchanged: bool = False
 
+
 class ObsidianOutput:
     def __init__(self, config: ObsidianOutputConfig) -> None: ...
 
@@ -56,6 +57,7 @@ class RenderedObsidianBook:
     chapter_path: str
     moc_path: str
     card_paths: tuple[str, ...]
+
 
 class ObsidianRenderer:
     def render(

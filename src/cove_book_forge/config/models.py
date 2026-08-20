@@ -1,7 +1,8 @@
+import unicodedata
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
 class ConfigModel(BaseModel):
@@ -46,6 +47,26 @@ class ObsidianOutputConfig(ConfigModel):
     vault_path: Path | None = None
     notes_folder: str = Field(default="Books", min_length=1, max_length=120)
     cards_folder: str = Field(default="Cards", min_length=1, max_length=120)
+
+    @field_validator("notes_folder", "cards_folder", mode="before")
+    @classmethod
+    def normalize_safe_relative_folder(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Obsidian folders must be strings")
+        normalized = unicodedata.normalize("NFC", value)
+        if not normalized or "\\" in normalized or normalized.startswith("/"):
+            raise ValueError("Obsidian folders must be safe relative POSIX paths")
+        components = normalized.split("/")
+        if any(
+            not component
+            or component in {".", ".."}
+            or component.strip() != component
+            or any(unicodedata.category(character).startswith("C") for character in component)
+            or any(character in ':*?"<>|' for character in component)
+            for component in components
+        ):
+            raise ValueError("Obsidian folders must be safe relative POSIX paths")
+        return "/".join(components)
 
     @model_validator(mode="after")
     def require_absolute_enabled_path(self) -> Self:

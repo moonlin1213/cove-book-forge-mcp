@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from cove_book_forge.config.loader import dump_config, load_config
-from cove_book_forge.config.models import AnalysisConfig, AppConfig
+from cove_book_forge.config.models import AnalysisConfig, AppConfig, ObsidianOutputConfig
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 
 
@@ -88,3 +88,26 @@ def test_analysis_config_accepts_its_inclusive_public_boundaries(config: Analysi
 def test_analysis_config_rejects_versions_longer_than_120_characters(field: str) -> None:
     with pytest.raises(ValidationError):
         AnalysisConfig.model_validate({field: "x" * 121})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        "/Books",
+        "Books/../private",
+        "Books//notes",
+        "Books\\notes",
+        "Books/./notes",
+        "Books/\x00notes",
+    ],
+)
+def test_obsidian_folders_reject_ambiguous_or_escaping_paths(value: str) -> None:
+    with pytest.raises(ValidationError):
+        ObsidianOutputConfig(notes_folder=value)
+
+
+def test_obsidian_folders_are_canonical_relative_posix_paths() -> None:
+    config = ObsidianOutputConfig(notes_folder="Bo\u0308cher/Notes", cards_folder="Cards/Atomic")
+    assert config.notes_folder == "B\u00f6cher/Notes"
+    assert config.cards_folder == "Cards/Atomic"

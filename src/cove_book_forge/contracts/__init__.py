@@ -28,6 +28,7 @@ from cove_book_forge.contracts.jobs import (
     ForgePlan,
     ForgeTarget,
 )
+from cove_book_forge.contracts.outputs import ObsidianPublishResult
 
 __all__ = [
     "AnalyzedChapter",
@@ -52,6 +53,7 @@ __all__ = [
     "ImportedBook",
     "ImportMode",
     "PdfProfile",
+    "ObsidianPublishResult",
     "Reflection",
     "StoredBook",
     "UserNote",

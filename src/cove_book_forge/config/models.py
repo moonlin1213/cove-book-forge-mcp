@@ -32,6 +32,15 @@ class ModelConfig(ConfigModel):
     default_max_output_tokens: int = Field(default=4_096, ge=1, le=131_072)
 
 
+class AnalysisConfig(ConfigModel):
+    prompt_template_version: str = Field(
+        default="chapter-analysis-v1", min_length=1, max_length=120
+    )
+    generator_version: str = Field(default="cove-analysis-v1", min_length=1, max_length=120)
+    max_chunk_characters: int = Field(default=24_000, ge=128, le=1_000_000)
+    include_provider_in_fingerprint: bool = False
+
+
 class ObsidianOutputConfig(ConfigModel):
     enabled: bool = False
     vault_path: Path | None = None
@@ -70,6 +79,7 @@ class FullBookForgeConfig(ConfigModel):
 class AppConfig(ConfigModel):
     library: LibraryConfig = Field(default_factory=LibraryConfig)
     model: ModelConfig
+    analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
     outputs: OutputsConfig = Field(default_factory=OutputsConfig)
     full_book_forge: FullBookForgeConfig = Field(default_factory=FullBookForgeConfig)
     telemetry_enabled: Literal[False] = False

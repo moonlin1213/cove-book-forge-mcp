@@ -1,3 +1,4 @@
+from cove_book_forge.contracts.analysis import AnalyzedChapter, ChapterAnalysis
 from cove_book_forge.contracts.base import ContractModel
 from cove_book_forge.contracts.books import (
     Annotation,
@@ -29,11 +30,13 @@ from cove_book_forge.contracts.jobs import (
 )
 
 __all__ = [
+    "AnalyzedChapter",
     "Annotation",
     "BookMetadata",
     "BookFormat",
     "BookRef",
     "ChapterContent",
+    "ChapterAnalysis",
     "ChapterSnapshot",
     "CostEstimate",
     "ContractModel",

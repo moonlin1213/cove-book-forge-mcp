@@ -1,9 +1,10 @@
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from cove_book_forge.config.loader import dump_config, load_config
-from cove_book_forge.config.models import AppConfig
+from cove_book_forge.config.models import AnalysisConfig, AppConfig
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 
 
@@ -47,5 +48,22 @@ def test_defaults_are_local_first_and_require_full_book_confirmation() -> None:
         {"model": {"provider": "openai-compatible", "model": "local-model"}}
     )
     assert config.library.enabled is True
+    assert config.analysis == AnalysisConfig()
     assert config.full_book_forge.require_preflight_confirmation is True
     assert config.telemetry_enabled is False
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("prompt_template_version", ""),
+        ("generator_version", ""),
+        ("max_chunk_characters", 127),
+        ("max_chunk_characters", 1_000_001),
+    ],
+)
+def test_analysis_config_rejects_values_outside_its_public_contract(
+    field: str, value: str | int
+) -> None:
+    with pytest.raises(ValidationError):
+        AnalysisConfig.model_validate({field: value})

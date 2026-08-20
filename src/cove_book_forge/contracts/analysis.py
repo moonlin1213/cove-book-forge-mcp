@@ -1,4 +1,4 @@
-from pydantic import Field
+from pydantic import ConfigDict, Field
 
 from cove_book_forge.contracts.base import ContractModel
 
@@ -74,3 +74,11 @@ class ChapterAnalysis(ContractModel):
     topic_tags: tuple[str, ...] = ()
     evidence_refs: tuple[EvidenceRef, ...] = ()
     quality_warnings: tuple[QualityWarning, ...] = ()
+
+
+class AnalyzedChapter(ContractModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    analysis: ChapterAnalysis
+    input_fingerprint: str
+    cache_hit: bool

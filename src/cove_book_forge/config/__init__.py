@@ -6,6 +6,7 @@ from cove_book_forge.config.loader import (
     load_config,
 )
 from cove_book_forge.config.models import (
+    AnalysisConfig,
     AppConfig,
     FullBookForgeConfig,
     LibraryConfig,
@@ -17,6 +18,7 @@ from cove_book_forge.config.models import (
 from cove_book_forge.config.paths import AuthorizedPathPolicy
 
 __all__ = [
+    "AnalysisConfig",
     "AppConfig",
     "AuthorizedPathPolicy",
     "FullBookForgeConfig",

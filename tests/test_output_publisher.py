@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import stat
+import subprocess
+import sys
 import traceback
 from pathlib import Path
 
@@ -81,6 +85,18 @@ def test_broad_vault_roots_are_rejected_without_writes(broad: Path) -> None:
     _assert_safe(raised.value, broad)
 
 
+def test_broad_root_policy_is_enforced_by_opened_directory_identity(monkeypatch) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    monkeypatch.setattr(publisher_module, "_is_broad", lambda _path: False)
+    broad = Path.cwd()
+
+    with pytest.raises(ForgeException) as raised:
+        _publisher(broad).publish(lambda _previous: pytest.fail("renderer must not run"))
+
+    assert raised.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+
+
 def test_unwritable_vault_is_a_fixed_permission_error(tmp_path: Path) -> None:
     vault = tmp_path / "vault"
     vault.mkdir(mode=0o500)
@@ -91,6 +107,36 @@ def test_unwritable_vault_is_a_fixed_permission_error(tmp_path: Path) -> None:
         vault.chmod(0o700)
 
     assert raised.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    _assert_safe(raised.value, vault)
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "card"),
+    [
+        ("_MAX_CANDIDATE_COUNT", 2, False),
+        ("_MAX_TOTAL_TRANSACTION_BYTES", 1, False),
+        ("_MAX_MANAGED_CHAPTERS", 0, False),
+        ("_MAX_MANAGED_CARDS", 0, True),
+    ],
+)
+def test_publication_budgets_fail_closed_before_filesystem_mutation(
+    tmp_path: Path,
+    monkeypatch,
+    limit_name: str,
+    limit_value: int,
+    card: bool,
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setattr(publisher_module, limit_name, limit_value, raising=False)
+
+    with pytest.raises(ForgeException) as raised:
+        _publish(vault, _analyzed(card=card))
+
+    assert raised.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert list(vault.iterdir()) == []
     _assert_safe(raised.value, vault)
 
 
@@ -116,6 +162,157 @@ def test_transaction_setup_failure_removes_only_owned_empty_directories(
     assert raised.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
     assert list(vault.iterdir()) == []
     _assert_safe(raised.value, vault)
+
+
+def test_transaction_open_failure_removes_the_owned_empty_transaction_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    real_open = publisher_module.os.open
+
+    def fail_transaction_open(path, flags, mode=0o777, *, dir_fd=None):
+        if isinstance(path, str) and path.startswith("tx-"):
+            raise OSError("PRIVATE-TX-OPEN")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(publisher_module.os, "open", fail_transaction_open)
+
+    with pytest.raises(ForgeException) as raised:
+        _publish(vault, _analyzed())
+
+    assert raised.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert list(vault.iterdir()) == []
+    _assert_safe(raised.value, vault)
+
+
+@pytest.mark.parametrize(
+    ("phase", "signal"),
+    [
+        ("setup", KeyboardInterrupt("setup signal")),
+        ("stage", SystemExit("stage signal")),
+        ("commit", asyncio.CancelledError("commit cancellation")),
+    ],
+)
+def test_non_exception_signals_are_cleaned_up_and_re_raised_exactly(
+    tmp_path: Path,
+    monkeypatch,
+    phase: str,
+    signal: BaseException,
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    if phase == "setup":
+        real_mkdir = publisher_module.os.mkdir
+
+        def interrupt_setup(path, *args, **kwargs):
+            if path == "stage":
+                raise signal
+            return real_mkdir(path, *args, **kwargs)
+
+        monkeypatch.setattr(publisher_module.os, "mkdir", interrupt_setup)
+    elif phase == "stage":
+        monkeypatch.setattr(
+            publisher_module.os, "write", lambda *_args, **_kwargs: (_ for _ in ()).throw(signal)
+        )
+    else:
+        monkeypatch.setattr(
+            publisher_module.os, "link", lambda *_args, **_kwargs: (_ for _ in ()).throw(signal)
+        )
+
+    with pytest.raises(type(signal)) as raised:
+        _publish(vault, _analyzed())
+
+    assert raised.value is signal
+    assert list(vault.iterdir()) == []
+
+
+@pytest.mark.parametrize("rollback_hook", ["remove", "restore"])
+def test_rollback_signal_finishes_recovery_before_exact_re_raise(
+    tmp_path: Path, monkeypatch, rollback_hook: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    before = _visible(vault)
+    signal = KeyboardInterrupt(f"rollback {rollback_hook} signal")
+    real_link = publisher_module.os.link
+    manifest_failed = False
+
+    def fail_manifest_link(src, dst, **kwargs):
+        nonlocal manifest_failed
+        if not manifest_failed and isinstance(dst, str) and dst.endswith(".json"):
+            manifest_failed = True
+            raise OSError("PRIVATE-MANIFEST-FAILURE")
+        return real_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(publisher_module.os, "link", fail_manifest_link)
+    method_name = "_remove_published" if rollback_hook == "remove" else "_restore_backup"
+    original = getattr(publisher_module.GuardedPublisher, method_name)
+    fired = False
+
+    def interrupt_after_recovery(self, *args, **kwargs):
+        nonlocal fired
+        result = original(self, *args, **kwargs)
+        if not fired:
+            fired = True
+            raise signal
+        return result
+
+    monkeypatch.setattr(publisher_module.GuardedPublisher, method_name, interrupt_after_recovery)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value is signal
+    assert fired
+    assert _visible(vault) == before
+    _assert_no_transactions(vault)
+
+
+def test_directory_child_fd_closes_when_post_open_validation_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    (vault / "existing").mkdir()
+    anchor = publisher_module._VaultAnchor.capture(
+        ObsidianOutputConfig(enabled=True, vault_path=vault)
+    )
+    real_open = publisher_module.os.open
+    real_stat = publisher_module.os.stat
+    opened_child: list[int] = []
+
+    def record_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        if path == "existing":
+            opened_child.append(descriptor)
+        return descriptor
+
+    def fail_post_open_stat(path, *, dir_fd=None, follow_symlinks=True):
+        if path == "existing":
+            raise OSError("PRIVATE-POST-OPEN")
+        return real_stat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(publisher_module.os, "open", record_open)
+    monkeypatch.setattr(publisher_module.os, "stat", fail_post_open_stat)
+    try:
+        with pytest.raises((ForgeException, OSError)):
+            _publisher(vault)._open_directory(anchor, "existing", create=False)
+    finally:
+        anchor.close()
+
+    assert len(opened_child) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened_child[0])
 
 
 def test_staged_bytes_are_verified_before_any_visible_mutation(tmp_path: Path, monkeypatch) -> None:
@@ -144,6 +341,128 @@ def test_staged_bytes_are_verified_before_any_visible_mutation(tmp_path: Path, m
     assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
     assert _visible(vault) == before
     assert (vault / first.rendered.chapter_path).is_file()
+
+
+def test_stage_inode_is_revalidated_immediately_before_each_publish(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    before = _visible(vault)
+    real_publish = publisher_module.GuardedPublisher._publish_stage
+    fired = False
+
+    def mutate_stage_then_publish(self, anchor, transaction, path, expected):
+        nonlocal fired
+        if not fired and path == first.rendered.chapter_path:
+            fired = True
+            staged = transaction.staged[path]
+            read_fd = os.open(staged.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=transaction.stage_fd)
+            try:
+                payload = os.read(read_fd, 32 * 1024 * 1024)
+            finally:
+                os.close(read_fd)
+            write_fd = os.open(
+                staged.name, os.O_WRONLY | os.O_NOFOLLOW, dir_fd=transaction.stage_fd
+            )
+            try:
+                os.write(write_fd, bytes([payload[0] ^ 1]) + payload[1:])
+                os.fsync(write_fd)
+            finally:
+                os.close(write_fd)
+        return real_publish(self, anchor, transaction, path, expected)
+
+    monkeypatch.setattr(
+        publisher_module.GuardedPublisher, "_publish_stage", mutate_stage_then_publish
+    )
+
+    with pytest.raises(ForgeException) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
+    assert _visible(vault) == before
+
+
+def test_manifest_linearization_revalidates_every_published_non_manifest_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    chapter = vault / first.rendered.chapter_path
+    old_chapter = chapter.read_bytes()
+    competitor = b"competitor after chapter publication"
+    real_publish = publisher_module.GuardedPublisher._publish_stage
+    fired = False
+
+    def replace_published_chapter(self, anchor, transaction, path, expected):
+        nonlocal fired
+        result = real_publish(self, anchor, transaction, path, expected)
+        if not fired and path == first.rendered.chapter_path:
+            fired = True
+            chapter.unlink()
+            chapter.write_bytes(competitor)
+        return result
+
+    monkeypatch.setattr(
+        publisher_module.GuardedPublisher, "_publish_stage", replace_published_chapter
+    )
+
+    with pytest.raises(ForgeException) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
+    assert chapter.read_bytes() == competitor
+    backups = (vault / ".cove-book-forge" / ".transactions").rglob("backup/*")
+    assert any(path.read_bytes() == old_chapter for path in backups)
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink", "fifo"])
+def test_rollback_restores_unexpected_object_without_following_or_deleting_it(
+    tmp_path: Path, monkeypatch, kind: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    chapter = vault / first.rendered.chapter_path
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside")
+    real_publish = publisher_module.GuardedPublisher._publish_stage
+    fired = False
+
+    def replace_after_publish(self, anchor, transaction, path, expected):
+        nonlocal fired
+        result = real_publish(self, anchor, transaction, path, expected)
+        if not fired and path == first.rendered.chapter_path:
+            fired = True
+            chapter.unlink()
+            if kind == "directory":
+                chapter.mkdir()
+                (chapter / "marker").write_bytes(b"rollback directory")
+            elif kind == "symlink":
+                chapter.symlink_to(outside)
+            else:
+                os.mkfifo(chapter)
+        return result
+
+    monkeypatch.setattr(publisher_module.GuardedPublisher, "_publish_stage", replace_after_publish)
+
+    with pytest.raises(ForgeException):
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    if kind == "directory":
+        assert (chapter / "marker").read_bytes() == b"rollback directory"
+    elif kind == "symlink":
+        assert chapter.is_symlink() and chapter.readlink() == outside
+    else:
+        assert stat.S_ISFIFO(chapter.stat(follow_symlinks=False).st_mode)
 
 
 @pytest.mark.parametrize("unsafe", ["parent_symlink", "target_symlink", "target_directory"])
@@ -301,6 +620,160 @@ def test_competitor_replacement_before_backup_is_preserved(tmp_path: Path, monke
     _assert_safe(raised.value, vault)
 
 
+def test_backup_rename_success_followed_by_an_error_does_not_lose_the_old_file(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    before = _visible(vault)
+    chapter = vault / first.rendered.chapter_path
+    real_rename = publisher_module.os.rename
+    fired = False
+
+    def rename_then_fail(src, dst, **kwargs):
+        nonlocal fired
+        result = real_rename(src, dst, **kwargs)
+        if not fired and src == chapter.name:
+            fired = True
+            raise OSError("PRIVATE-POST-BACKUP-RENAME")
+        return result
+
+    monkeypatch.setattr(publisher_module.os, "rename", rename_then_fail)
+
+    with pytest.raises(ForgeException):
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert fired
+    assert _visible(vault) == before
+    _assert_no_transactions(vault)
+
+
+def test_rollback_rename_success_followed_by_an_error_still_restores_old_bundle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    before = _visible(vault)
+    real_link = publisher_module.os.link
+    real_rename = publisher_module.os.rename
+    manifest_failed = False
+    rollback_failed = False
+
+    def fail_manifest_once(src, dst, **kwargs):
+        nonlocal manifest_failed
+        if not manifest_failed and isinstance(dst, str) and dst.endswith(".json"):
+            manifest_failed = True
+            raise OSError("PRIVATE-MANIFEST-FAILURE")
+        return real_link(src, dst, **kwargs)
+
+    def rollback_rename_then_fail(src, dst, **kwargs):
+        nonlocal rollback_failed
+        result = real_rename(src, dst, **kwargs)
+        if not rollback_failed and isinstance(dst, str) and dst.startswith("r"):
+            rollback_failed = True
+            raise OSError("PRIVATE-POST-ROLLBACK-RENAME")
+        return result
+
+    monkeypatch.setattr(publisher_module.os, "link", fail_manifest_once)
+    monkeypatch.setattr(publisher_module.os, "rename", rollback_rename_then_fail)
+
+    with pytest.raises(ForgeException):
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert manifest_failed and rollback_failed
+    assert _visible(vault) == before
+    _assert_no_transactions(vault)
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink", "fifo"])
+def test_unexpected_object_moved_during_backup_is_restored_without_following_it(
+    tmp_path: Path, monkeypatch, kind: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    chapter = vault / first.rendered.chapter_path
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"outside remains untouched")
+    real_rename = publisher_module.os.rename
+    fired = False
+
+    def replace_then_rename(src, dst, **kwargs):
+        nonlocal fired
+        if not fired and src == chapter.name:
+            fired = True
+            chapter.unlink()
+            if kind == "directory":
+                chapter.mkdir()
+                (chapter / "marker").write_bytes(b"directory competitor")
+            elif kind == "symlink":
+                chapter.symlink_to(outside)
+            else:
+                os.mkfifo(chapter)
+        return real_rename(src, dst, **kwargs)
+
+    monkeypatch.setattr(publisher_module.os, "rename", replace_then_rename)
+
+    with pytest.raises(ForgeException) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
+    if kind == "directory":
+        assert chapter.is_dir()
+        assert (chapter / "marker").read_bytes() == b"directory competitor"
+    elif kind == "symlink":
+        assert chapter.is_symlink()
+        assert chapter.readlink() == outside
+        assert outside.read_bytes() == b"outside remains untouched"
+    else:
+        assert stat.S_ISFIFO(chapter.stat(follow_symlinks=False).st_mode)
+
+
+def test_transaction_fifo_read_is_nonblocking_and_fails_closed(tmp_path: Path) -> None:
+    directory = tmp_path / "transaction"
+    directory.mkdir()
+    os.mkfifo(directory / "candidate")
+    script = """
+import os
+from pathlib import Path
+from cove_book_forge.config import ObsidianOutputConfig
+from cove_book_forge.errors import ForgeException
+from cove_book_forge.outputs.publisher import GuardedPublisher
+
+root = Path(os.environ["COVE_FIFO_TEST_DIR"])
+directory_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    try:
+        GuardedPublisher(ObsidianOutputConfig())._snapshot_in_directory(
+            directory_fd, "candidate"
+        )
+    except ForgeException:
+        raise SystemExit(0)
+    raise SystemExit(3)
+finally:
+    os.close(directory_fd)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        env={**os.environ, "COVE_FIFO_TEST_DIR": str(directory)},
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_competitor_creation_before_publish_is_never_overwritten_or_deleted(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -340,6 +813,19 @@ def test_competitor_creation_before_publish_is_never_overwritten_or_deleted(
     assert chapter.read_bytes() == competitor
     backups = list((vault / ".cove-book-forge" / ".transactions").rglob("backup/*"))
     assert any(path.read_bytes() != competitor for path in backups)
+    recovery_records = list((vault / ".cove-book-forge" / ".transactions").rglob("recovery-*.json"))
+    assert len(recovery_records) == 1
+    recovery = json.loads(recovery_records[0].read_bytes())
+    assert recovery == {
+        "container": "backup",
+        "moved_name": recovery["moved_name"],
+        "original_path": first.rendered.chapter_path,
+        "recovery_id": recovery_records[0].stem.removeprefix("recovery-"),
+        "schema": 1,
+    }
+    assert recovery["moved_name"].startswith("b")
+    assert (recovery_records[0].parent / "backup" / recovery["moved_name"]).is_file()
+    assert str(vault) not in recovery_records[0].read_text()
     _assert_safe(raised.value, vault)
 
 

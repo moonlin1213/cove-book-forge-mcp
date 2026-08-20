@@ -177,3 +177,28 @@ def test_source_never_selects_a_path_outside_the_renderer_contract(tmp_path: Pat
 
     assert all(".." not in path.split("/") for path in result.changed_paths)
     assert not outside.exists()
+
+
+def test_renderer_exception_is_mapped_to_a_fixed_safe_public_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    output = _output(vault)
+    sentinel = "PRIVATE-LONG-TITLE-" + "x" * 200
+    snapshot = _snapshot(title=sentinel)
+
+    def fail_render(*_args, **_kwargs):
+        raise ValueError(f"{sentinel} {vault} traceback sentinel")
+
+    monkeypatch.setattr(output._renderer, "render", fail_render)
+
+    with pytest.raises(ForgeException) as raised:
+        output.publish(snapshot, _analyzed())
+
+    assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
+    surface = repr(raised.value) + str(raised.value) + json.dumps(raised.value.as_result())
+    assert sentinel not in surface
+    assert str(vault) not in surface
+    assert "traceback sentinel" not in surface
+    assert raised.value.__cause__ is None

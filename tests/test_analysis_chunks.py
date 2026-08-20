@@ -118,3 +118,23 @@ def test_splitter_allows_backticks_in_a_tilde_fence_info_string() -> None:
     content = "~~~python`allowed\ninside\n~~~"
 
     assert split_chapter_content(content, max_characters=7) == (content,)
+
+
+def test_splitter_keeps_an_escaped_pipe_gfm_table_atomic() -> None:
+    table = "Name \\| Alias | Value\n--- | ---\nAlice \\| A | 1\n"
+    content = f"Before\n\n{table}\nAfter"
+
+    chunks = split_chapter_content(content, max_characters=18)
+
+    assert chunks == ("Before\n\n", f"{table}\n", "After")
+    assert "".join(chunks) == content
+
+
+def test_splitter_keeps_an_outer_pipe_single_column_gfm_table_atomic() -> None:
+    table = "| Name |\n| --- |\n| Alice |\n"
+    content = f"Before\n\n{table}\nAfter"
+
+    chunks = split_chapter_content(content, max_characters=12)
+
+    assert chunks == ("Before\n\n", f"{table}\n", "After")
+    assert "".join(chunks) == content

@@ -136,13 +136,40 @@ def _is_table_row(line: str) -> bool:
 
 def _table_cells(line: str) -> tuple[str, ...]:
     candidate = line.rstrip("\r\n").strip()
-    if candidate.startswith("|"):
-        candidate = candidate[1:]
-    if candidate.endswith("|"):
-        candidate = candidate[:-1]
-    if "|" not in candidate:
+    separators = _structural_pipe_positions(candidate)
+    if not separators:
         return ()
-    return tuple(cell.strip() for cell in candidate.split("|"))
+
+    start = 1 if separators[0] == 0 else 0
+    end = len(candidate) - 1 if separators[-1] == len(candidate) - 1 else len(candidate)
+    if start > end:
+        return ()
+
+    cells: list[str] = []
+    cell_start = start
+    for separator in separators:
+        if start <= separator < end:
+            cells.append(candidate[cell_start:separator].strip())
+            cell_start = separator + 1
+    cells.append(candidate[cell_start:end].strip())
+    return tuple(cells)
+
+
+def _structural_pipe_positions(value: str) -> tuple[int, ...]:
+    return tuple(
+        index
+        for index, character in enumerate(value)
+        if character == "|" and _preceding_backslash_count(value, index) % 2 == 0
+    )
+
+
+def _preceding_backslash_count(value: str, index: int) -> int:
+    count = 0
+    cursor = index - 1
+    while cursor >= 0 and value[cursor] == "\\":
+        count += 1
+        cursor -= 1
+    return count
 
 
 def _is_closing_fence(line: str, opener: tuple[str, int]) -> bool:

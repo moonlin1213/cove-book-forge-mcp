@@ -34,15 +34,19 @@ def validate_component(value: str, *, max_bytes: int = MAX_COMPONENT_BYTES) -> s
     return normalized
 
 
+def has_reserved_stem(component: str) -> bool:
+    """Return whether a portable Windows device-name stem is present."""
+    return component.split(".", 1)[0].casefold() in _RESERVED
+
+
 def _validate_component(component: str, *, max_bytes: int = MAX_COMPONENT_BYTES) -> None:
-    stem = component.split(".", 1)[0].casefold()
     if (
         not component
         or component in {".", ".."}
         or component.strip() != component
         or component.endswith((".", " "))
         or len(component.encode("utf-8")) > max_bytes
-        or stem in _RESERVED
+        or has_reserved_stem(component)
         or any(unicodedata.category(character).startswith("C") for character in component)
         or any(character in ':*?"<>|' for character in component)
     ):

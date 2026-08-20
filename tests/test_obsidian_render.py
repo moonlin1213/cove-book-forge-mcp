@@ -418,3 +418,68 @@ def test_unicode_display_names_and_relative_paths_stay_inside_byte_budgets() -> 
         for path in rendered.files
         for component in path.split("/")
     )
+
+
+def test_untrusted_fields_neutralize_generic_schemes_and_email_linkifiers() -> None:
+    snapshot = _snapshot(
+        title="ftp://host file://private mailto:me@example.com vscode:open data:text/plain,x"
+    )
+    analyzed = _analyzed().model_copy(
+        update={
+            "analysis": _analyzed().analysis.model_copy(
+                update={
+                    "core_idea": "me@example.com ftp://host file:///tmp vscode:open data:text/plain,x"
+                }
+            )
+        }
+    )
+    rendered = _render(snapshot, analyzed)
+    chapter = rendered.files[rendered.chapter_path].decode("utf-8")
+    for token in ("ftp://", "file://", "mailto:", "vscode:", "data:", "me@example.com"):
+        assert token not in chapter
+    normal = _render(_snapshot(title="12:30 中文：正常"), analyzed)
+    assert "12:30 中文：正常" in normal.files[normal.chapter_path].decode("utf-8")
+
+
+def test_reserved_display_titles_are_prefixed_before_portable_path_validation() -> None:
+    snapshot = _snapshot(title="AUX.log")
+    snapshot = snapshot.model_copy(
+        update={"book": snapshot.book.model_copy(update={"title": "CON.txt"})}
+    )
+    analyzed = _analyzed().model_copy(
+        update={
+            "analysis": _analyzed().analysis.model_copy(
+                update={
+                    "concepts": (Concept(term="LPT1.md", definition="Safe concept."),),
+                    "decision_rules": (DecisionRule(rule="PRN.txt", conditions=()),),
+                }
+            )
+        }
+    )
+    rendered = _render(snapshot, analyzed)
+    assert all(
+        "/CON.txt" not in path
+        and "/AUX.log" not in path
+        and "/LPT1.md" not in path
+        and "/PRN.txt" not in path
+        for path in rendered.files
+    )
+
+
+def test_total_chapters_covers_current_declared_and_previous_actual_indices() -> None:
+    renderer = ObsidianRenderer(ObsidianOutputConfig())
+    baseline = _snapshot()
+    indexed_five = baseline.model_copy(
+        update={
+            "book": baseline.book.model_copy(update={"total_chapters": 0}),
+            "chapter": baseline.chapter.model_copy(update={"index": 5}),
+        }
+    )
+    first = renderer.render(indexed_five, _analyzed(), None)
+    assert first.manifest.total_chapters == 6
+    declared_low = baseline.model_copy(
+        update={"book": baseline.book.model_copy(update={"total_chapters": 1})}
+    )
+    second = renderer.render(declared_low, _analyzed(), first.manifest)
+    assert second.manifest.total_chapters == 6
+    assert "- 06" not in second.files[second.moc_path].decode("utf-8")

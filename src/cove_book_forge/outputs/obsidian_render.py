@@ -26,7 +26,11 @@ from cove_book_forge.outputs.obsidian_models import (
     ObsidianChapterManifest,
     RenderedObsidianBook,
 )
-from cove_book_forge.path_safety import validate_component, validate_relative_path
+from cove_book_forge.path_safety import (
+    has_reserved_stem,
+    validate_component,
+    validate_relative_path,
+)
 
 _SCHEMA: Literal[1] = 1
 _MARKDOWN_FIELDS = (
@@ -40,7 +44,8 @@ _MARKDOWN_FIELDS = (
     "cove_body_sha256",
 )
 _UNSAFE_FILENAME = re.compile(r'[\\/:*?"<>|]+')
-_BARE_LINK = re.compile(r"(?i)\b(https?://|www\.|obsidian://)")
+_BARE_LINK = re.compile(r"(?i)\b(?:www\.|[a-z][a-z0-9+.-]*:)(?=\S)")
+_EMAIL_LINK = re.compile(r"(?i)(?<![\w.+-])[\w.+-]+@[\w.-]+\.[a-z]{2,}(?![\w.-])")
 _BLOCK_LINE = re.compile(r"^ {0,3}(?:#{1,6}(?:\s|$)|>|[-+*]\s|\d+[.)]\s|`{3,}|~{3,}|(?:=+|-+)\s*$)")
 
 
@@ -78,14 +83,7 @@ def _safe_component(value: str, fallback: str, *, limit: int = 80) -> str:
     normalized = normalized.strip(" .-")
     if normalized in {"", ".", ".."}:
         normalized = fallback
-    if normalized.casefold() in {
-        "con",
-        "prn",
-        "aux",
-        "nul",
-        *(f"com{number}" for number in range(1, 10)),
-        *(f"lpt{number}" for number in range(1, 10)),
-    }:
+    if has_reserved_stem(normalized):
         normalized = f"{fallback}-{normalized}"
 
     def clip_bytes(text: str, budget: int) -> str:
@@ -108,8 +106,9 @@ def _markdown_text(value: str) -> str:
     escaped = html.escape(_normalized_text(value), quote=False)
     escaped = escaped.replace("\\", "\\\\")
     escaped = _BARE_LINK.sub(
-        lambda match: match.group(1).replace(":", "\\:").replace(".", "\\."), escaped
+        lambda match: match.group(0).replace(":", "\\:").replace(".", "\\."), escaped
     )
+    escaped = _EMAIL_LINK.sub(lambda match: match.group(0).replace("@", "\\@"), escaped)
     for character in ("`", "*", "_", "[", "]"):
         escaped = escaped.replace(character, f"\\{character}")
     lines = escaped.split("\n")
@@ -557,6 +556,8 @@ class ObsidianRenderer:
             moc_path=moc_path,
             total_chapters=max(
                 total_chapters,
+                current.index + 1,
+                *(chapter.index + 1 for chapter in old_chapters),
                 previous.total_chapters
                 if previous is not None and previous.book_key == book_key
                 else 0,

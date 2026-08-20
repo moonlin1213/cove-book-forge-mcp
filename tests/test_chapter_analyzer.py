@@ -67,6 +67,22 @@ class FakeCache:
         self.entries[(source_system, external_book_id, chapter_index, input_fingerprint)] = analysis
 
 
+class RecheckingCache(FakeCache):
+    def __init__(self, loads: list[ChapterAnalysis | None]) -> None:
+        super().__init__()
+        self._loads: deque[ChapterAnalysis | None] = deque(loads)
+
+    def load_chapter_analysis(
+        self,
+        source_system: str,
+        external_book_id: str,
+        chapter_index: int,
+        input_fingerprint: str,
+    ) -> ChapterAnalysis | None:
+        del source_system, external_book_id, chapter_index, input_fingerprint
+        return self._loads.popleft() if self._loads else None
+
+
 class FakeProvider:
     def __init__(self, responses: list[dict[str, JsonValue] | BaseException]) -> None:
         self._responses: deque[dict[str, JsonValue] | BaseException] = deque(responses)
@@ -176,6 +192,43 @@ async def test_analyze_matching_cache_hit_makes_zero_provider_calls() -> None:
     assert reused.analysis == generated.analysis
     assert reused.input_fingerprint == generated.input_fingerprint
     assert reused.cache_hit is True
+    assert len(provider.calls) == 1
+    assert cache.store_calls == 1
+
+
+@pytest.mark.anyio
+async def test_analyze_rechecks_cache_inside_non_force_attempt_before_provider_generation() -> None:
+    cached = ChapterAnalysis(core_idea="Written by another analyzer.")
+    provider = FakeProvider([_valid_value(core_idea="Provider should not run")])
+    cache = RecheckingCache([None, cached])
+
+    result = await _analyzer(provider, cache).analyze(_snapshot())
+
+    assert result.analysis == cached
+    assert result.cache_hit is True
+    assert len(provider.calls) == 0
+    assert cache.store_calls == 0
+
+
+@pytest.mark.anyio
+async def test_analyze_force_refreshes_after_joining_non_force_cache_recheck_outcome() -> None:
+    cached = ChapterAnalysis(core_idea="Written by another analyzer.")
+    provider = FakeProvider([_valid_value(core_idea="Forced refresh.")])
+    provider.release = asyncio.Event()
+    cache = RecheckingCache([None, cached])
+    analyzer = _analyzer(provider, cache)
+
+    non_force = asyncio.create_task(analyzer.analyze(_snapshot()))
+    forced = asyncio.create_task(analyzer.analyze(_snapshot(), force=True))
+    await provider.started.wait()
+    assert len(provider.calls) == 1
+    provider.release.set()
+    non_force_result, forced_result = await asyncio.gather(non_force, forced)
+
+    assert non_force_result.analysis == cached
+    assert non_force_result.cache_hit is True
+    assert forced_result.analysis == ChapterAnalysis(core_idea="Forced refresh.")
+    assert forced_result.cache_hit is False
     assert len(provider.calls) == 1
     assert cache.store_calls == 1
 

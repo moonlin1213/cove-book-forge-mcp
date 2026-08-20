@@ -17,8 +17,14 @@ from cove_book_forge.providers.base import ModelProvider
 
 
 @dataclass
+class _AttemptOutcome:
+    analysis: ChapterAnalysis
+    from_cache: bool
+
+
+@dataclass
 class _InflightAttempt:
-    task: asyncio.Task[ChapterAnalysis]
+    task: asyncio.Task[_AttemptOutcome]
 
 
 class ChapterAnalyzer:
@@ -59,25 +65,30 @@ class ChapterAnalyzer:
                     cache_hit=True,
                 )
 
-        entry, started_attempt = await self._join_attempt(key, snapshot)
-        analysis = await asyncio.shield(entry.task)
-        return AnalyzedChapter(
-            analysis=analysis,
-            input_fingerprint=input_fingerprint,
-            cache_hit=not started_attempt,
-        )
+        while True:
+            entry, started_attempt = await self._join_attempt(key, snapshot, force=force)
+            outcome = await asyncio.shield(entry.task)
+            if force and outcome.from_cache:
+                continue
+            return AnalyzedChapter(
+                analysis=outcome.analysis,
+                input_fingerprint=input_fingerprint,
+                cache_hit=outcome.from_cache or not started_attempt,
+            )
 
     async def _join_attempt(
         self,
         key: tuple[str, str, int, str],
         snapshot: ChapterSnapshot,
+        *,
+        force: bool,
     ) -> tuple[_InflightAttempt, bool]:
         async with self._lock_entries_guard:
             existing = self._lock_entries.get(key)
             if existing is not None and not existing.task.done():
                 return existing, False
 
-            task = asyncio.create_task(self._generate_and_store(snapshot, key))
+            task = asyncio.create_task(self._generate_and_store(snapshot, key, force=force))
             entry = _InflightAttempt(task=task)
             self._lock_entries[key] = entry
             task.add_done_callback(lambda completed: self._on_attempt_done(key, entry, completed))
@@ -87,10 +98,16 @@ class ChapterAnalyzer:
         self,
         snapshot: ChapterSnapshot,
         key: tuple[str, str, int, str],
-    ) -> ChapterAnalysis:
+        *,
+        force: bool,
+    ) -> _AttemptOutcome:
+        if not force:
+            cached = self._cache.load_chapter_analysis(*key)
+            if cached is not None:
+                return _AttemptOutcome(analysis=cached, from_cache=True)
         analysis = await self._generate_valid_analysis(snapshot)
         self._cache.store_chapter_analysis(*key, analysis)
-        return analysis
+        return _AttemptOutcome(analysis=analysis, from_cache=False)
 
     async def _generate_valid_analysis(self, snapshot: ChapterSnapshot) -> ChapterAnalysis:
         system_prompt, user_prompt = build_chapter_analysis_prompts(snapshot)
@@ -130,7 +147,7 @@ class ChapterAnalyzer:
         self,
         key: tuple[str, str, int, str],
         entry: _InflightAttempt,
-        completed: asyncio.Task[ChapterAnalysis],
+        completed: asyncio.Task[_AttemptOutcome],
     ) -> None:
         if not completed.cancelled():
             completed.exception()

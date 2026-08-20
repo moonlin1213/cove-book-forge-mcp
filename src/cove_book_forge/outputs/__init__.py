@@ -1,4 +1,4 @@
-"""Managed Obsidian rendering and publication services."""
+"""Managed Obsidian and Agent Skill rendering services."""
 
 from cove_book_forge.outputs.obsidian import ObsidianOutput
 from cove_book_forge.outputs.obsidian_render import ObsidianRenderer

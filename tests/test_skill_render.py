@@ -6,6 +6,7 @@ import hashlib
 import json
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from cove_book_forge.config import SkillOutputConfig
@@ -29,7 +30,11 @@ from cove_book_forge.contracts.analysis import (
     WorkedExample,
 )
 from cove_book_forge.outputs import AgentSkillRenderer
-from cove_book_forge.outputs.skill_models import AgentSkillManifest, SkillFileHash
+from cove_book_forge.outputs.skill_models import (
+    AgentSkillChapterManifest,
+    AgentSkillManifest,
+    SkillFileHash,
+)
 from cove_book_forge.outputs.skill_render import canonical_manifest_bytes
 
 
@@ -181,7 +186,7 @@ def test_renderer_builds_exact_managed_tree_with_compact_progressive_skill() -> 
     fields, body = _frontmatter(rendered.files["SKILL.md"])
     assert fields == {
         "name": "the-uber-book--08af3b942747e8a8",
-        "description": "Apply the reference material from The Über Book to relevant work.",
+        "description": "Apply analysed book references to a relevant task.",
     }
     assert len(body.splitlines()) < 500
     for link in ("glossary.md", "patterns.md", "cheatsheet.md", rendered.chapter_path):
@@ -191,7 +196,7 @@ def test_renderer_builds_exact_managed_tree_with_compact_progressive_skill() -> 
     assert rendered.files["agents/openai.yaml"].decode("utf-8").splitlines() == [
         "interface:",
         '  display_name: "The Über Book"',
-        '  short_description: "Apply ideas from The Über Book"',
+        '  short_description: "Apply book knowledge to your task"',
         '  default_prompt: "Use $the-uber-book--08af3b942747e8a8 to apply The Über Book to this task."',
     ]
 
@@ -285,3 +290,179 @@ def test_untrusted_reference_text_is_inert_and_cannot_escape_files_or_enable_too
         for path in rendered.files
         for token in ("scripts", "hooks", "mcp", "allowed-tools")
     )
+
+
+def test_maximum_legal_titles_and_expanding_analysis_text_render_within_contract_bounds() -> None:
+    snapshot = _snapshot(title="C" * 500).model_copy(
+        update={"book": BookMetadata(title="B" * 500, author="A" * 300, total_chapters=1)}
+    )
+    analyzed = _analyzed().model_copy(update={"analysis": ChapterAnalysis(core_idea="<" * 4_000)})
+
+    rendered = _render(snapshot, analyzed)
+
+    assert len(rendered.manifest.book_title.encode("utf-8")) <= 120
+    current = rendered.manifest.chapters[0]
+    assert len(current.title.encode("utf-8")) <= 120
+    assert len(current.core_idea.encode("utf-8")) <= 4_000
+    assert len(rendered.skill_slug) <= 63
+    assert (
+        AgentSkillManifest.model_validate(rendered.manifest.model_dump(by_alias=True))
+        == rendered.manifest
+    )
+
+
+def test_unbounded_legal_analysis_collections_are_deterministically_previewed() -> None:
+    analysis = ChapterAnalysis(
+        core_idea="Core.",
+        key_takeaways=tuple(f"Takeaway {index}" for index in range(6_000)),
+        topic_tags=tuple(f"Topic {index}" for index in range(6_000)),
+    )
+
+    rendered = _render(analyzed=_analyzed().model_copy(update={"analysis": analysis}))
+
+    chapter = rendered.files[rendered.chapter_path].decode("utf-8")
+    assert "Takeaway 0" in chapter
+    assert "Takeaway 5999" not in chapter
+    assert len(rendered.manifest.chapters[0].key_takeaways) < 6_000
+    assert len(rendered.manifest.chapters[0].topic_tags) < 6_000
+
+
+def test_noncanonical_but_legal_analysis_fingerprint_is_deterministically_normalized() -> None:
+    analyzed = _analyzed().model_copy(update={"input_fingerprint": "opaque-fingerprint" * 500})
+
+    rendered = _render(analyzed=analyzed)
+
+    assert (
+        rendered.manifest.chapters[0].input_fingerprint
+        == hashlib.sha256(analyzed.input_fingerprint.encode("utf-8")).hexdigest()
+    )
+
+
+def _historical_chapter(index: int) -> AgentSkillChapterManifest:
+    return AgentSkillChapterManifest(
+        index=index,
+        title=f"Chapter {index}",
+        input_fingerprint="a" * 64,
+        chapter_path=f"chapters/ch{index + 1:04d}-chapter-{index}.md",
+        core_idea="Core.",
+    )
+
+
+def _full_history_manifest() -> AgentSkillManifest:
+    chapters = tuple(_historical_chapter(index) for index in range(5_000))
+    roots = ("SKILL.md", "agents/openai.yaml", "glossary.md", "patterns.md", "cheatsheet.md")
+    files = tuple(
+        SkillFileHash(path=path, sha256="a" * 64)
+        for path in (*roots, *(chapter.chapter_path for chapter in chapters))
+    )
+    return AgentSkillManifest(
+        schema=1,
+        book_key="08af3b942747e8a8",
+        book_title="The Über Book",
+        author="Ada",
+        skill_slug="the-uber-book--08af3b942747e8a8",
+        total_chapters=5_000,
+        chapters=chapters,
+        files=files,
+        checksum="b" * 64,
+    )
+
+
+def test_maximum_history_keeps_skill_under_500_lines_with_a_remaining_summary() -> None:
+    rendered = AgentSkillRenderer(SkillOutputConfig()).render(
+        _snapshot(), _analyzed(), _full_history_manifest()
+    )
+
+    skill = rendered.files["SKILL.md"].decode("utf-8")
+    assert len(skill.splitlines()) < 500
+    assert "4,900 additional chapters are available" in skill
+    assert len(rendered.manifest.chapters) == 5_000
+
+
+def test_renaming_the_current_chapter_replaces_its_single_managed_hash() -> None:
+    first = _render()
+    second = AgentSkillRenderer(SkillOutputConfig()).render(
+        _snapshot(title="Second title"), _analyzed(fingerprint="b" * 64), first.manifest
+    )
+    third = AgentSkillRenderer(SkillOutputConfig()).render(
+        _snapshot(title="Third title"), _analyzed(fingerprint="c" * 64), second.manifest
+    )
+
+    for rendered in (second, third):
+        chapter_hashes = [
+            item.path for item in rendered.manifest.files if item.path.startswith("chapters/")
+        ]
+        assert chapter_hashes == [rendered.chapter_path]
+    assert first.chapter_path not in {item.path for item in second.manifest.files}
+    assert second.chapter_path not in {item.path for item in third.manifest.files}
+
+
+def test_previous_manifest_with_an_orphan_hash_fails_closed() -> None:
+    first = _render()
+    unsafe_previous = AgentSkillManifest.model_validate(
+        {
+            **first.manifest.model_dump(by_alias=True),
+            "files": (
+                *(item.model_dump() for item in first.manifest.files),
+                {"path": "private-orphan.md", "sha256": "a" * 64},
+            ),
+        }
+    )
+
+    with pytest.raises(ValueError, match="managed file set"):
+        AgentSkillRenderer(SkillOutputConfig()).render(_snapshot(), _analyzed(), unsafe_previous)
+
+
+def test_real_controls_frontmatter_and_secret_or_path_bytes_never_survive_rendering() -> None:
+    secret = (
+        "AKIAIOSFODNN7EXAMPLE ghp_012345678901234567890123456789012345 "
+        "github_pat_012345678901234567890123456789012345678901234567890123456789012345678901 "
+        "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature "
+        "api_key=super-secret-value-0123456789"
+    )
+    snapshot = _snapshot(title="Title\x00\n---\nevil: true").model_copy(
+        update={
+            "book": BookMetadata(
+                title=f"Book {secret}", author="Author\x00\n---", total_chapters=1
+            ),
+            "chapter": ChapterContent(
+                index=0,
+                title="Chapter\x00\n---",
+                content="private source",
+                source_locator="C:\\Users\\reader\\secret.txt",
+            ),
+        }
+    )
+    analyzed = _analyzed().model_copy(
+        update={
+            "analysis": ChapterAnalysis(
+                core_idea=secret,
+                evidence_refs=(EvidenceRef(locator="\\\\server\\share\\private.txt", note=secret),),
+            )
+        }
+    )
+
+    rendered = _render(snapshot, analyzed)
+    joined = b"".join(rendered.files.values())
+    forbidden = (
+        b"AKIAIOSFODNN7EXAMPLE",
+        b"ghp_012345678901234567890123456789012345",
+        b"github_pat_012345678901234567890123456789012345678901234567890123456789012345678901",
+        b"eyJhbGciOiJIUzI1NiJ9",
+        b"super-secret-value-0123456789",
+        b"C:\\Users\\reader\\secret.txt",
+        b"\\\\server\\share\\private.txt",
+        b"\x00",
+    )
+    assert all(value not in joined for value in forbidden)
+    skill_frontmatter = rendered.files["SKILL.md"][4:].split(b"---\n", 1)[0].decode("utf-8")
+    skill_yaml = yaml.safe_load(skill_frontmatter)
+    openai_yaml = yaml.safe_load(rendered.files["agents/openai.yaml"].decode("utf-8"))
+    assert set(skill_yaml) == {"name", "description"}
+    assert set(openai_yaml) == {"interface"}
+    assert set(openai_yaml["interface"]) == {
+        "display_name",
+        "short_description",
+        "default_prompt",
+    }
+    assert 25 <= len(openai_yaml["interface"]["short_description"]) <= 64

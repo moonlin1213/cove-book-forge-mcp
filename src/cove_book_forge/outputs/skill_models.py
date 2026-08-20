@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Final, Literal
+from typing import Final, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
@@ -14,6 +15,24 @@ from cove_book_forge.path_safety import validate_relative_path
 MAX_SKILL_FILES: Final = MAX_BOOK_CHAPTERS + 10
 MAX_SUMMARY_ITEMS: Final = 128
 MAX_SUMMARY_ITEM_BYTES: Final = 1_000
+_CHAPTER_PATH = re.compile(r"^chapters/ch[0-9]{4}-[a-z0-9]+(?:-[a-z0-9]+)*\.md$")
+_CHAPTER_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def canonical_chapter_path(index: int, slug: str) -> str:
+    """Build the sole managed chapter path shape from a zero-based chapter index."""
+    if not 0 <= index < MAX_BOOK_CHAPTERS or not _CHAPTER_SLUG.fullmatch(slug):
+        raise ValueError("Skill chapter path components are not canonical")
+    return f"chapters/ch{index + 1:04d}-{slug}.md"
+
+
+def validate_canonical_chapter_path(index: int, path: str) -> str:
+    """Reject every chapter path except the canonical chapter-index navigation path."""
+    validate_relative_path(path)
+    match = _CHAPTER_PATH.fullmatch(path)
+    if match is None or path[11:15] != f"{index + 1:04d}":
+        raise ValueError("Skill chapter path must be canonical and match its index")
+    return path
 
 
 class AgentSkillModel(BaseModel):
@@ -48,11 +67,6 @@ class AgentSkillChapterManifest(AgentSkillModel):
     topic_tags: tuple[str, ...] = Field(default=(), max_length=MAX_SUMMARY_ITEMS)
     source_locators: tuple[str, ...] = Field(default=(), max_length=MAX_SUMMARY_ITEMS)
 
-    @field_validator("chapter_path")
-    @classmethod
-    def validate_path(cls, value: str) -> str:
-        return validate_relative_path(value)
-
     @field_validator(
         "title",
         "core_idea",
@@ -79,6 +93,11 @@ class AgentSkillChapterManifest(AgentSkillModel):
             raise ValueError("Skill summary text exceeds its byte budget")
         return value
 
+    @model_validator(mode="after")
+    def require_canonical_chapter_path(self) -> Self:
+        validate_canonical_chapter_path(self.index, self.chapter_path)
+        return self
+
 
 class AgentSkillManifest(AgentSkillModel):
     schema_version: Literal[1] = Field(alias="schema", serialization_alias="schema")
@@ -102,6 +121,8 @@ class AgentSkillManifest(AgentSkillModel):
     def require_unique_entries(self) -> AgentSkillManifest:
         if len({chapter.index for chapter in self.chapters}) != len(self.chapters):
             raise ValueError("Skill manifest chapter indices must be unique")
+        if len({chapter.chapter_path for chapter in self.chapters}) != len(self.chapters):
+            raise ValueError("Skill manifest chapter paths must be unique")
         if len({item.path for item in self.files}) != len(self.files):
             raise ValueError("Skill manifest file paths must be unique")
         return self

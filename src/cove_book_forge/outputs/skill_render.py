@@ -19,6 +19,8 @@ from cove_book_forge.outputs.skill_models import (
     AgentSkillManifest,
     RenderedAgentSkill,
     SkillFileHash,
+    canonical_chapter_path,
+    validate_canonical_chapter_path,
 )
 from cove_book_forge.path_safety import validate_relative_path
 
@@ -206,7 +208,7 @@ class AgentSkillRenderer:
             validated_previous.skill_slug if validated_previous is not None else candidate_slug
         )
         chapter_name = _slug_component(snapshot.chapter.title, "chapter", limit=55)
-        chapter_path = f"chapters/ch{snapshot.chapter.index + 1:04d}-{chapter_name}.md"
+        chapter_path = canonical_chapter_path(snapshot.chapter.index, chapter_name)
         current = _chapter_summary(snapshot, analyzed, chapter_path)
         old_chapters = validated_previous.chapters if validated_previous is not None else ()
         historical_chapters = tuple(item for item in old_chapters if item.index != current.index)
@@ -286,8 +288,6 @@ class AgentSkillRenderer:
         if previous is None or previous.book_key != book_key:
             return None
         validated = AgentSkillManifest.model_validate(previous.model_dump(by_alias=True))
-        if any(not chapter.chapter_path.startswith("chapters/") for chapter in validated.chapters):
-            raise ValueError("previous Skill manifest has an unsafe chapter index path")
         expected_paths = {
             "SKILL.md",
             "agents/openai.yaml",
@@ -440,7 +440,9 @@ class AgentSkillRenderer:
     def _chapter_index(manifest: AgentSkillManifest) -> bytes:
         lines = ["# Chapter index", ""]
         for chapter in manifest.chapters:
-            path = chapter.chapter_path.removeprefix("chapters/")
+            path = validate_canonical_chapter_path(
+                chapter.index, chapter.chapter_path
+            ).removeprefix("chapters/")
             lines.append(f"- [Chapter {chapter.index + 1:04d}]({path})")
         result = ("\n".join(lines) + "\n").encode("utf-8")
         if len(result) > _MAX_CHAPTER_INDEX_BYTES:
@@ -452,6 +454,7 @@ class AgentSkillRenderer:
         manifest: AgentSkillManifest,
         current_index: int,
         select: Callable[[AgentSkillChapterManifest], tuple[str, ...]],
+        reserve_current: Callable[[AgentSkillChapterManifest], tuple[str, ...]] | None = None,
     ) -> tuple[tuple[str, ...], int]:
         """Allocate a deterministic per-book budget without materialising every value."""
         chapters = manifest.chapters
@@ -467,10 +470,26 @@ class AgentSkillRenderer:
             0,
         )
         values: list[str] = []
+        seen: set[str] = set()
+
+        def append(chapter: AgentSkillChapterManifest, value: str) -> bool:
+            if value in seen:
+                return False
+            seen.add(value)
+            values.append(f"Chapter {chapter.index + 1:04d}: {value}")
+            return True
+
         current = chapters[current_position]
         current_values = select(current)
-        if current_values:
-            values.append(f"Chapter {current.index + 1:04d}: {current_values[0]}")
+        current_reserves = (
+            reserve_current(current)
+            if reserve_current is not None
+            else ((current_values[0],) if len(current_values) else ())
+        )
+        for value in current_reserves:
+            if len(values) == _MAX_SUMMARY_ITEMS:
+                break
+            append(current, value)
         offset = 1
         while len(values) < _MAX_SUMMARY_ITEMS:
             emitted = False
@@ -479,10 +498,7 @@ class AgentSkillRenderer:
                 item_position = offset if chapter.index == current_index else offset - 1
                 chapter_values = select(chapter)
                 if item_position < len(chapter_values):
-                    values.append(
-                        f"Chapter {chapter.index + 1:04d}: {chapter_values[item_position]}"
-                    )
-                    emitted = True
+                    emitted = append(chapter, chapter_values[item_position]) or emitted
                     if len(values) == _MAX_SUMMARY_ITEMS:
                         break
             if not emitted:
@@ -496,8 +512,11 @@ class AgentSkillRenderer:
         manifest: AgentSkillManifest,
         current_index: int,
         select: Callable[[AgentSkillChapterManifest], tuple[str, ...]],
+        reserve_current: Callable[[AgentSkillChapterManifest], tuple[str, ...]] | None = None,
     ) -> bytes:
-        values, total = AgentSkillRenderer._aggregate_values(manifest, current_index, select)
+        values, total = AgentSkillRenderer._aggregate_values(
+            manifest, current_index, select, reserve_current
+        )
         omitted = total - len(values)
         lines = [
             f"# {title}",
@@ -511,7 +530,11 @@ class AgentSkillRenderer:
     @staticmethod
     def _glossary(manifest: AgentSkillManifest, current_index: int) -> bytes:
         return AgentSkillRenderer._aggregate_file(
-            "Glossary", manifest, current_index, lambda chapter: chapter.concepts
+            "Glossary",
+            manifest,
+            current_index,
+            lambda chapter: chapter.concepts,
+            lambda chapter: (chapter.concepts[0],) if chapter.concepts else (),
         )
 
     @staticmethod
@@ -521,6 +544,11 @@ class AgentSkillRenderer:
             manifest,
             current_index,
             lambda chapter: (*chapter.frameworks, *chapter.mental_models, *chapter.methods),
+            lambda chapter: tuple(
+                values[0]
+                for values in (chapter.frameworks, chapter.mental_models, chapter.methods)
+                if values
+            ),
         )
 
     @staticmethod
@@ -530,4 +558,7 @@ class AgentSkillRenderer:
             manifest,
             current_index,
             lambda chapter: (*chapter.decision_rules, *chapter.key_takeaways),
+            lambda chapter: tuple(
+                values[0] for values in (chapter.decision_rules, chapter.key_takeaways) if values
+            ),
         )

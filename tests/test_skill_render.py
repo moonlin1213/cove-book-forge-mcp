@@ -410,29 +410,57 @@ def test_chapter_index_keeps_every_large_book_chapter_navigable_from_skill() -> 
 
 
 def test_current_chapter_is_guaranteed_aggregate_coverage_after_full_history_budget() -> None:
-    full_history = ChapterAnalysis(
-        core_idea="First.",
-        concepts=tuple(
-            Concept(term=f"Old concept {index}", definition="Old.") for index in range(128)
-        ),
-        frameworks=tuple(Framework(name=f"Old framework {index}") for index in range(128)),
-        methods=tuple(Method(name=f"Old method {index}") for index in range(128)),
-        decision_rules=tuple(DecisionRule(rule=f"Old rule {index}") for index in range(128)),
+    history = tuple(
+        AgentSkillChapterManifest(
+            index=index,
+            title=f"History {index}",
+            input_fingerprint="a" * 64,
+            chapter_path=f"chapters/ch{index + 1:04d}-history-{index}.md",
+            core_idea="Old.",
+            concepts=(f"Old concept {index}",),
+            frameworks=(f"Old framework {index}",),
+            mental_models=(f"Old mental model {index}",),
+            methods=(f"Old method {index}",),
+            decision_rules=(f"Old rule {index}",),
+            key_takeaways=(f"Old takeaway {index}",),
+        )
+        for index in range(128)
     )
-    first = _render(
-        _snapshot(chapter_index=0), _analyzed().model_copy(update={"analysis": full_history})
+    roots = (
+        "SKILL.md",
+        "agents/openai.yaml",
+        "chapters/index.md",
+        "glossary.md",
+        "patterns.md",
+        "cheatsheet.md",
+    )
+    first = AgentSkillManifest(
+        schema=1,
+        book_key="08af3b942747e8a8",
+        book_title="The Über Book",
+        author="Ada",
+        skill_slug="the-uber-book--08af3b942747e8a8",
+        total_chapters=129,
+        chapters=history,
+        files=tuple(
+            SkillFileHash(path=path, sha256="a" * 64)
+            for path in (*roots, *(chapter.chapter_path for chapter in history))
+        ),
+        checksum="b" * 64,
     )
     current = ChapterAnalysis(
         core_idea="Second.",
         concepts=(Concept(term="Current concept", definition="Current."),),
         frameworks=(Framework(name="Current framework"),),
+        mental_models=(MentalModel(name="Current mental model", explanation="Current."),),
         methods=(Method(name="Current method"),),
         decision_rules=(DecisionRule(rule="Current rule"),),
+        key_takeaways=("Current takeaway",),
     )
     second = AgentSkillRenderer(SkillOutputConfig()).render(
-        _snapshot(chapter_index=1, title="Second"),
+        _snapshot(chapter_index=128, title="Second"),
         _analyzed(fingerprint="b" * 64).model_copy(update={"analysis": current}),
-        first.manifest,
+        first,
     )
 
     glossary = second.files["glossary.md"].decode("utf-8")
@@ -440,8 +468,10 @@ def test_current_chapter_is_guaranteed_aggregate_coverage_after_full_history_bud
     cheatsheet = second.files["cheatsheet.md"].decode("utf-8")
     assert "Current concept" in glossary
     assert "Current framework" in patterns
+    assert "Current mental model" in patterns
     assert "Current method" in patterns
     assert "Current rule" in cheatsheet
+    assert "Current takeaway" in cheatsheet
     assert "Coverage: 128 items shown; 1 omitted." in glossary
     assert "Old concept 127" not in glossary
 
@@ -469,6 +499,40 @@ def test_aggregate_budget_does_not_iterate_or_materialize_every_logical_item() -
     assert total == 640_000
     assert len(values) == 128
     assert values[0] == "Chapter 5000: Item 0"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "chapters/index.md",
+        "SKILL.md",
+        "chapters/ch0001-title with space.md",
+        "chapters/ch0001-[title].md",
+        "chapters/subdir/ch0001-title.md",
+        "chapters/ch0002-title.md",
+    ],
+)
+def test_manifest_rejects_noncanonical_or_mismatched_chapter_navigation_paths(path: str) -> None:
+    valid = _historical_chapter(0)
+
+    with pytest.raises(ValidationError):
+        AgentSkillChapterManifest.model_validate({**valid.model_dump(), "chapter_path": path})
+
+
+def test_manifest_rejects_duplicate_chapter_paths_even_with_distinct_indices() -> None:
+    first = _historical_chapter(0)
+    second = AgentSkillChapterManifest.model_construct(
+        **{**_historical_chapter(1).model_dump(), "chapter_path": first.chapter_path}
+    )
+
+    with pytest.raises(ValidationError):
+        AgentSkillManifest(
+            schema=1,
+            book_key="0" * 16,
+            book_title="Book",
+            skill_slug="book--0000000000000000",
+            chapters=(first, second),
+        )
 
 
 def test_renaming_the_current_chapter_replaces_its_single_managed_hash() -> None:

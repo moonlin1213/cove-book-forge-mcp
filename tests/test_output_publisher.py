@@ -140,6 +140,64 @@ def test_publication_budgets_fail_closed_before_filesystem_mutation(
     _assert_safe(raised.value, vault)
 
 
+def test_second_pass_growth_is_rejected_from_stat_before_reading_beyond_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    chapter = vault / first.rendered.chapter_path
+    renderer = ObsidianRenderer(ObsidianOutputConfig(enabled=True, vault_path=vault))
+    updated = renderer.render(
+        _snapshot(),
+        _analyzed(fingerprint="b" * 64),
+        first.rendered.manifest,
+    )
+    existing_size = sum(len(data) for data in _visible(vault).values())
+    staged_size = sum(len(data) for data in updated.files.values())
+    monkeypatch.setattr(
+        publisher_module,
+        "_MAX_TOTAL_TRANSACTION_BYTES",
+        existing_size + staged_size + 8,
+    )
+    real_stage = publisher_module.GuardedPublisher._stage
+    real_read = publisher_module.os.read
+    growth_started = False
+    grew_inode: tuple[int, int] | None = None
+    read_grown_file = False
+
+    def stage_then_grow(self, transaction, writes):
+        nonlocal growth_started, grew_inode
+        result = real_stage(self, transaction, writes)
+        with chapter.open("ab") as stream:
+            stream.write(b"x" * 64)
+            stream.flush()
+            os.fsync(stream.fileno())
+        status = chapter.stat()
+        grew_inode = (status.st_dev, status.st_ino)
+        growth_started = True
+        return result
+
+    def record_read(descriptor: int, size: int) -> bytes:
+        nonlocal read_grown_file
+        status = os.fstat(descriptor)
+        if growth_started and grew_inode == (status.st_dev, status.st_ino):
+            read_grown_file = True
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(publisher_module.GuardedPublisher, "_stage", stage_then_grow)
+    monkeypatch.setattr(publisher_module.os, "read", record_read)
+
+    with pytest.raises(ForgeException) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value.code is ForgeErrorCode.PATH_NOT_ALLOWED
+    assert growth_started
+    assert read_grown_file is False
+
+
 def test_transaction_setup_failure_removes_only_owned_empty_directories(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -276,6 +334,98 @@ def test_rollback_signal_finishes_recovery_before_exact_re_raise(
     _assert_no_transactions(vault)
 
 
+def test_original_keyboard_interrupt_precedes_rollback_record_error_and_converges(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    before = _visible(vault)
+    real_link = publisher_module.os.link
+    real_protect = publisher_module.GuardedPublisher._protect_moved
+    original_signal = KeyboardInterrupt("original publish interrupt")
+    link_fired = False
+    rollback_fired = False
+
+    def link_then_interrupt(src, dst, **kwargs):
+        nonlocal link_fired
+        result = real_link(src, dst, **kwargs)
+        if not link_fired and dst == Path(first.rendered.chapter_path).name:
+            link_fired = True
+            raise original_signal
+        return result
+
+    def fail_first_rollback_intent(self, transaction, directory_fd, container, moved_name, path):
+        nonlocal rollback_fired
+        if not rollback_fired and container == "transaction":
+            rollback_fired = True
+            raise OSError("PRIVATE-ROLLBACK-INTENT")
+        return real_protect(self, transaction, directory_fd, container, moved_name, path)
+
+    monkeypatch.setattr(publisher_module.os, "link", link_then_interrupt)
+    monkeypatch.setattr(
+        publisher_module.GuardedPublisher,
+        "_protect_moved",
+        fail_first_rollback_intent,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value is original_signal
+    assert link_fired and rollback_fired
+    assert _visible(vault) == before
+    _assert_no_transactions(vault)
+
+
+def test_signal_after_forget_transition_is_preserved_after_rollback_convergence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    before = _visible(vault)
+    real_link = publisher_module.os.link
+    real_forget = publisher_module.GuardedPublisher._forget_moved
+    manifest_failed = False
+    signal = SystemExit("post-forget transition")
+    fired = False
+
+    def fail_manifest_once(src, dst, **kwargs):
+        nonlocal manifest_failed
+        if not manifest_failed and isinstance(dst, str) and dst.endswith(".json"):
+            manifest_failed = True
+            raise OSError("PRIVATE-MANIFEST")
+        return real_link(src, dst, **kwargs)
+
+    def forget_then_interrupt(self, transaction, directory_fd, moved_name):
+        nonlocal fired
+        result = real_forget(self, transaction, directory_fd, moved_name)
+        if not fired and moved_name.startswith("r"):
+            fired = True
+            raise signal
+        return result
+
+    monkeypatch.setattr(publisher_module.os, "link", fail_manifest_once)
+    monkeypatch.setattr(
+        publisher_module.GuardedPublisher,
+        "_forget_moved",
+        forget_then_interrupt,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value is signal
+    assert manifest_failed and fired
+    assert _visible(vault) == before
+    _assert_no_transactions(vault)
+
+
 def test_directory_child_fd_closes_when_post_open_validation_fails(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -384,6 +534,38 @@ def test_stage_inode_is_revalidated_immediately_before_each_publish(
 
     assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
     assert _visible(vault) == before
+
+
+def test_link_success_followed_by_keyboard_interrupt_restores_exact_old_bundle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    before = _visible(vault)
+    real_link = publisher_module.os.link
+    signal = KeyboardInterrupt("post-link transition")
+    fired = False
+
+    def link_then_interrupt(src, dst, **kwargs):
+        nonlocal fired
+        result = real_link(src, dst, **kwargs)
+        if not fired and dst == Path(first.rendered.chapter_path).name:
+            fired = True
+            raise signal
+        return result
+
+    monkeypatch.setattr(publisher_module.os, "link", link_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value is signal
+    assert fired
+    assert _visible(vault) == before
+    _assert_no_transactions(vault)
 
 
 def test_manifest_linearization_revalidates_every_published_non_manifest_file(
@@ -512,7 +694,7 @@ def test_first_publish_never_overwrites_an_unmanaged_regular_target(tmp_path: Pa
     _assert_safe(raised.value, vault)
 
 
-@pytest.mark.parametrize("failure", ["stage", "backup", "publish", "middle", "manifest", "cleanup"])
+@pytest.mark.parametrize("failure", ["stage", "backup", "publish", "middle", "manifest"])
 def test_injected_failures_restore_the_last_visible_bundle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
@@ -537,7 +719,7 @@ def test_injected_failures_restore_the_last_visible_bundle(
 
         monkeypatch.setattr(publisher_module.os, "write", fail_write)
     elif failure == "backup":
-        real_rename = publisher_module.os.rename
+        real_rename = publisher_module._rename_noreplace
         fired = False
 
         def fail_rename(src, dst, **kwargs):
@@ -547,7 +729,7 @@ def test_injected_failures_restore_the_last_visible_bundle(
                 raise OSError("PRIVATE-BACKUP")
             return real_rename(src, dst, **kwargs)
 
-        monkeypatch.setattr(publisher_module.os, "rename", fail_rename)
+        monkeypatch.setattr(publisher_module, "_rename_noreplace", fail_rename)
     elif failure in {"publish", "middle", "manifest"}:
         real_link = publisher_module.os.link
         fired = False
@@ -569,14 +751,6 @@ def test_injected_failures_restore_the_last_visible_bundle(
             return real_link(src, dst, **kwargs)
 
         monkeypatch.setattr(publisher_module.os, "link", fail_link)
-    else:
-        original = publisher_module.GuardedPublisher._cleanup_committed
-
-        def fail_cleanup(self, transaction):
-            raise OSError("PRIVATE-CLEANUP")
-
-        monkeypatch.setattr(publisher_module.GuardedPublisher, "_cleanup_committed", fail_cleanup)
-
     with pytest.raises(ForgeException) as raised:
         _publish(vault, _analyzed(fingerprint="b" * 64))
 
@@ -587,8 +761,90 @@ def test_injected_failures_restore_the_last_visible_bundle(
     assert _visible(vault) == before
     _assert_no_transactions(vault)
     _assert_safe(raised.value, vault)
-    if failure == "cleanup":
-        monkeypatch.setattr(publisher_module.GuardedPublisher, "_cleanup_committed", original)
+
+
+@pytest.mark.parametrize("failure", ["oserror", "keyboard_interrupt"])
+def test_post_commit_backup_cleanup_failure_never_rolls_back_complete_new_bundle(
+    tmp_path: Path, monkeypatch, failure: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    expected_vault = tmp_path / "expected"
+    expected_vault.mkdir()
+    _publish(expected_vault, _analyzed())
+    _publish(expected_vault, _analyzed(fingerprint="b" * 64))
+    expected = _visible(expected_vault)
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    real_unlink = publisher_module.os.unlink
+    signal = KeyboardInterrupt("committed backup cleanup")
+    fired = False
+
+    def unlink_then_fail(path, *args, **kwargs):
+        nonlocal fired
+        result = real_unlink(path, *args, **kwargs)
+        if not fired and isinstance(path, str) and path.startswith("b"):
+            fired = True
+            if failure == "oserror":
+                raise OSError("PRIVATE-COMMITTED-CLEANUP")
+            raise signal
+        return result
+
+    monkeypatch.setattr(publisher_module.os, "unlink", unlink_then_fail)
+
+    if failure == "oserror":
+        receipt = _publish(vault, _analyzed(fingerprint="b" * 64))
+        assert receipt.unchanged is False
+    else:
+        with pytest.raises(KeyboardInterrupt) as raised:
+            _publish(vault, _analyzed(fingerprint="b" * 64))
+        assert raised.value is signal
+
+    assert fired
+    assert _visible(vault) == expected
+
+
+@pytest.mark.parametrize("cleanup_method", ["_close_transaction", "_cleanup_created"])
+def test_post_commit_close_or_directory_cleanup_signal_keeps_complete_new_bundle(
+    tmp_path: Path, monkeypatch, cleanup_method: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    expected_vault = tmp_path / "expected"
+    expected_vault.mkdir()
+    _publish(expected_vault, _analyzed())
+    _publish(expected_vault, _analyzed(fingerprint="b" * 64))
+    expected = _visible(expected_vault)
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    original = getattr(publisher_module.GuardedPublisher, cleanup_method)
+    signal = SystemExit(f"committed {cleanup_method}")
+    fired = False
+
+    def cleanup_then_interrupt(self, *args, **kwargs):
+        nonlocal fired
+        result = original(self, *args, **kwargs)
+        if not fired:
+            fired = True
+            raise signal
+        return result
+
+    monkeypatch.setattr(
+        publisher_module.GuardedPublisher,
+        cleanup_method,
+        cleanup_then_interrupt,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value is signal
+    assert fired
+    assert _visible(vault) == expected
 
 
 def test_competitor_replacement_before_backup_is_preserved(tmp_path: Path, monkeypatch) -> None:
@@ -599,7 +855,7 @@ def test_competitor_replacement_before_backup_is_preserved(tmp_path: Path, monke
     first = _publish(vault, _analyzed())
     chapter = vault / first.rendered.chapter_path
     competitor = b"competitor replacement"
-    real_rename = publisher_module.os.rename
+    real_rename = publisher_module._rename_noreplace
     fired = False
 
     def race_rename(src, dst, **kwargs):
@@ -610,7 +866,7 @@ def test_competitor_replacement_before_backup_is_preserved(tmp_path: Path, monke
             chapter.write_bytes(competitor)
         return real_rename(src, dst, **kwargs)
 
-    monkeypatch.setattr(publisher_module.os, "rename", race_rename)
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", race_rename)
 
     with pytest.raises(ForgeException) as raised:
         _publish(vault, _analyzed(fingerprint="b" * 64))
@@ -630,7 +886,7 @@ def test_backup_rename_success_followed_by_an_error_does_not_lose_the_old_file(
     first = _publish(vault, _analyzed())
     before = _visible(vault)
     chapter = vault / first.rendered.chapter_path
-    real_rename = publisher_module.os.rename
+    real_rename = publisher_module._rename_noreplace
     fired = False
 
     def rename_then_fail(src, dst, **kwargs):
@@ -641,12 +897,137 @@ def test_backup_rename_success_followed_by_an_error_does_not_lose_the_old_file(
             raise OSError("PRIVATE-POST-BACKUP-RENAME")
         return result
 
-    monkeypatch.setattr(publisher_module.os, "rename", rename_then_fail)
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", rename_then_fail)
 
     with pytest.raises(ForgeException):
         _publish(vault, _analyzed(fingerprint="b" * 64))
 
     assert fired
+    assert _visible(vault) == before
+    _assert_no_transactions(vault)
+
+
+def test_backup_move_followed_by_internal_transition_signal_converges_to_old_bundle(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    before = _visible(vault)
+    original = publisher_module.GuardedPublisher._snapshot_in_directory
+    signal = KeyboardInterrupt("backup transition")
+    fired = False
+
+    def interrupt_first_backup_inspection(self, directory_fd, name):
+        nonlocal fired
+        if not fired and isinstance(name, str) and name.startswith("b"):
+            fired = True
+            raise signal
+        return original(self, directory_fd, name)
+
+    monkeypatch.setattr(
+        publisher_module.GuardedPublisher,
+        "_snapshot_in_directory",
+        interrupt_first_backup_inspection,
+    )
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value is signal
+    assert fired
+    assert _visible(vault) == before
+    _assert_no_transactions(vault)
+
+
+def test_occupied_backup_destination_preserves_source_destination_and_recovery_intent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    chapter = vault / first.rendered.chapter_path
+    old_chapter = chapter.read_bytes()
+    competitor = b"occupied backup destination"
+    original = publisher_module._rename_noreplace
+    fired = False
+
+    def occupy_destination(source, destination, *, source_fd, destination_fd):
+        nonlocal fired
+        if not fired and source == chapter.name:
+            fired = True
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                os.write(descriptor, competitor)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        return original(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", occupy_destination)
+
+    with pytest.raises(ForgeException) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert fired
+    assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
+    assert chapter.read_bytes() == old_chapter
+    transactions = vault / ".cove-book-forge" / ".transactions"
+    assert any(path.read_bytes() == competitor for path in transactions.rglob("backup/b*"))
+    records = list(transactions.rglob("recovery-*.json"))
+    assert len(records) == 1
+    assert json.loads(records[0].read_bytes())["original_path"] == first.rendered.chapter_path
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+def test_recovery_intent_persistence_failure_happens_before_backup_move(
+    tmp_path: Path, monkeypatch, failure: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    before = _visible(vault)
+    real_write = publisher_module.os.write
+    real_fsync = publisher_module._fsync
+    recovery_written = False
+
+    def fail_recovery_write(descriptor: int, data: bytes) -> int:
+        nonlocal recovery_written
+        if b'"recovery_id"' in data:
+            if failure == "write":
+                raise OSError("PRIVATE-RECOVERY-WRITE")
+            recovery_written = True
+        return real_write(descriptor, data)
+
+    def fail_recovery_fsync(descriptor: int) -> None:
+        nonlocal recovery_written
+        if failure == "fsync" and recovery_written:
+            recovery_written = False
+            raise OSError("PRIVATE-RECOVERY-FSYNC")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(publisher_module.os, "write", fail_recovery_write)
+    monkeypatch.setattr(publisher_module, "_fsync", fail_recovery_fsync)
+
+    with pytest.raises(ForgeException):
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
     assert _visible(vault) == before
     _assert_no_transactions(vault)
 
@@ -703,7 +1084,7 @@ def test_unexpected_object_moved_during_backup_is_restored_without_following_it(
     chapter = vault / first.rendered.chapter_path
     outside = tmp_path / "outside"
     outside.write_bytes(b"outside remains untouched")
-    real_rename = publisher_module.os.rename
+    real_rename = publisher_module._rename_noreplace
     fired = False
 
     def replace_then_rename(src, dst, **kwargs):
@@ -720,7 +1101,7 @@ def test_unexpected_object_moved_during_backup_is_restored_without_following_it(
                 os.mkfifo(chapter)
         return real_rename(src, dst, **kwargs)
 
-    monkeypatch.setattr(publisher_module.os, "rename", replace_then_rename)
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", replace_then_rename)
 
     with pytest.raises(ForgeException) as raised:
         _publish(vault, _analyzed(fingerprint="b" * 64))

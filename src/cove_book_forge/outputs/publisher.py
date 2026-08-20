@@ -12,6 +12,7 @@ import sys
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Final
 from uuid import uuid4
@@ -217,6 +218,7 @@ class _FileSnapshot:
     exists: bool
     parent_identity: _Identity | None = None
     identity: _Identity | None = None
+    size: int | None = None
     digest: str | None = None
     data: bytes | None = None
 
@@ -235,32 +237,58 @@ class _StagedFile:
     digest: str
 
 
-@dataclass(frozen=True)
+class _BackupStatus(StrEnum):
+    INTENT = "intent"
+    MOVED = "moved"
+    VERIFIED = "verified"
+    RESTORED = "restored"
+    NO_MOVE = "no_move"
+    PROTECTED = "protected"
+
+
+@dataclass
 class _BackupFile:
     path: str
+    parent_path: str
+    source_name: str
     name: str
     parent_identity: _Identity
     identity: _Identity
     digest: str
     size: int
+    status: _BackupStatus = _BackupStatus.INTENT
 
 
-@dataclass(frozen=True)
+class _PublishedStatus(StrEnum):
+    INTENT = "intent"
+    PUBLISHED = "published"
+    ABSENT = "absent"
+    REMOVED = "removed"
+    COMPETITOR = "competitor"
+
+
+@dataclass
 class _PublishedFile:
     path: str
+    parent_path: str
+    name: str
     parent_identity: _Identity
     identity: _Identity
     digest: str
     size: int
+    data: bytes
+    status: _PublishedStatus = _PublishedStatus.INTENT
+    rollback_name: str | None = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class _RecoveryEntry:
     original_path: str
     container: str
     moved_name: str
     record_name: str
     record_identity: _Identity
+    durable: bool = False
 
 
 @dataclass
@@ -385,16 +413,20 @@ class GuardedPublisher:
         with anchor:
             initial = render(None)
             self._validate_rendered_budget(initial)
-            manifest_path = self._manifest_path(initial.manifest.book_key)
+            initial_book_key = initial.manifest.book_key
+            initial_paths = tuple(initial.files)
+            manifest_path = self._manifest_path(initial_book_key)
             manifest_snapshot = self._read_snapshot(anchor, manifest_path)
             previous = self._previous_manifest(manifest_snapshot)
+            del manifest_snapshot
             if previous is not None:
                 self._validate_manifest_budget(previous)
             rendered = render(previous)
             self._validate_rendered_budget(rendered)
-            if rendered.manifest.book_key != initial.manifest.book_key:
+            if rendered.manifest.book_key != initial_book_key:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            candidates = self._candidate_paths(initial, rendered, previous)
+            candidates = self._candidate_paths(initial_paths, rendered, previous)
+            del initial
             existing_size = sum(self._candidate_size(anchor, path) for path in candidates)
             staged_size = sum(len(payload) for payload in rendered.files.values())
             if existing_size + staged_size > _MAX_TOTAL_TRANSACTION_BYTES:
@@ -402,7 +434,8 @@ class GuardedPublisher:
             existing: dict[str, bytes] = {}
             actual_existing_size = 0
             for path in candidates:
-                snapshot = self._read_snapshot(anchor, path)
+                remaining = _MAX_TOTAL_TRANSACTION_BYTES - staged_size - actual_existing_size
+                snapshot = self._read_snapshot(anchor, path, max_bytes=remaining)
                 if snapshot.exists:
                     assert snapshot.data is not None
                     actual_existing_size += len(snapshot.data)
@@ -421,6 +454,7 @@ class GuardedPublisher:
 
             created: list[_CreatedDirectory] = []
             transaction: _Transaction | None = None
+            committed = False
             try:
                 for path in sorted({*plan.writes, *plan.removals}):
                     parent = path.rsplit("/", 1)[0] if "/" in path else ""
@@ -433,19 +467,41 @@ class GuardedPublisher:
                 transaction = self._new_transaction(anchor, created)
                 self._stage(transaction, plan.writes)
                 snapshots: dict[str, _FileSnapshot] = {}
-                precondition_size = 0
+                retained_size = actual_existing_size
+                processed_size = 0
+                missing = object()
                 for path in candidates:
-                    snapshot = self._read_snapshot(anchor, path)
-                    if snapshot.data is not None:
-                        precondition_size += len(snapshot.data)
-                        if precondition_size + staged_size > _MAX_TOTAL_TRANSACTION_BYTES:
-                            raise _error(ForgeErrorCode.PATH_NOT_ALLOWED)
-                    snapshots[path] = snapshot
-                self._match_planning_bytes(existing, snapshots)
-                existing.clear()
+                    expected_bytes = existing.pop(path, missing)
+                    expected_exists = isinstance(expected_bytes, bytes)
+                    expected_size: int | None = None
+                    expected_digest: str | None = None
+                    if expected_exists:
+                        assert isinstance(expected_bytes, bytes)
+                        expected_size = len(expected_bytes)
+                        expected_digest = hashlib.sha256(expected_bytes).hexdigest()
+                        retained_size -= expected_size
+                    del expected_bytes
+                    remaining = (
+                        _MAX_TOTAL_TRANSACTION_BYTES - staged_size - retained_size - processed_size
+                    )
+                    snapshot = self._read_snapshot(anchor, path, max_bytes=remaining)
+                    if snapshot.size is not None:
+                        processed_size += snapshot.size
+                    if snapshot.exists != expected_exists:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    if snapshot.exists and (
+                        snapshot.size != expected_size or snapshot.digest != expected_digest
+                    ):
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    snapshots[path] = _FileSnapshot(
+                        exists=snapshot.exists,
+                        parent_identity=snapshot.parent_identity,
+                        identity=snapshot.identity,
+                        size=snapshot.size,
+                        digest=snapshot.digest,
+                    )
+                    del snapshot
                 anchor.verify()
-                for path, expected in snapshots.items():
-                    self._require_snapshot(anchor, path, expected)
                 self._commit(
                     anchor,
                     transaction,
@@ -456,6 +512,8 @@ class GuardedPublisher:
                 )
                 anchor.verify()
                 self._verify_published_files(anchor, transaction)
+                anchor.verify()
+                committed = True
                 self._cleanup_committed(transaction)
                 self._close_transaction(transaction)
                 self._cleanup_created(anchor, created)
@@ -465,31 +523,53 @@ class GuardedPublisher:
                     unchanged=False,
                 )
             except BaseException as exc:
+                if committed:
+                    assert transaction is not None
+                    cleanup_signal = self._finish_committed_cleanup(
+                        anchor,
+                        transaction,
+                        created,
+                        exc if not isinstance(exc, Exception) else None,
+                    )
+                    if cleanup_signal is not None:
+                        raise cleanup_signal from None
+                    return PublisherReceipt(
+                        rendered=rendered,
+                        changed_paths=plan.changed_paths,
+                        unchanged=False,
+                    )
                 rollback_safe = True
                 pending: BaseException = exc
                 if transaction is not None:
                     try:
                         rollback_safe = self._rollback(anchor, transaction)
+                        if transaction.protected_entries:
+                            rollback_safe = False
                     except BaseException as rollback_exc:
                         rollback_safe = False
-                        pending = rollback_exc
+                        if isinstance(exc, Exception):
+                            pending = rollback_exc
                     try:
                         self._cleanup_failed(transaction)
                     except BaseException as cleanup_exc:
                         rollback_safe = False
-                        if not isinstance(cleanup_exc, Exception):
+                        if not isinstance(cleanup_exc, Exception) and isinstance(
+                            pending, Exception
+                        ):
                             pending = cleanup_exc
                     try:
                         self._close_transaction(transaction)
                     except BaseException as cleanup_exc:
                         rollback_safe = False
-                        if not isinstance(cleanup_exc, Exception):
+                        if not isinstance(cleanup_exc, Exception) and isinstance(
+                            pending, Exception
+                        ):
                             pending = cleanup_exc
                 try:
                     self._cleanup_created(anchor, created)
                 except BaseException as cleanup_exc:
                     rollback_safe = False
-                    if not isinstance(cleanup_exc, Exception):
+                    if not isinstance(cleanup_exc, Exception) and isinstance(pending, Exception):
                         pending = cleanup_exc
                 if not isinstance(pending, Exception):
                     raise pending from None
@@ -501,6 +581,29 @@ class GuardedPublisher:
                     else ForgeErrorCode.EXTERNAL_MODIFICATION
                 )
                 raise _error(code) from None
+
+    def _finish_committed_cleanup(
+        self,
+        anchor: _VaultAnchor,
+        transaction: _Transaction,
+        created: list[_CreatedDirectory],
+        pending_signal: BaseException | None,
+    ) -> BaseException | None:
+        cleanups: tuple[Callable[[], None], ...] = (
+            lambda: self._cleanup_committed(transaction),
+            lambda: self._close_transaction(transaction),
+            lambda: self._cleanup_created(anchor, created),
+        )
+        for cleanup in cleanups:
+            for _attempt in range(2):
+                try:
+                    cleanup()
+                except BaseException as cleanup_exc:
+                    if not isinstance(cleanup_exc, Exception) and pending_signal is None:
+                        pending_signal = cleanup_exc
+                    continue
+                break
+        return pending_signal
 
     @staticmethod
     def _manifest_path(book_key: str) -> str:
@@ -517,11 +620,11 @@ class GuardedPublisher:
 
     def _candidate_paths(
         self,
-        initial: RenderedObsidianBook,
+        initial_paths: tuple[str, ...],
         rendered: RenderedObsidianBook,
         previous: ObsidianBookManifest | None,
     ) -> tuple[str, ...]:
-        paths = {*initial.files, *rendered.files}
+        paths = {*initial_paths, *rendered.files}
         if previous is not None:
             paths.add(previous.moc_path)
             paths.update(chapter.note_path for chapter in previous.chapters)
@@ -643,7 +746,13 @@ class GuardedPublisher:
                 os.close(parent)
             raise
 
-    def _read_snapshot(self, anchor: _VaultAnchor, path: str) -> _FileSnapshot:
+    def _read_snapshot(
+        self,
+        anchor: _VaultAnchor,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> _FileSnapshot:
         anchor.verify()
         path = validate_relative_path(path)
         parent_path, _, name = path.rpartition("/")
@@ -660,11 +769,12 @@ class GuardedPublisher:
             if not stat.S_ISREG(entry.st_mode):
                 raise _error(ForgeErrorCode.PATH_NOT_ALLOWED)
             limit = _MAX_MANIFEST_BYTES if path.endswith(".json") else _MAX_MARKDOWN_BYTES
-            if entry.st_size > limit:
+            allowed = limit if max_bytes is None else min(limit, max(0, max_bytes))
+            if entry.st_size > allowed:
                 raise _error(ForgeErrorCode.PATH_NOT_ALLOWED)
             descriptor = os.open(name, _READ_FLAGS, dir_fd=parent)
             before = os.fstat(descriptor)
-            if not stat.S_ISREG(before.st_mode) or before.st_size > limit:
+            if not stat.S_ISREG(before.st_mode) or before.st_size > allowed:
                 raise _error(ForgeErrorCode.PATH_NOT_ALLOWED)
             data = _read_descriptor(descriptor, before.st_size)
             after = os.fstat(descriptor)
@@ -676,6 +786,7 @@ class GuardedPublisher:
                 True,
                 parent_identity=parent_identity,
                 identity=_identity(after),
+                size=after.st_size,
                 digest=hashlib.sha256(data).hexdigest(),
                 data=data,
             )
@@ -781,19 +892,15 @@ class GuardedPublisher:
                         os.close(descriptor)
         _fsync(transaction.stage_fd)
 
-    @staticmethod
-    def _match_planning_bytes(
-        existing: dict[str, bytes], snapshots: dict[str, _FileSnapshot]
-    ) -> None:
-        for path, snapshot in snapshots.items():
-            if snapshot.exists != (path in existing):
-                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            if snapshot.exists and snapshot.data != existing[path]:
-                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-
     def _require_snapshot(self, anchor: _VaultAnchor, path: str, expected: _FileSnapshot) -> None:
         current = self._read_snapshot(anchor, path)
-        if current != expected:
+        if (
+            current.exists != expected.exists
+            or current.parent_identity != expected.parent_identity
+            or current.identity != expected.identity
+            or current.size != expected.size
+            or current.digest != expected.digest
+        ):
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
 
     def _commit(
@@ -831,6 +938,7 @@ class GuardedPublisher:
             not expected.exists
             or expected.parent_identity is None
             or expected.identity is None
+            or expected.size is None
             or expected.digest is None
         ):
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
@@ -842,93 +950,44 @@ class GuardedPublisher:
                 os.close(parent)
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         backup_name = f"b{len(transaction.backups):06d}"
+        backup = _BackupFile(
+            path=path,
+            parent_path=parent_path,
+            source_name=name,
+            name=backup_name,
+            parent_identity=expected.parent_identity,
+            identity=expected.identity,
+            digest=expected.digest,
+            size=expected.size,
+        )
+        transaction.backups.append(backup)
         try:
-            try:
-                os.rename(
-                    name,
-                    backup_name,
-                    src_dir_fd=parent,
-                    dst_dir_fd=transaction.backup_fd,
-                )
-            except BaseException:
-                if self._entry_exists(transaction.backup_fd, backup_name):
-                    self._protect_moved(
-                        transaction,
-                        transaction.backup_fd,
-                        "backup",
-                        backup_name,
-                        path,
-                    )
-                    self._restore_moved(
-                        transaction,
-                        transaction.backup_fd,
-                        backup_name,
-                        parent,
-                        name,
-                    )
-                raise
-            try:
-                self._protect_moved(
-                    transaction,
-                    transaction.backup_fd,
-                    "backup",
-                    backup_name,
-                    path,
-                )
-                moved_status = os.stat(
-                    backup_name,
-                    dir_fd=transaction.backup_fd,
-                    follow_symlinks=False,
-                )
-            except BaseException:
-                self._restore_moved(
-                    transaction,
-                    transaction.backup_fd,
-                    backup_name,
-                    parent,
-                    name,
-                )
-                raise
-            if not stat.S_ISREG(moved_status.st_mode):
-                self._restore_moved(
-                    transaction,
-                    transaction.backup_fd,
-                    backup_name,
-                    parent,
-                    name,
-                )
-                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            try:
-                moved = self._snapshot_in_directory(transaction.backup_fd, backup_name)
-            except BaseException:
-                self._restore_moved(
-                    transaction,
-                    transaction.backup_fd,
-                    backup_name,
-                    parent,
-                    name,
-                )
-                raise
-            if moved.identity != expected.identity or moved.digest != expected.digest:
-                self._restore_moved(
-                    transaction,
-                    transaction.backup_fd,
-                    backup_name,
-                    parent,
-                    name,
-                )
-                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            self._forget_moved(transaction, transaction.backup_fd, backup_name)
-            transaction.backups.append(
-                _BackupFile(
-                    path,
-                    backup_name,
-                    expected.parent_identity,
-                    expected.identity,
-                    expected.digest,
-                    len(moved.data or b""),
-                )
+            self._protect_moved(
+                transaction,
+                transaction.backup_fd,
+                "backup",
+                backup_name,
+                path,
             )
+            moved = _rename_noreplace(
+                name,
+                backup_name,
+                source_fd=parent,
+                destination_fd=transaction.backup_fd,
+            )
+            if not moved:
+                backup.status = _BackupStatus.PROTECTED
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            backup.status = _BackupStatus.MOVED
+            moved_snapshot = self._snapshot_in_directory(transaction.backup_fd, backup_name)
+            if (
+                moved_snapshot.identity != backup.identity
+                or moved_snapshot.size != backup.size
+                or moved_snapshot.digest != backup.digest
+            ):
+                backup.status = _BackupStatus.PROTECTED
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            backup.status = _BackupStatus.VERIFIED
             _fsync(parent)
             _fsync(transaction.backup_fd)
         except FileNotFoundError:
@@ -938,7 +997,7 @@ class GuardedPublisher:
         except PermissionError:
             raise _error(ForgeErrorCode.OUTPUT_PERMISSION_DENIED) from None
         except OSError:
-            raise _error(ForgeErrorCode.OUTPUT_PERMISSION_DENIED) from None
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
         finally:
             with suppress(OSError):
                 os.close(parent)
@@ -960,8 +1019,11 @@ class GuardedPublisher:
         original_path: str,
     ) -> None:
         key = (directory_fd, moved_name)
-        if key in transaction.recoveries:
-            return
+        existing = transaction.recoveries.get(key)
+        if existing is not None:
+            if existing.durable:
+                return
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         transaction.protected_entries.add(key)
         recovery_id = uuid4().hex
         record_name = f"recovery-{recovery_id}.json"
@@ -980,6 +1042,15 @@ class GuardedPublisher:
         descriptor: int | None = None
         try:
             descriptor = os.open(record_name, _WRITE_FLAGS, 0o600, dir_fd=transaction.fd)
+            identity = _identity(os.fstat(descriptor))
+            recovery = _RecoveryEntry(
+                original_path,
+                container,
+                moved_name,
+                record_name,
+                identity,
+            )
+            transaction.recoveries[key] = recovery
             offset = 0
             while offset < len(payload):
                 written = os.write(descriptor, payload[offset:])
@@ -987,15 +1058,8 @@ class GuardedPublisher:
                     raise OSError("short recovery write")
                 offset += written
             _fsync(descriptor)
-            identity = _identity(os.fstat(descriptor))
-            transaction.recoveries[key] = _RecoveryEntry(
-                original_path,
-                container,
-                moved_name,
-                record_name,
-                identity,
-            )
             _fsync(transaction.fd)
+            recovery.durable = True
         finally:
             if descriptor is not None:
                 with suppress(OSError):
@@ -1003,14 +1067,17 @@ class GuardedPublisher:
 
     def _forget_moved(self, transaction: _Transaction, directory_fd: int, moved_name: str) -> None:
         key = (directory_fd, moved_name)
-        recovery = transaction.recoveries.pop(key, None)
+        recovery = transaction.recoveries.get(key)
         if recovery is not None:
-            self._unlink_if_identity(
+            removed = self._unlink_if_identity(
                 transaction,
                 transaction.fd,
                 recovery.record_name,
                 recovery.record_identity,
             )
+            if not removed:
+                return
+            transaction.recoveries.pop(key, None)
         transaction.protected_entries.discard(key)
 
     def _restore_moved(
@@ -1054,6 +1121,7 @@ class GuardedPublisher:
             return _FileSnapshot(
                 True,
                 identity=_identity(after),
+                size=after.st_size,
                 digest=hashlib.sha256(data).hexdigest(),
                 data=data,
             )
@@ -1090,6 +1158,17 @@ class GuardedPublisher:
                 pass
             else:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            published = _PublishedFile(
+                path=path,
+                parent_path=parent_path,
+                name=name,
+                parent_identity=parent_identity,
+                identity=staged.identity,
+                digest=staged.digest,
+                size=len(expected_bytes),
+                data=expected_bytes,
+            )
+            transaction.published.append(published)
             os.link(
                 staged.name,
                 name,
@@ -1107,15 +1186,7 @@ class GuardedPublisher:
                 or target.data != expected_bytes
             ):
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            transaction.published.append(
-                _PublishedFile(
-                    path,
-                    parent_identity,
-                    staged.identity,
-                    staged.digest,
-                    len(expected_bytes),
-                )
-            )
+            published.status = _PublishedStatus.PUBLISHED
             stage_status = os.stat(staged.name, dir_fd=transaction.stage_fd, follow_symlinks=False)
             if _identity(stage_status) != staged.identity:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
@@ -1136,7 +1207,7 @@ class GuardedPublisher:
 
     def _verify_published_files(self, anchor: _VaultAnchor, transaction: _Transaction) -> None:
         for published in transaction.published:
-            expected = transaction.expected_writes[published.path]
+            expected = published.data
             current = self._read_snapshot(anchor, published.path)
             if (
                 not current.exists
@@ -1152,45 +1223,112 @@ class GuardedPublisher:
         safe = True
         pending_signal: BaseException | None = None
         for published in reversed(transaction.published):
-            try:
-                removed = self._remove_published(anchor, transaction, published)
-            except BaseException as exc:
+            removed = False
+            for _attempt in range(3):
                 try:
-                    removed = not self._read_snapshot(anchor, published.path).exists
-                except BaseException:
-                    removed = False
-                if not isinstance(exc, Exception) and pending_signal is None:
-                    pending_signal = exc
+                    removed = self._remove_published(anchor, transaction, published)
+                except BaseException as exc:
+                    if not isinstance(exc, Exception) and pending_signal is None:
+                        pending_signal = exc
+                    continue
+                break
             if not removed:
+                published.status = _PublishedStatus.COMPETITOR
                 safe = False
         for backup in reversed(transaction.backups):
-            try:
-                restored = self._restore_backup(anchor, transaction, backup)
-            except BaseException as exc:
+            restored = False
+            for _attempt in range(3):
                 try:
-                    current = self._read_snapshot(anchor, backup.path)
-                    restored = (
-                        current.exists
-                        and current.parent_identity == backup.parent_identity
-                        and current.identity == backup.identity
-                        and current.digest == backup.digest
-                    )
-                except BaseException:
-                    restored = False
-                if not isinstance(exc, Exception) and pending_signal is None:
-                    pending_signal = exc
+                    restored = self._reconcile_backup(anchor, transaction, backup)
+                except BaseException as exc:
+                    if not isinstance(exc, Exception) and pending_signal is None:
+                        pending_signal = exc
+                    continue
+                break
             if not restored:
                 safe = False
-                self._protect_moved(
-                    transaction,
-                    transaction.backup_fd,
-                    "backup",
-                    backup.name,
-                    backup.path,
-                )
+                backup.status = _BackupStatus.PROTECTED
         if pending_signal is not None:
             raise pending_signal
         return safe
+
+    def _reconcile_backup(
+        self,
+        anchor: _VaultAnchor,
+        transaction: _Transaction,
+        backup: _BackupFile,
+    ) -> bool:
+        visible: _FileSnapshot | None = None
+        with suppress(ForgeException, OSError):
+            visible = self._read_snapshot(anchor, backup.path)
+        destination: _FileSnapshot | None = None
+        destination_exists = False
+        try:
+            destination = self._snapshot_in_directory(transaction.backup_fd, backup.name)
+            destination_exists = True
+        except FileNotFoundError:
+            pass
+        except (ForgeException, OSError):
+            destination_exists = self._entry_exists(transaction.backup_fd, backup.name)
+        if visible is None:
+            if not destination_exists:
+                backup.status = _BackupStatus.NO_MOVE
+                self._forget_moved(transaction, transaction.backup_fd, backup.name)
+            else:
+                backup.status = _BackupStatus.PROTECTED
+            return False
+        visible_is_old = self._snapshot_matches_backup(visible, backup)
+        destination_is_old = destination is not None and self._snapshot_matches_backup(
+            destination, backup
+        )
+        if visible_is_old:
+            if destination is None:
+                backup.status = _BackupStatus.NO_MOVE
+            elif destination_is_old:
+                backup.status = _BackupStatus.RESTORED
+            else:
+                backup.status = _BackupStatus.PROTECTED
+                return False
+            self._forget_moved(transaction, transaction.backup_fd, backup.name)
+            return True
+        if visible.exists or not destination_is_old:
+            if not visible.exists and destination_exists:
+                self._restore_unverified_backup_entry(anchor, transaction, backup)
+            backup.status = _BackupStatus.PROTECTED
+            return False
+        return self._restore_backup(anchor, transaction, backup)
+
+    def _restore_unverified_backup_entry(
+        self,
+        anchor: _VaultAnchor,
+        transaction: _Transaction,
+        backup: _BackupFile,
+    ) -> bool:
+        parent = self._open_directory(anchor, backup.parent_path, create=False)
+        if parent is None:
+            return False
+        try:
+            if _identity(os.fstat(parent)) != backup.parent_identity:
+                return False
+            return self._restore_moved(
+                transaction,
+                transaction.backup_fd,
+                backup.name,
+                parent,
+                backup.source_name,
+            )
+        finally:
+            os.close(parent)
+
+    @staticmethod
+    def _snapshot_matches_backup(snapshot: _FileSnapshot, backup: _BackupFile) -> bool:
+        return (
+            snapshot.exists
+            and snapshot.parent_identity in {None, backup.parent_identity}
+            and snapshot.identity == backup.identity
+            and snapshot.size == backup.size
+            and snapshot.digest == backup.digest
+        )
 
     def _remove_published(
         self,
@@ -1198,86 +1336,87 @@ class GuardedPublisher:
         transaction: _Transaction,
         published: _PublishedFile,
     ) -> bool:
-        parent_path, _, name = published.path.rpartition("/")
-        try:
-            parent = self._open_directory(anchor, parent_path, create=False)
-            if parent is None or _identity(os.fstat(parent)) != published.parent_identity:
-                if parent is not None:
-                    os.close(parent)
-                return False
-            rollback_name = f"r{len(transaction.protected_entries):06d}-{uuid4().hex}"
-            try:
-                try:
-                    os.rename(
-                        name,
-                        rollback_name,
-                        src_dir_fd=parent,
-                        dst_dir_fd=transaction.fd,
-                    )
-                except BaseException as rename_exc:
-                    if self._entry_exists(transaction.fd, rollback_name):
-                        try:
-                            removed = self._discard_moved_published(
-                                transaction,
-                                rollback_name,
-                                published,
-                            )
-                        except BaseException as inspect_exc:
-                            self._restore_moved(
-                                transaction,
-                                transaction.fd,
-                                rollback_name,
-                                parent,
-                                name,
-                            )
-                            raise inspect_exc from None
-                        if removed:
-                            _fsync(transaction.fd)
-                            _fsync(parent)
-                            if not isinstance(rename_exc, Exception):
-                                raise rename_exc from None
-                            return True
-                        self._restore_moved(
-                            transaction,
-                            transaction.fd,
-                            rollback_name,
-                            parent,
-                            name,
-                        )
-                    raise
-                try:
-                    removed = self._discard_moved_published(
-                        transaction,
-                        rollback_name,
-                        published,
-                    )
-                except BaseException:
-                    self._restore_moved(
-                        transaction,
-                        transaction.fd,
-                        rollback_name,
-                        parent,
-                        name,
-                    )
-                    raise
-                if removed:
-                    _fsync(transaction.fd)
-                    _fsync(parent)
-                    return True
-                self._restore_moved(
-                    transaction,
-                    transaction.fd,
-                    rollback_name,
-                    parent,
-                    name,
-                )
-                return False
-            except FileNotFoundError:
-                return False
-            finally:
+        parent_path = published.parent_path
+        name = published.name
+        parent = self._open_directory(anchor, parent_path, create=False)
+        if parent is None or _identity(os.fstat(parent)) != published.parent_identity:
+            if parent is not None:
                 os.close(parent)
-        except (ForgeException, OSError):
             return False
+        try:
+            if published.rollback_name is not None:
+                settled = self._settle_published_move(
+                    transaction,
+                    published,
+                    parent,
+                )
+                if settled is not None:
+                    return settled
+            rollback_name = f"r{len(transaction.protected_entries):06d}-{uuid4().hex}"
+            published.rollback_name = rollback_name
+            self._protect_moved(
+                transaction,
+                transaction.fd,
+                "transaction",
+                rollback_name,
+                published.path,
+            )
+            try:
+                os.rename(
+                    name,
+                    rollback_name,
+                    src_dir_fd=parent,
+                    dst_dir_fd=transaction.fd,
+                )
+            except BaseException as rename_exc:
+                settled = self._settle_published_move(transaction, published, parent)
+                if settled:
+                    if not isinstance(rename_exc, Exception):
+                        raise rename_exc from None
+                    return True
+                raise
+            settled = self._settle_published_move(transaction, published, parent)
+            return bool(settled)
+        except FileNotFoundError:
+            if published.rollback_name is not None:
+                self._forget_moved(transaction, transaction.fd, published.rollback_name)
+                published.rollback_name = None
+            published.status = _PublishedStatus.ABSENT
+            return True
+        finally:
+            os.close(parent)
+
+    def _settle_published_move(
+        self,
+        transaction: _Transaction,
+        published: _PublishedFile,
+        parent: int,
+    ) -> bool | None:
+        rollback_name = published.rollback_name
+        if rollback_name is None:
+            return None
+        if not self._entry_exists(transaction.fd, rollback_name):
+            self._forget_moved(transaction, transaction.fd, rollback_name)
+            published.rollback_name = None
+            return None
+        removed = self._discard_moved_published(transaction, rollback_name, published)
+        if removed:
+            _fsync(transaction.fd)
+            _fsync(parent)
+            published.status = _PublishedStatus.REMOVED
+            published.rollback_name = None
+            return True
+        restored = self._restore_moved(
+            transaction,
+            transaction.fd,
+            rollback_name,
+            parent,
+            published.name,
+        )
+        if restored:
+            published.rollback_name = None
+        published.status = _PublishedStatus.COMPETITOR
+        return False
 
     def _discard_moved_published(
         self,
@@ -1300,7 +1439,7 @@ class GuardedPublisher:
         if not stat.S_ISREG(moved_status.st_mode):
             return False
         moved = self._snapshot_in_directory(transaction.fd, rollback_name)
-        expected = transaction.expected_writes[published.path]
+        expected = published.data
         if (
             moved.identity != published.identity
             or moved.digest != published.digest
@@ -1308,8 +1447,8 @@ class GuardedPublisher:
             or len(expected) != published.size
         ):
             return False
-        self._forget_moved(transaction, transaction.fd, rollback_name)
         os.unlink(rollback_name, dir_fd=transaction.fd)
+        self._forget_moved(transaction, transaction.fd, rollback_name)
         return True
 
     def _restore_backup(
@@ -1318,14 +1457,14 @@ class GuardedPublisher:
         transaction: _Transaction,
         backup: _BackupFile,
     ) -> bool:
-        parent_path, _, name = backup.path.rpartition("/")
+        parent_path = backup.parent_path
+        name = backup.source_name
         try:
             stored = self._snapshot_in_directory(transaction.backup_fd, backup.name)
             if (
                 stored.identity != backup.identity
                 or stored.digest != backup.digest
-                or stored.data is None
-                or len(stored.data) != backup.size
+                or stored.size != backup.size
             ):
                 return False
             parent = self._open_directory(anchor, parent_path, create=False)
@@ -1349,12 +1488,13 @@ class GuardedPublisher:
                 restored = (
                     visible.identity == backup.identity
                     and visible.digest == backup.digest
-                    and visible.data is not None
-                    and len(visible.data) == backup.size
+                    and visible.size == backup.size
                 )
                 if not restored:
                     self._unlink_named_identity(parent, name, backup.identity)
                     return False
+                backup.status = _BackupStatus.RESTORED
+                self._forget_moved(transaction, transaction.backup_fd, backup.name)
                 _fsync(parent)
                 return True
             except FileExistsError:
@@ -1374,56 +1514,98 @@ class GuardedPublisher:
             pass
 
     def _cleanup_committed(self, transaction: _Transaction) -> None:
-        self._cleanup_entries(transaction)
-
-    def _cleanup_failed(self, transaction: _Transaction) -> None:
-        with suppress(OSError, ForgeException):
-            self._cleanup_entries(transaction)
-
-    def _cleanup_entries(self, transaction: _Transaction) -> None:
         for staged in transaction.staged.values():
             self._unlink_if_identity(
                 transaction, transaction.stage_fd, staged.name, staged.identity
             )
         for backup in transaction.backups:
-            self._unlink_if_identity(
-                transaction, transaction.backup_fd, backup.name, backup.identity
+            removed = self._unlink_identity_without_protection(
+                transaction.backup_fd,
+                backup.name,
+                backup.identity,
             )
+            if removed:
+                self._forget_moved(transaction, transaction.backup_fd, backup.name)
         _fsync(transaction.stage_fd)
         _fsync(transaction.backup_fd)
+
+    def _cleanup_failed(self, transaction: _Transaction) -> None:
+        with suppress(OSError, ForgeException):
+            for staged in transaction.staged.values():
+                self._unlink_if_identity(
+                    transaction, transaction.stage_fd, staged.name, staged.identity
+                )
+            for backup in transaction.backups:
+                if backup.status in {_BackupStatus.RESTORED, _BackupStatus.NO_MOVE}:
+                    self._unlink_if_identity(
+                        transaction,
+                        transaction.backup_fd,
+                        backup.name,
+                        backup.identity,
+                    )
+            _fsync(transaction.stage_fd)
+            _fsync(transaction.backup_fd)
+
+    @staticmethod
+    def _unlink_identity_without_protection(
+        directory_fd: int,
+        name: str,
+        expected: _Identity,
+    ) -> bool:
+        try:
+            status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        if stat.S_ISREG(status.st_mode) and _identity(status) == expected:
+            os.unlink(name, dir_fd=directory_fd)
+            return True
+        return False
 
     @staticmethod
     def _unlink_if_identity(
         transaction: _Transaction, directory_fd: int, name: str, expected: _Identity
-    ) -> None:
+    ) -> bool:
         if (directory_fd, name) in transaction.protected_entries:
-            return
+            return False
         try:
             status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
-            return
+            return True
         if stat.S_ISREG(status.st_mode) and _identity(status) == expected:
             os.unlink(name, dir_fd=directory_fd)
+            return True
+        return False
 
     def _close_transaction(self, transaction: _Transaction) -> None:
         if transaction.closed:
             return
+        pending_signal: BaseException | None = None
+        actions: tuple[Callable[[], None], ...] = (
+            lambda: os.close(transaction.stage_fd),
+            lambda: os.close(transaction.backup_fd),
+            lambda: os.rmdir("stage", dir_fd=transaction.fd),
+            lambda: os.rmdir("backup", dir_fd=transaction.fd),
+            lambda: os.close(transaction.fd),
+            lambda: os.rmdir(transaction.name, dir_fd=transaction.parent_fd),
+            lambda: os.close(transaction.parent_fd),
+        )
+        for action in actions:
+            for _attempt in range(2):
+                try:
+                    action()
+                except OSError:
+                    break
+                except BaseException as exc:
+                    if pending_signal is None:
+                        pending_signal = exc
+                    continue
+                break
         transaction.closed = True
-        for descriptor in (transaction.stage_fd, transaction.backup_fd):
-            with suppress(OSError):
-                os.close(descriptor)
-        with suppress(OSError):
-            os.rmdir("stage", dir_fd=transaction.fd)
-        with suppress(OSError):
-            os.rmdir("backup", dir_fd=transaction.fd)
-        with suppress(OSError):
-            os.close(transaction.fd)
-        with suppress(OSError):
-            os.rmdir(transaction.name, dir_fd=transaction.parent_fd)
-        with suppress(OSError):
-            os.close(transaction.parent_fd)
+        if pending_signal is not None:
+            raise pending_signal
 
     def _cleanup_created(self, anchor: _VaultAnchor, created: Iterable[_CreatedDirectory]) -> None:
+        pending_signal: BaseException | None = None
         for item in reversed(tuple(created)):
             parent_path, _, name = item.path.rpartition("/")
             try:
@@ -1438,3 +1620,9 @@ class GuardedPublisher:
                     os.close(parent)
             except (OSError, ForgeException):
                 continue
+            except BaseException as exc:
+                if pending_signal is None:
+                    pending_signal = exc
+                continue
+        if pending_signal is not None:
+            raise pending_signal

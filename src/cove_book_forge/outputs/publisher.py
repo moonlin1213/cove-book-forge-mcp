@@ -866,6 +866,7 @@ class GuardedPublisher:
             created: list[_CreatedDirectory] = []
             transaction: _Transaction | None = None
             committed = False
+            committed_bundle_verified = False
             try:
                 for path in sorted({*plan.writes, *plan.removals}):
                     parent = path.rsplit("/", 1)[0] if "/" in path else ""
@@ -933,8 +934,13 @@ class GuardedPublisher:
                 anchor.verify()
                 self._verify_published_files(anchor, transaction)
                 anchor.verify()
+                assert transaction.journal is not None
+                self._durabilize_new_bundle(anchor, transaction.journal)
                 self._persist_transaction_phase(transaction, _TransactionPhase.COMMITTED)
                 committed = True
+                if not self._new_bundle_is_complete(anchor, transaction.journal, {}):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                committed_bundle_verified = True
                 self._cleanup_committed(transaction)
                 self._close_transaction(transaction)
                 self._cleanup_created(anchor, created)
@@ -946,6 +952,11 @@ class GuardedPublisher:
             except BaseException as exc:
                 if committed:
                     assert transaction is not None
+                    if not committed_bundle_verified:
+                        self._close_recovery_descriptors(transaction)
+                        if not isinstance(exc, Exception):
+                            raise exc from None
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
                     cleanup_signal = self._finish_committed_cleanup(
                         anchor,
                         transaction,
@@ -1023,7 +1034,11 @@ class GuardedPublisher:
             return True
         if journal is None or not self._old_bundle_is_complete(anchor, journal):
             return False
+        self._durabilize_old_bundle(anchor, journal)
         self._persist_transaction_phase(transaction, _TransactionPhase.ROLLED_BACK)
+        if not self._old_bundle_is_complete(anchor, journal):
+            self._close_recovery_descriptors(transaction)
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         self._cleanup_rolled_back(transaction)
         return not transaction.protected_entries and not transaction.recoveries
 
@@ -1055,23 +1070,39 @@ class GuardedPublisher:
             return (
                 pending_signal or last_cleanup_error or _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             )
-        cleanups: tuple[Callable[[], None], ...] = (
-            lambda: self._close_transaction(transaction),
-            lambda: self._cleanup_created(anchor, created),
-        )
-        for cleanup in cleanups:
-            for _attempt in range(2):
-                try:
-                    cleanup()
-                except BaseException as cleanup_exc:
-                    if pending_signal is None and (
-                        not isinstance(cleanup_exc, Exception)
-                        or isinstance(cleanup_exc, OSError)
-                        and cleanup_exc.errno == errno.EBADF
-                    ):
-                        pending_signal = cleanup_exc
-                    continue
-                break
+        close_complete = False
+        last_close_error: BaseException | None = None
+        for _attempt in range(2):
+            try:
+                self._close_transaction(transaction)
+            except BaseException as cleanup_exc:
+                last_close_error = cleanup_exc
+                if pending_signal is None and not isinstance(cleanup_exc, Exception):
+                    pending_signal = cleanup_exc
+                continue
+            close_complete = True
+            break
+        if not close_complete:
+            self._close_recovery_descriptors(transaction)
+            return (
+                pending_signal or last_close_error or _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            )
+        created_cleanup_complete = False
+        last_created_error: BaseException | None = None
+        for _attempt in range(2):
+            try:
+                self._cleanup_created(anchor, created)
+            except BaseException as cleanup_exc:
+                last_created_error = cleanup_exc
+                if pending_signal is None and not isinstance(cleanup_exc, Exception):
+                    pending_signal = cleanup_exc
+                continue
+            created_cleanup_complete = True
+            break
+        if not created_cleanup_complete:
+            return (
+                pending_signal or last_created_error or _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            )
         return pending_signal
 
     def _recover_transactions(self, anchor: _VaultAnchor) -> None:
@@ -1192,16 +1223,7 @@ class GuardedPublisher:
                 state_records[record_name] = snapshot.identity
             if selected_journal is None or selected_phase is None:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            required_phases = {_TransactionPhase.PREPARED, selected_phase}
-            if selected_phase in {
-                _TransactionPhase.MANIFEST_PENDING,
-                _TransactionPhase.COMMITTED,
-            } or (
-                selected_phase is _TransactionPhase.ROLLED_BACK
-                and _TransactionPhase.MANIFEST_PENDING in found_phases
-            ):
-                required_phases.add(_TransactionPhase.MANIFEST_PENDING)
-            if found_phases != required_phases:
+            if not self._valid_recovery_phase_set(found_phases, selected_phase):
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             if (
                 selected_journal.transaction_name != name
@@ -1246,6 +1268,36 @@ class GuardedPublisher:
                 if descriptor is not None:
                     with suppress(OSError):
                         os.close(descriptor)
+
+    @staticmethod
+    def _valid_recovery_phase_set(
+        found: set[_TransactionPhase], selected: _TransactionPhase
+    ) -> bool:
+        if selected is _TransactionPhase.PREPARED:
+            return found == {_TransactionPhase.PREPARED}
+        if selected is _TransactionPhase.MANIFEST_PENDING:
+            return found == {
+                _TransactionPhase.PREPARED,
+                _TransactionPhase.MANIFEST_PENDING,
+            }
+        chains = (
+            (
+                _TransactionPhase.PREPARED,
+                _TransactionPhase.MANIFEST_PENDING,
+                _TransactionPhase.COMMITTED,
+            ),
+            (_TransactionPhase.PREPARED, _TransactionPhase.ROLLED_BACK),
+            (
+                _TransactionPhase.PREPARED,
+                _TransactionPhase.MANIFEST_PENDING,
+                _TransactionPhase.ROLLED_BACK,
+            ),
+        )
+        return any(
+            chain[-1] is selected and found == set(chain[index:])
+            for chain in chains
+            for index in range(len(chain))
+        )
 
     def _reclaim_prejournal_transaction(
         self,
@@ -1437,6 +1489,8 @@ class GuardedPublisher:
         elif phase is _TransactionPhase.MANIFEST_PENDING and commit_visible:
             self._durabilize_new_bundle(anchor, journal)
             self._persist_transaction_phase(transaction, _TransactionPhase.COMMITTED)
+            if not self._new_bundle_is_complete(anchor, journal, {}):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             self._recover_committed_transaction(transaction)
         else:
             self._recover_precommit_transaction(anchor, transaction, stage_bytes)
@@ -1525,32 +1579,147 @@ class GuardedPublisher:
 
     def _durabilize_new_bundle(self, anchor: _VaultAnchor, journal: _TransactionJournal) -> None:
         anchor.verify()
+        manifest_bytes: bytes | None = None
         for write in journal.writes:
-            parent_path, _, name = write.path.rpartition("/")
-            parent = self._open_directory(anchor, parent_path, create=False)
-            if parent is None:
-                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-            descriptor: int | None = None
-            try:
-                if _identity(os.fstat(parent)) != write.parent_identity:
-                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-                descriptor = os.open(name, _READ_FLAGS, dir_fd=parent)
-                status = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(status.st_mode)
-                    or _identity(status) != write.identity
-                    or status.st_size != write.size
-                ):
-                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-                _fsync_file(descriptor)
-                _fsync_directory(parent)
-            finally:
-                if descriptor is not None:
-                    with suppress(OSError):
-                        os.close(descriptor)
-                with suppress(OSError):
-                    os.close(parent)
+            data = self._durabilize_regular_file(
+                anchor,
+                write.path,
+                write.parent_identity,
+                write.identity,
+                write.size,
+                write.digest,
+            )
+            if write.path == journal.manifest_path:
+                manifest_bytes = data
+        write_paths = {write.path for write in journal.writes}
+        for old in journal.old_files:
+            if old.path not in write_paths:
+                self._durabilize_absence(anchor, old.path, old.parent_identity)
+        if manifest_bytes is None:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        try:
+            parsed = parse_obsidian_manifest(manifest_bytes)
+        except ForgeException:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+        if parsed.checksum != journal.new_manifest_checksum:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         anchor.verify()
+
+    def _durabilize_old_bundle(self, anchor: _VaultAnchor, journal: _TransactionJournal) -> None:
+        anchor.verify()
+        manifest_bytes: bytes | None = None
+        for old in journal.old_files:
+            if old.exists:
+                if old.identity is None or old.size is None or old.digest is None:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                data = self._durabilize_regular_file(
+                    anchor,
+                    old.path,
+                    old.parent_identity,
+                    old.identity,
+                    old.size,
+                    old.digest,
+                )
+                if old.path == journal.manifest_path:
+                    manifest_bytes = data
+            else:
+                self._durabilize_absence(anchor, old.path, old.parent_identity)
+        if journal.old_manifest_checksum is None:
+            if manifest_bytes is not None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        else:
+            if manifest_bytes is None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            try:
+                parsed = parse_obsidian_manifest(manifest_bytes)
+            except ForgeException:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
+            if parsed.checksum != journal.old_manifest_checksum:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        anchor.verify()
+
+    def _durabilize_regular_file(
+        self,
+        anchor: _VaultAnchor,
+        path: str,
+        parent_identity: _Identity,
+        identity: _Identity,
+        size: int,
+        digest: str,
+    ) -> bytes:
+        parent_path, _, name = path.rpartition("/")
+        parent = self._open_directory(anchor, parent_path, create=False)
+        if parent is None:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        descriptor: int | None = None
+        try:
+            if _identity(os.fstat(parent)) != parent_identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            entry = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            descriptor = os.open(name, _READ_FLAGS, dir_fd=parent)
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(entry.st_mode)
+                or not stat.S_ISREG(before.st_mode)
+                or _identity(entry) != identity
+                or _identity(before) != identity
+                or entry.st_size != size
+                or before.st_size != size
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            data = _read_descriptor(descriptor, size)
+            after = os.fstat(descriptor)
+            if (
+                _identity(after) != identity
+                or after.st_size != size
+                or hashlib.sha256(data).hexdigest() != digest
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            _fsync_file(descriptor)
+            synced = os.fstat(descriptor)
+            if _identity(synced) != identity or synced.st_size != size:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            _fsync_directory(parent)
+            if _identity(os.fstat(parent)) != parent_identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            return data
+        finally:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            with suppress(OSError):
+                os.close(parent)
+
+    def _durabilize_absence(
+        self,
+        anchor: _VaultAnchor,
+        path: str,
+        parent_identity: _Identity,
+    ) -> None:
+        parent_path, _, name = path.rpartition("/")
+        parent = self._open_directory(anchor, parent_path, create=False)
+        if parent is None:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        try:
+            if _identity(os.fstat(parent)) != parent_identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            _fsync_directory(parent)
+            if _identity(os.fstat(parent)) != parent_identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        finally:
+            with suppress(OSError):
+                os.close(parent)
 
     def _recover_precommit_transaction(
         self,
@@ -1627,7 +1796,10 @@ class GuardedPublisher:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         elif journal.old_manifest_checksum is not None or manifest_snapshot.exists:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        self._durabilize_old_bundle(anchor, journal)
         self._persist_transaction_phase(transaction, _TransactionPhase.ROLLED_BACK)
+        if not self._old_bundle_is_complete(anchor, journal):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         self._cleanup_rolled_back(transaction)
         if transaction.protected_entries or transaction.recoveries:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)

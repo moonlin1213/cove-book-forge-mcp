@@ -27,6 +27,67 @@ def _insert_minimal_book(connection: sqlite3.Connection, book_id: str = "book-1"
     )
 
 
+_VALID_ANALYSIS_TABLE_COLUMNS = """
+    source_system TEXT NOT NULL,
+    external_book_id TEXT NOT NULL,
+    chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),
+    input_fingerprint TEXT NOT NULL,
+    analysis_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+"""
+
+
+def _create_v3_database_with_analysis_table(path: Path, analysis_table_columns: str) -> None:
+    with sqlite3.connect(path) as connection, connection:
+        for statement in library_database._SCHEMA_V1:  # noqa: SLF001 - legacy fixture
+            connection.execute(statement)
+        connection.execute(
+            "ALTER TABLE chapter_snapshots "
+            "ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
+        )
+        connection.execute(f"CREATE TABLE chapter_analyses ({analysis_table_columns})")
+        connection.execute("PRAGMA user_version = 3")
+
+
+@pytest.mark.parametrize(
+    "analysis_table_columns",
+    [
+        _VALID_ANALYSIS_TABLE_COLUMNS,
+        _VALID_ANALYSIS_TABLE_COLUMNS.replace(
+            "chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),\n", ""
+        ),
+        _VALID_ANALYSIS_TABLE_COLUMNS.replace("input_fingerprint TEXT NOT NULL", "input_fingerprint TEXT"),
+        _VALID_ANALYSIS_TABLE_COLUMNS.replace(
+            "chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0)",
+            "chapter_index INTEGER NOT NULL",
+        ),
+        _VALID_ANALYSIS_TABLE_COLUMNS.replace(
+            "source_system TEXT NOT NULL", "source_system BLOB NOT NULL"
+        ),
+        _VALID_ANALYSIS_TABLE_COLUMNS + ", extra TEXT",
+    ],
+    ids=("no_primary_key", "missing_column", "nullable", "missing_check", "wrong_type", "extra"),
+)
+def test_v3_analysis_cache_schema_shape_fails_closed(
+    tmp_path: Path,
+    analysis_table_columns: str,
+) -> None:
+    """Weakening v3 shape validation would initialize a cache that cannot uphold its key contract."""
+    path = tmp_path / "library.sqlite3"
+    _create_v3_database_with_analysis_table(path, analysis_table_columns)
+
+    with sqlite3.connect(path) as connection, pytest.raises(sqlite3.DatabaseError):
+        library_database._inspect_library_schema(connection)  # noqa: SLF001 - inspector boundary
+
+    with pytest.raises(ForgeException) as exc_info:
+        LibraryDatabase(path).initialize()
+
+    assert exc_info.value.code is ForgeErrorCode.OUTPUT_PERMISSION_DENIED
+    assert "CREATE TABLE" not in str(exc_info.value)
+    assert str(path) not in str(exc_info.value)
+
+
 def test_schema_migration_is_explicit_idempotent_and_forward_compatible(tmp_path: Path) -> None:
     database = LibraryDatabase(tmp_path / "library.sqlite3")
 

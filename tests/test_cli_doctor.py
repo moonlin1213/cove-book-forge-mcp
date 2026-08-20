@@ -1020,6 +1020,64 @@ def test_doctor_validates_library_application_schema_without_writing(
     assert _filesystem_snapshot(tmp_path) == before
 
 
+@pytest.mark.parametrize(
+    "analysis_table_columns",
+    [
+        """
+        source_system TEXT NOT NULL,
+        external_book_id TEXT NOT NULL,
+        chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),
+        input_fingerprint TEXT NOT NULL,
+        analysis_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+        """,
+        """
+        source_system TEXT NOT NULL,
+        external_book_id TEXT NOT NULL,
+        chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),
+        input_fingerprint TEXT,
+        analysis_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (source_system, external_book_id, chapter_index)
+        """,
+        """
+        source_system TEXT NOT NULL,
+        external_book_id TEXT NOT NULL,
+        chapter_index INTEGER NOT NULL,
+        input_fingerprint TEXT NOT NULL,
+        analysis_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (source_system, external_book_id, chapter_index)
+        """,
+    ],
+    ids=("missing_primary_key", "nullable_column", "missing_chapter_index_check"),
+)
+def test_doctor_rejects_invalid_v3_analysis_cache_shape_without_writing(
+    tmp_path: Path,
+    analysis_table_columns: str,
+) -> None:
+    """Accepting a malformed v3 cache table would advertise storage as ready before upsert fails."""
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    database = data_dir / "library.sqlite3"
+    _create_library_schema(database, version=3)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.execute("DROP TABLE chapter_analyses")
+        connection.execute(f"CREATE TABLE chapter_analyses ({analysis_table_columns})")
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_snapshot(tmp_path)
+
+    result, database_check, stdout = _database_check_from_cli(config)
+
+    assert result.exit_code == 1
+    assert database_check["status"] == "fail"
+    assert "chapter_analyses" not in stdout
+    assert _filesystem_snapshot(tmp_path) == before
+
+
 @pytest.mark.parametrize("view_name", ["private_unrelated", "books"])
 def test_doctor_rejects_unversioned_view_schemas_without_writing(
     tmp_path: Path,

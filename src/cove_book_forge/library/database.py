@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import stat
 import tempfile
@@ -137,6 +138,37 @@ _REQUIRED_V1_COLUMNS = {
     ),
 }
 
+_V3_ANALYSIS_COLUMNS = (
+    ("source_system", "TEXT", 1, None, 1),
+    ("external_book_id", "TEXT", 1, None, 2),
+    ("chapter_index", "INTEGER", 1, None, 3),
+    ("input_fingerprint", "TEXT", 1, None, 0),
+    ("analysis_json", "TEXT", 1, None, 0),
+    ("created_at", "TEXT", 1, None, 0),
+    ("updated_at", "TEXT", 1, None, 0),
+)
+
+
+def _has_v3_analysis_table_shape(connection: sqlite3.Connection) -> bool:
+    columns = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), row[4], int(row[5]))
+        for row in connection.execute("PRAGMA table_info(chapter_analyses)").fetchall()
+    )
+    if columns != _V3_ANALYSIS_COLUMNS:
+        return False
+    schema_row = connection.execute(
+        "SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?",
+        ("table", "chapter_analyses"),
+    ).fetchone()
+    if schema_row is None or not isinstance(schema_row[0], str):
+        return False
+    normalized = re.sub(r"\s+", "", schema_row[0].lower())
+    normalized = normalized.replace('"', "").replace("`", "").replace("[", "").replace("]", "")
+    return re.search(
+        r"check\(\(*(?:chapter_index>=0|0<=chapter_index)\)*\)",
+        normalized,
+    ) is not None
+
 
 class _LibrarySchemaReadiness(StrEnum):
     UNINITIALIZED = "uninitialized"
@@ -204,6 +236,8 @@ def _inspect_library_schema(connection: sqlite3.Connection) -> _LibrarySchemaRea
         }
         if not expected_columns <= actual_columns:
             raise sqlite3.DatabaseError("required application column is missing")
+    if version == _SCHEMA_VERSION and not _has_v3_analysis_table_shape(connection):
+        raise sqlite3.DatabaseError("chapter analysis table has an invalid schema")
 
     if version < _SCHEMA_VERSION:
         return _LibrarySchemaReadiness.MIGRATION_PENDING

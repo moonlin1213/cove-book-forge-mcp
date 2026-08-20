@@ -1146,6 +1146,141 @@ def test_backup_noreplace_winner_is_never_restored_after_visible_source_disappea
     )
 
 
+@pytest.mark.parametrize("failure", ["keyboard_before", "oserror_after"])
+def test_backup_no_move_retries_the_same_recovery_intent_until_fully_cleared(
+    tmp_path: Path, monkeypatch, failure: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    before = _visible(vault)
+    chapter = vault / first.rendered.chapter_path
+    competitor = b"backup forget collision"
+    real_rename = publisher_module._rename_noreplace
+    real_forget = publisher_module.GuardedPublisher._forget_moved
+    signal = KeyboardInterrupt("backup no-move forget")
+    collision_name: str | None = None
+    forget_names: list[str] = []
+    fault_fired = False
+
+    def collide_backup(source, destination, *, source_fd, destination_fd):
+        nonlocal collision_name
+        if collision_name is None and source == chapter.name and destination.startswith("b"):
+            collision_name = destination
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                os.write(descriptor, competitor)
+            finally:
+                os.close(descriptor)
+            return False
+        return real_rename(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    def interrupt_forget(self, transaction, directory_fd, moved_name):
+        nonlocal fault_fired
+        if collision_name is not None and moved_name == collision_name:
+            forget_names.append(moved_name)
+            if not fault_fired:
+                fault_fired = True
+                if failure == "keyboard_before":
+                    raise signal
+                real_forget(self, transaction, directory_fd, moved_name)
+                raise OSError("PRIVATE-BACKUP-FORGET")
+        return real_forget(self, transaction, directory_fd, moved_name)
+
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", collide_backup)
+    monkeypatch.setattr(publisher_module.GuardedPublisher, "_forget_moved", interrupt_forget)
+
+    expected_error = KeyboardInterrupt if failure == "keyboard_before" else ForgeException
+    with pytest.raises(expected_error) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    if failure == "keyboard_before":
+        assert raised.value is signal
+    assert fault_fired
+    assert collision_name is not None
+    assert forget_names[:2] == [collision_name, collision_name]
+    assert _visible(vault) == before
+    collision = next((vault / ".cove-book-forge" / ".transactions").rglob(collision_name))
+    assert collision.read_bytes() == competitor
+    records = list((vault / ".cove-book-forge" / ".transactions").rglob("recovery-*.json"))
+    assert all(
+        json.loads(record.read_bytes())["moved_name"] != collision_name for record in records
+    )
+
+
+def test_backup_no_move_keeps_the_same_mapping_when_forget_cannot_clear_it(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    first = _publish(vault, _analyzed())
+    before = _visible(vault)
+    chapter = vault / first.rendered.chapter_path
+    competitor = b"protected backup cleanup failure"
+    real_rename = publisher_module._rename_noreplace
+    real_forget = publisher_module.GuardedPublisher._forget_moved
+    collision_name: str | None = None
+    forget_names: list[str] = []
+
+    def collide_backup(source, destination, *, source_fd, destination_fd):
+        nonlocal collision_name
+        if collision_name is None and source == chapter.name and destination.startswith("b"):
+            collision_name = destination
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                os.write(descriptor, competitor)
+            finally:
+                os.close(descriptor)
+            return False
+        return real_rename(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    def fail_collision_forget(self, transaction, directory_fd, moved_name):
+        if collision_name is not None and moved_name == collision_name:
+            forget_names.append(moved_name)
+            return False
+        return real_forget(self, transaction, directory_fd, moved_name)
+
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", collide_backup)
+    monkeypatch.setattr(publisher_module.GuardedPublisher, "_forget_moved", fail_collision_forget)
+
+    with pytest.raises(ForgeException):
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert collision_name is not None
+    assert len(forget_names) >= 2
+    assert set(forget_names) == {collision_name}
+    assert _visible(vault) == before
+    records = [
+        json.loads(record.read_bytes())
+        for record in (vault / ".cove-book-forge" / ".transactions").rglob("recovery-*.json")
+    ]
+    assert [record["moved_name"] for record in records].count(collision_name) == 1
+
+
 @pytest.mark.parametrize("failure", ["write", "fsync"])
 def test_recovery_intent_persistence_failure_happens_before_backup_move(
     tmp_path: Path, monkeypatch, failure: str
@@ -1390,6 +1525,187 @@ def test_rollback_ambiguous_exception_with_source_and_hardlink_destination_is_no
     assert all(
         json.loads(record.read_bytes())["moved_name"] != collision_name for record in records
     )
+
+
+@pytest.mark.parametrize("failure", ["keyboard_before", "oserror_after"])
+def test_rollback_no_move_retries_the_same_recovery_intent_until_fully_cleared(
+    tmp_path: Path, monkeypatch, failure: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    before = _visible(vault)
+    real_link = publisher_module.os.link
+    real_rename = publisher_module._rename_noreplace
+    real_forget = publisher_module.GuardedPublisher._forget_moved
+    signal = KeyboardInterrupt("rollback no-move forget")
+    competitor = b"rollback forget collision"
+    manifest_failed = False
+    collision_name: str | None = None
+    forget_names: list[str] = []
+    fault_fired = False
+
+    def fail_manifest_once(src, dst, **kwargs):
+        nonlocal manifest_failed
+        if not manifest_failed and isinstance(dst, str) and dst.endswith(".json"):
+            manifest_failed = True
+            raise OSError("PRIVATE-MANIFEST-FAILURE")
+        return real_link(src, dst, **kwargs)
+
+    def collide_rollback(source, destination, *, source_fd, destination_fd):
+        nonlocal collision_name
+        try:
+            os.stat(source, dir_fd=source_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            source_exists = False
+        else:
+            source_exists = True
+        if collision_name is None and destination.startswith("r") and source_exists:
+            collision_name = destination
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                os.write(descriptor, competitor)
+            finally:
+                os.close(descriptor)
+            return False
+        return real_rename(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    def interrupt_forget(self, transaction, directory_fd, moved_name):
+        nonlocal fault_fired
+        if collision_name is not None and moved_name == collision_name:
+            forget_names.append(moved_name)
+            if not fault_fired:
+                fault_fired = True
+                if failure == "keyboard_before":
+                    raise signal
+                real_forget(self, transaction, directory_fd, moved_name)
+                raise OSError("PRIVATE-ROLLBACK-FORGET")
+        return real_forget(self, transaction, directory_fd, moved_name)
+
+    monkeypatch.setattr(publisher_module.os, "link", fail_manifest_once)
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", collide_rollback)
+    monkeypatch.setattr(publisher_module.GuardedPublisher, "_forget_moved", interrupt_forget)
+
+    expected_error = KeyboardInterrupt if failure == "keyboard_before" else ForgeException
+    with pytest.raises(expected_error) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    if failure == "keyboard_before":
+        assert raised.value is signal
+    assert manifest_failed and fault_fired
+    assert collision_name is not None
+    assert forget_names[:2] == [collision_name, collision_name]
+    assert _visible(vault) == before
+    collision = next((vault / ".cove-book-forge" / ".transactions").rglob(collision_name))
+    assert collision.read_bytes() == competitor
+    records = list((vault / ".cove-book-forge" / ".transactions").rglob("recovery-*.json"))
+    assert all(
+        json.loads(record.read_bytes())["moved_name"] != collision_name for record in records
+    )
+
+
+def test_rollback_no_move_keeps_same_mapping_and_visible_file_when_forget_stays_failed(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    real_link = publisher_module.os.link
+    real_rename = publisher_module._rename_noreplace
+    real_forget = publisher_module.GuardedPublisher._forget_moved
+    competitor = b"protected rollback cleanup failure"
+    manifest_failed = False
+    collision_name: str | None = None
+    published_path: str | None = None
+    published_bytes: bytes | None = None
+    forget_names: list[str] = []
+
+    def fail_manifest_once(src, dst, **kwargs):
+        nonlocal manifest_failed
+        if not manifest_failed and isinstance(dst, str) and dst.endswith(".json"):
+            manifest_failed = True
+            raise OSError("PRIVATE-MANIFEST-FAILURE")
+        return real_link(src, dst, **kwargs)
+
+    def collide_rollback(source, destination, *, source_fd, destination_fd):
+        nonlocal collision_name, published_bytes
+        source_exists = False
+        if collision_name is None and destination.startswith("r"):
+            try:
+                descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=source_fd)
+            except FileNotFoundError:
+                pass
+            else:
+                source_exists = True
+                try:
+                    size = os.fstat(descriptor).st_size
+                    published_bytes = os.read(descriptor, size)
+                finally:
+                    os.close(descriptor)
+        if collision_name is None and destination.startswith("r") and source_exists:
+            collision_name = destination
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=destination_fd,
+            )
+            try:
+                os.write(descriptor, competitor)
+            finally:
+                os.close(descriptor)
+            return False
+        return real_rename(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    def fail_collision_forget(self, transaction, directory_fd, moved_name):
+        nonlocal published_path
+        if collision_name is not None and moved_name == collision_name:
+            forget_names.append(moved_name)
+            recovery = transaction.recoveries[(directory_fd, moved_name)]
+            published_path = recovery.original_path
+            return False
+        return real_forget(self, transaction, directory_fd, moved_name)
+
+    monkeypatch.setattr(publisher_module.os, "link", fail_manifest_once)
+    monkeypatch.setattr(publisher_module, "_rename_noreplace", collide_rollback)
+    monkeypatch.setattr(publisher_module.GuardedPublisher, "_forget_moved", fail_collision_forget)
+
+    with pytest.raises(ForgeException):
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert manifest_failed
+    assert collision_name is not None
+    assert published_path is not None
+    assert published_bytes is not None
+    assert len(forget_names) >= 2
+    assert set(forget_names) == {collision_name}
+    assert (vault / published_path).read_bytes() == published_bytes
+    collision = next((vault / ".cove-book-forge" / ".transactions").rglob(collision_name))
+    assert collision.read_bytes() == competitor
+    records = [
+        json.loads(record.read_bytes())
+        for record in (vault / ".cove-book-forge" / ".transactions").rglob("recovery-*.json")
+    ]
+    assert [record["moved_name"] for record in records].count(collision_name) == 1
 
 
 @pytest.mark.parametrize("kind", ["directory", "symlink", "fifo"])

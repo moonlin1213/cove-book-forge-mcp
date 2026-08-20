@@ -1074,7 +1074,7 @@ class GuardedPublisher:
                 with suppress(OSError):
                     os.close(descriptor)
 
-    def _forget_moved(self, transaction: _Transaction, directory_fd: int, moved_name: str) -> None:
+    def _forget_moved(self, transaction: _Transaction, directory_fd: int, moved_name: str) -> bool:
         key = (directory_fd, moved_name)
         recovery = transaction.recoveries.get(key)
         if recovery is not None:
@@ -1085,9 +1085,10 @@ class GuardedPublisher:
                 recovery.record_identity,
             )
             if not removed:
-                return
+                return False
             transaction.recoveries.pop(key, None)
         transaction.protected_entries.discard(key)
+        return key not in transaction.recoveries and key not in transaction.protected_entries
 
     def _restore_moved(
         self,
@@ -1240,7 +1241,8 @@ class GuardedPublisher:
                     if not isinstance(exc, Exception) and pending_signal is None:
                         pending_signal = exc
                     continue
-                break
+                if removed:
+                    break
             if not removed:
                 published.status = _PublishedStatus.COMPETITOR
                 safe = False
@@ -1253,10 +1255,12 @@ class GuardedPublisher:
                     if not isinstance(exc, Exception) and pending_signal is None:
                         pending_signal = exc
                     continue
-                break
+                if restored:
+                    break
             if not restored:
                 safe = False
-                backup.status = _BackupStatus.PROTECTED
+                if backup.status is not _BackupStatus.NO_MOVE_CONFLICT:
+                    backup.status = _BackupStatus.PROTECTED
         if pending_signal is not None:
             raise pending_signal
         return safe
@@ -1267,11 +1271,18 @@ class GuardedPublisher:
         transaction: _Transaction,
         backup: _BackupFile,
     ) -> bool:
+        if backup.status is _BackupStatus.NO_MOVE_CONFLICT:
+            if not self._forget_moved(transaction, transaction.backup_fd, backup.name):
+                return False
+            conflict_visible: _FileSnapshot | None = None
+            with suppress(ForgeException, OSError):
+                conflict_visible = self._read_snapshot(anchor, backup.path)
+            return conflict_visible is not None and self._snapshot_matches_backup(
+                conflict_visible, backup
+            )
         visible: _FileSnapshot | None = None
         with suppress(ForgeException, OSError):
             visible = self._read_snapshot(anchor, backup.path)
-        if backup.status is _BackupStatus.NO_MOVE_CONFLICT:
-            return visible is not None and self._snapshot_matches_backup(visible, backup)
         destination: _FileSnapshot | None = None
         destination_exists = False
         try:
@@ -1372,6 +1383,11 @@ class GuardedPublisher:
                         return settled
                 elif published.rollback_status is _RollbackMoveStatus.AMBIGUOUS:
                     return False
+                elif published.rollback_status is _RollbackMoveStatus.NO_MOVE_CONFLICT:
+                    if not self._forget_moved(transaction, transaction.fd, published.rollback_name):
+                        return False
+                    published.rollback_name = None
+                    published.rollback_status = None
             source_state = self._published_entry_state(parent, name, published)
             if source_state == "absent":
                 published.status = _PublishedStatus.ABSENT
@@ -1400,8 +1416,8 @@ class GuardedPublisher:
                 source_state = self._published_entry_state(parent, name, published)
                 if source_state == "expected":
                     published.rollback_status = _RollbackMoveStatus.NO_MOVE_CONFLICT
-                    self._forget_moved(transaction, transaction.fd, rollback_name)
-                    published.rollback_name = None
+                    if self._forget_moved(transaction, transaction.fd, rollback_name):
+                        published.rollback_name = None
                     raise rename_exc from None
                 if source_state == "absent" and self._rollback_destination_matches(
                     transaction, rollback_name, published
@@ -1416,8 +1432,10 @@ class GuardedPublisher:
                 raise rename_exc from None
             if not moved:
                 published.rollback_status = _RollbackMoveStatus.NO_MOVE_CONFLICT
-                self._forget_moved(transaction, transaction.fd, rollback_name)
+                if not self._forget_moved(transaction, transaction.fd, rollback_name):
+                    return False
                 published.rollback_name = None
+                published.rollback_status = None
                 source_state = self._published_entry_state(parent, name, published)
                 if source_state == "absent":
                     published.status = _PublishedStatus.ABSENT

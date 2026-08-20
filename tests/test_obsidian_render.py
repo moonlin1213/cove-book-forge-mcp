@@ -43,9 +43,15 @@ def _snapshot(
         chapter=ChapterContent(
             index=0, title=title, content=content, source_locator="epub:spine-1"
         ),
-        highlights=(Highlight(id="h1", text="Keep options open.", note="Useful reminder."),),
+        highlights=(
+            Highlight(id="h1", text="Keep options open.", note="Useful reminder.", page=3),
+        ),
         user_notes=(UserNote(id="n1", text="Try this at work."),),
-        annotations=(Annotation(id="a1", text="Question this assumption.", author_label="Reader"),),
+        annotations=(
+            Annotation(
+                id="a1", text="Question this assumption.", author_label="Reader", paragraph_index=2
+            ),
+        ),
         reflections=(
             Reflection(id="r1", text="This changes my next step.", author_label="Reader"),
         ),
@@ -129,11 +135,15 @@ def _render(snapshot: ChapterSnapshot | None = None, analyzed: AnalyzedChapter |
 
 
 def _frontmatter_and_body(data: bytes) -> tuple[dict[str, object], bytes]:
-    prefix, body = data.split(b"---\n", 2)[1:]
-    fields = {
-        line.split(": ", 1)[0]: json.loads(line.split(": ", 1)[1])
-        for line in prefix.decode("utf-8").splitlines()
-    }
+    assert data.startswith(b"---\n")
+    prefix, body = data[4:].split(b"---\n", 1)
+    fields: dict[str, object] = {}
+    for line in prefix.decode("utf-8").splitlines():
+        key, separator, raw_value = line.partition(": ")
+        assert separator and key and key not in fields
+        value = json.loads(raw_value)
+        assert isinstance(value, str)
+        fields[key] = value
     return fields, body
 
 
@@ -158,7 +168,7 @@ def test_rendering_uses_stable_identities_across_unicode_and_newline_variants() 
         _snapshot(title="Make reversible moves", content="Original chapter text.\r\n"),
         _analyzed(),
     )
-    assert baseline.manifest.book_key == "4a35674a27a8d10c"
+    assert baseline.manifest.book_key == "08af3b942747e8a8"
     assert baseline.manifest.book_key == equivalent.manifest.book_key
     assert baseline.card_paths == equivalent.card_paths
 
@@ -304,3 +314,107 @@ def test_empty_analysis_collections_render_fixed_sections_without_private_source
     payload = json.loads(canonical_manifest_bytes(rendered.manifest))
     assert "private body" not in json.dumps(payload, ensure_ascii=False)
     assert all(not path.startswith("/") and ".." not in path.split("/") for path in rendered.files)
+
+
+def test_book_key_uses_an_unambiguous_canonical_source_identity() -> None:
+    first = _snapshot()
+    second = first.model_copy(update={"source_system": "coveb", "external_book_id": "ook-42"})
+    assert _render(first).manifest.book_key != _render(second).manifest.book_key
+
+
+def test_moc_coverage_is_one_complete_line_not_characters() -> None:
+    rendered = _render()
+    moc = rendered.files[rendered.moc_path].decode("utf-8")
+    assert "- Rendered: 1 / known total: 3." in moc
+    assert "## Unprocessed chapters\n- 02\n- 03" in moc
+
+
+def test_untrusted_rendered_fields_cannot_create_markdown_or_html_links_or_blocks() -> None:
+    snapshot = _snapshot(
+        title=(
+            "  ### Attack\n> quote\n- bullet\n1. ordered\n```\n---\nhttp://evil.test\n"
+            "[link](https://evil.test)\n<script>x</script>"
+        )
+    )
+    analyzed = _analyzed().model_copy(
+        update={
+            "analysis": _analyzed().analysis.model_copy(
+                update={"core_idea": "www.evil.test obsidian://open?vault=x <img src=x>"}
+            )
+        }
+    )
+    rendered = _render(snapshot, analyzed)
+    chapter = rendered.files[rendered.chapter_path].decode("utf-8")
+    assert "<script>" not in chapter and "<img" not in chapter
+    assert "http://evil.test" not in chapter and "https://evil.test" not in chapter
+    assert "www.evil.test" not in chapter and "obsidian://" not in chapter
+    assert "\n### Attack" not in chapter and "\n> quote" not in chapter
+    assert "\n- bullet" not in chapter and "\n1. ordered" not in chapter
+
+
+def test_render_includes_all_contract_semantics_with_context_and_attribution() -> None:
+    rendered = _render()
+    chapter = rendered.files[rendered.chapter_path].decode("utf-8")
+    for value in (
+        "Reduce scope.",
+        "Not for emergencies.",
+        "Early decisions.",
+        "Before commitment.",
+        "Run a small test.",
+        "Useful reminder.",
+        "page 3",
+        "Reader (annotation, paragraph 2): Question this assumption.",
+        "Reader (reflection): This changes my next step.",
+        "p. 4: Supporting passage",
+    ):
+        assert value in chapter
+
+
+def test_same_book_title_change_keeps_physical_book_and_moc_paths_locked() -> None:
+    initial = _render()
+    renamed = _snapshot(title="Renamed chapter")
+    renamed = renamed.model_copy(
+        update={"book": renamed.book.model_copy(update={"title": "New title", "total_chapters": 1})}
+    )
+    rerendered = ObsidianRenderer(ObsidianOutputConfig()).render(
+        renamed, _analyzed(), initial.manifest
+    )
+    assert rerendered.moc_path == initial.moc_path
+    assert rerendered.manifest.book_directory == initial.manifest.book_directory
+    assert rerendered.manifest.book_title == "New title"
+    assert rerendered.manifest.total_chapters == 3
+
+
+def test_rendered_files_mapping_cannot_be_mutated_after_construction() -> None:
+    rendered = _render()
+    with pytest.raises(TypeError):
+        rendered.files["Books/evil.md"] = b"evil"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "path", ["/absolute.md", "../escape.md", "Cards\\escape.md", "Cards/CON.txt"]
+)
+def test_public_result_rejects_nonportable_paths(path: str) -> None:
+    with pytest.raises(ValidationError):
+        ObsidianPublishResult(
+            book_key="0" * 16,
+            chapter_path=path,
+            moc_path="Books/moc.md",
+            input_fingerprint="a" * 64,
+        )
+
+
+def test_unicode_display_names_and_relative_paths_stay_inside_byte_budgets() -> None:
+    snapshot = _snapshot(title="📚" * 50)
+    snapshot = snapshot.model_copy(
+        update={"book": snapshot.book.model_copy(update={"title": "书" * 50})}
+    )
+    rendered = ObsidianRenderer(
+        ObsidianOutputConfig(notes_folder="资料/笔记", cards_folder="卡片/原子")
+    ).render(snapshot, _analyzed(), None)
+    assert all(len(path.encode("utf-8")) <= 240 for path in rendered.files)
+    assert all(
+        len(component.encode("utf-8")) <= 120
+        for path in rendered.files
+        for component in path.split("/")
+    )

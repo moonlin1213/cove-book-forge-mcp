@@ -26,6 +26,7 @@ from cove_book_forge.outputs.obsidian_models import (
     ObsidianChapterManifest,
     RenderedObsidianBook,
 )
+from cove_book_forge.path_safety import validate_component, validate_relative_path
 
 _SCHEMA: Literal[1] = 1
 _MARKDOWN_FIELDS = (
@@ -39,6 +40,8 @@ _MARKDOWN_FIELDS = (
     "cove_body_sha256",
 )
 _UNSAFE_FILENAME = re.compile(r'[\\/:*?"<>|]+')
+_BARE_LINK = re.compile(r"(?i)\b(https?://|www\.|obsidian://)")
+_BLOCK_LINE = re.compile(r"^ {0,3}(?:#{1,6}(?:\s|$)|>|[-+*]\s|\d+[.)]\s|`{3,}|~{3,}|(?:=+|-+)\s*$)")
 
 
 def canonical_manifest_bytes(manifest: ObsidianBookManifest) -> bytes:
@@ -57,10 +60,11 @@ def _normalized_text(value: str) -> str:
 
 
 def _book_key(snapshot: ChapterSnapshot) -> str:
-    identity = _normalized_text(snapshot.source_system) + _normalized_text(
-        snapshot.external_book_id
-    )
-    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    identity = [
+        _normalized_text(snapshot.source_system),
+        _normalized_text(snapshot.external_book_id),
+    ]
+    return hashlib.sha256(_canonical_json_bytes(identity)).hexdigest()[:16]
 
 
 def _safe_component(value: str, fallback: str, *, limit: int = 80) -> str:
@@ -83,33 +87,38 @@ def _safe_component(value: str, fallback: str, *, limit: int = 80) -> str:
         *(f"lpt{number}" for number in range(1, 10)),
     }:
         normalized = f"{fallback}-{normalized}"
-    truncated = normalized[:limit].rstrip(" .") or fallback
+
+    def clip_bytes(text: str, budget: int) -> str:
+        result = ""
+        for character in text:
+            if len((result + character).encode("utf-8")) > budget:
+                break
+            result += character
+        return result
+
+    truncated = clip_bytes(normalized, limit).rstrip(" .") or fallback
     if truncated != original:
         suffix = hashlib.sha256(original.encode("utf-8")).hexdigest()[:8]
-        truncated = f"{truncated[: limit - len(suffix) - 2].rstrip(' .')}--{suffix}"
-    return truncated
+        truncated = f"{clip_bytes(truncated, limit - len(suffix) - 2).rstrip(' .')}--{suffix}"
+    return validate_component(truncated, max_bytes=limit)
 
 
 def _markdown_text(value: str) -> str:
     """Render untrusted content as inert Markdown data, preserving visible text."""
     escaped = html.escape(_normalized_text(value), quote=False)
     escaped = escaped.replace("\\", "\\\\")
+    escaped = _BARE_LINK.sub(
+        lambda match: match.group(1).replace(":", "\\:").replace(".", "\\."), escaped
+    )
     for character in ("`", "*", "_", "[", "]"):
         escaped = escaped.replace(character, f"\\{character}")
     lines = escaped.split("\n")
-    return "\n".join(
-        f"\\{line}" if line.startswith(("#", ">", "-", "+", "*")) else line for line in lines
-    )
+    return "\n".join(f"\\{line}" if _BLOCK_LINE.match(line) else line for line in lines)
 
 
 def _markdown_link(label: str, source_path: str, target_path: str) -> str:
     relative = posixpath.relpath(target_path, start=posixpath.dirname(source_path) or ".")
-    if (
-        target_path.startswith("/")
-        or "\\" in target_path
-        or any(component in {"", ".", ".."} for component in target_path.split("/"))
-    ):
-        raise ValueError("managed link target is not a vault-relative managed path")
+    validate_relative_path(target_path)
     return f"[{_markdown_text(label)}]({quote(relative, safe='/-._~')})"
 
 
@@ -218,10 +227,15 @@ class ObsidianRenderer:
         previous: ObsidianBookManifest | None,
     ) -> RenderedObsidianBook:
         book_key = _book_key(snapshot)
-        book_title = _safe_component(snapshot.book.title, "Untitled Book")
-        chapter_title = _safe_component(snapshot.chapter.title, "Untitled Chapter")
-        book_dir = f"{self._config.notes_folder}/{book_title}--{book_key}"
-        moc_path = f"{book_dir}/{book_title} MOC.md"
+        book_title = _safe_component(snapshot.book.title, "Untitled Book", limit=45)
+        chapter_title = _safe_component(snapshot.chapter.title, "Untitled Chapter", limit=38)
+        candidate_book_dir = f"{self._config.notes_folder}/{book_title}--{book_key}"
+        if previous is not None and previous.book_key == book_key:
+            book_dir = previous.book_directory
+            moc_path = previous.moc_path
+        else:
+            book_dir = candidate_book_dir
+            moc_path = f"{book_dir}/{book_title} MOC.md"
         chapter_path = f"{book_dir}/Chapters/{snapshot.chapter.index + 1:02d} {chapter_title}.md"
         analysis = analyzed.analysis
 
@@ -254,6 +268,7 @@ class ObsidianRenderer:
             previous=previous,
             book_key=book_key,
             book_title=book_title,
+            total_chapters=snapshot.book.total_chapters,
             moc_path=moc_path,
             current=chapter_summary,
             cards=cards,
@@ -274,6 +289,8 @@ class ObsidianRenderer:
             manifest_path: canonical_manifest_bytes(manifest),
             **card_files,
         }
+        for path in files:
+            validate_relative_path(path)
         return RenderedObsidianBook(
             files=files,
             manifest=manifest,
@@ -409,7 +426,8 @@ class ObsidianRenderer:
         )
         sections.extend(
             _list(
-                f"{item.name}: {item.when_to_use} {item.why}".strip()
+                f"{item.name}: {item.when_to_use} {'; '.join(item.how)} {item.why} "
+                f"limitations: {'; '.join(item.limitations)}".strip()
                 for item in analysis.frameworks
             )
         )
@@ -417,14 +435,27 @@ class ObsidianRenderer:
         sections.extend(_list(f"{item.term}: {item.definition}" for item in analysis.concepts))
         sections.extend(["", "## Mental models"])
         sections.extend(
-            _list(f"{item.name}: {item.explanation}" for item in analysis.mental_models)
+            _list(
+                f"{item.name}: {item.explanation} {item.when_to_use}"
+                for item in analysis.mental_models
+            )
         )
         sections.extend(["", "## Methods"])
         sections.extend(
-            _list(f"{item.name}: {'; '.join(item.steps)}".rstrip(": ") for item in analysis.methods)
+            _list(
+                f"{item.name}: {'; '.join(item.steps)} {item.when_to_use} limitations: {'; '.join(item.limitations)}".rstrip(
+                    ": "
+                )
+                for item in analysis.methods
+            )
         )
         sections.extend(["", "## Anti-patterns"])
-        sections.extend(_list(f"{item.name}: {item.why}" for item in analysis.anti_patterns))
+        sections.extend(
+            _list(
+                f"{item.name}: {item.why} Alternative: {item.alternative}"
+                for item in analysis.anti_patterns
+            )
+        )
         sections.extend(["", "## Decision rules"])
         sections.extend(_list(item.rule for item in analysis.decision_rules))
         sections.extend(["", "## Worked examples"])
@@ -438,7 +469,17 @@ class ObsidianRenderer:
         sections.extend(_list(analysis.key_takeaways))
         sections.extend(["", "## Highlights"])
         sections.extend(
-            _list((*analysis.highlight_insights, *(item.text for item in snapshot.highlights)))
+            _list(
+                (
+                    *analysis.highlight_insights,
+                    *(
+                        f"{item.text} {item.note}"
+                        f"{' page ' + str(item.page) if item.page is not None else ''}"
+                        f"{' paragraph ' + str(item.paragraph_index) if item.paragraph_index is not None else ''}"
+                        for item in snapshot.highlights
+                    ),
+                )
+            )
         )
         sections.extend(["", "## User notes"])
         sections.extend(_list(item.text for item in snapshot.user_notes))
@@ -446,8 +487,15 @@ class ObsidianRenderer:
         sections.extend(
             _list(
                 (
-                    *(item.text for item in snapshot.annotations),
-                    *(item.text for item in snapshot.reflections),
+                    *(
+                        f"{item.author_label or 'Annotation'} ({item.kind}"
+                        f"{', paragraph ' + str(item.paragraph_index) if item.paragraph_index is not None else ''}): {item.text}"
+                        for item in snapshot.annotations
+                    ),
+                    *(
+                        f"{item.author_label or 'Reflection'} (reflection): {item.text}"
+                        for item in snapshot.reflections
+                    ),
                     *analysis.annotation_insights,
                 )
             )
@@ -474,6 +522,7 @@ class ObsidianRenderer:
         previous: ObsidianBookManifest | None,
         book_key: str,
         book_title: str,
+        total_chapters: int,
         moc_path: str,
         current: ObsidianChapterManifest,
         cards: tuple[ObsidianCardManifest, ...],
@@ -504,7 +553,14 @@ class ObsidianRenderer:
             schema=_SCHEMA,
             book_key=book_key,
             book_title=book_title,
+            book_directory=moc_path.rsplit("/", 1)[0],
             moc_path=moc_path,
+            total_chapters=max(
+                total_chapters,
+                previous.total_chapters
+                if previous is not None and previous.book_key == book_key
+                else 0,
+            ),
             chapters=chapters,
             cards=all_cards,
         )
@@ -512,7 +568,15 @@ class ObsidianRenderer:
 
     def _moc_body(self, manifest: ObsidianBookManifest, moc_path: str) -> str:
         sections = [f"# {_markdown_text(manifest.book_title)} MOC", "", "## Coverage"]
-        sections.extend(_list(f"{len(manifest.chapters)} chapter(s) rendered."))
+        known = str(manifest.total_chapters) if manifest.total_chapters else "unknown"
+        sections.extend(_list((f"Rendered: {len(manifest.chapters)} / known total: {known}.",)))
+        sections.extend(["", "## Unprocessed chapters"])
+        missing = [
+            f"{index + 1:02d}"
+            for index in range(manifest.total_chapters)
+            if index not in {chapter.index for chapter in manifest.chapters}
+        ]
+        sections.extend(_list(missing))
         sections.extend(["", "## Chapter directory"])
         sections.extend(
             [

@@ -1,6 +1,7 @@
-from pydantic import ConfigDict, Field
+from pydantic import ConfigDict, Field, field_validator
 
 from cove_book_forge.contracts.base import ContractModel
+from cove_book_forge.path_safety import validate_relative_path
 
 
 class ObsidianPublishResult(ContractModel):
@@ -15,3 +16,10 @@ class ObsidianPublishResult(ContractModel):
     input_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     changed_paths: tuple[str, ...] = ()
     unchanged: bool = False
+
+    @field_validator("chapter_path", "moc_path", "card_paths", "changed_paths")
+    @classmethod
+    def validate_paths(cls, value: str | tuple[str, ...]) -> str | tuple[str, ...]:
+        if isinstance(value, tuple):
+            return tuple(validate_relative_path(path) for path in value)
+        return validate_relative_path(value)

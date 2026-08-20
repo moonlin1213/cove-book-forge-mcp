@@ -111,3 +111,12 @@ def test_obsidian_folders_are_canonical_relative_posix_paths() -> None:
     config = ObsidianOutputConfig(notes_folder="Bo\u0308cher/Notes", cards_folder="Cards/Atomic")
     assert config.notes_folder == "B\u00f6cher/Notes"
     assert config.cards_folder == "Cards/Atomic"
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["C:Books", "C:/Books", "\\\\server\\share", "Books/CON.txt", "Books/name. ", "Books:stream"],
+)
+def test_obsidian_folders_reject_portability_hazards(value: str) -> None:
+    with pytest.raises(ValidationError):
+        ObsidianOutputConfig(notes_folder=value)

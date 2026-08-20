@@ -68,7 +68,7 @@ class ObsidianRenderer:
 
 ## Locked Managed Format
 
-- `book_key = sha256(canonical source_system + external_book_id)[:16]`.
+- `book_key = sha256(canonical JSON composite [source_system, external_book_id])[:16]`; `+` denotes the canonical composite, never ambiguous bare string concatenation.
 - Book directory: `<notes_folder>/<safe book title>--<book_key>/`.
 - MOC: `<book directory>/<safe book title> MOC.md`.
 - Chapter note: `<book directory>/Chapters/<index+1:02d> <safe chapter title>.md`.

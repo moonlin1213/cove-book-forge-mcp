@@ -1,8 +1,9 @@
-import unicodedata
 from pathlib import Path
 from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+
+from cove_book_forge.path_safety import validate_relative_path
 
 
 class ConfigModel(BaseModel):
@@ -53,20 +54,7 @@ class ObsidianOutputConfig(ConfigModel):
     def normalize_safe_relative_folder(cls, value: object) -> str:
         if not isinstance(value, str):
             raise ValueError("Obsidian folders must be strings")
-        normalized = unicodedata.normalize("NFC", value)
-        if not normalized or "\\" in normalized or normalized.startswith("/"):
-            raise ValueError("Obsidian folders must be safe relative POSIX paths")
-        components = normalized.split("/")
-        if any(
-            not component
-            or component in {".", ".."}
-            or component.strip() != component
-            or any(unicodedata.category(character).startswith("C") for character in component)
-            or any(character in ':*?"<>|' for character in component)
-            for component in components
-        ):
-            raise ValueError("Obsidian folders must be safe relative POSIX paths")
-        return "/".join(components)
+        return validate_relative_path(value, max_path_bytes=120)
 
     @model_validator(mode="after")
     def require_absolute_enabled_path(self) -> Self:

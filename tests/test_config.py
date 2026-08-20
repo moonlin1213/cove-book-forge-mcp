@@ -4,7 +4,12 @@ import pytest
 from pydantic import ValidationError
 
 from cove_book_forge.config.loader import dump_config, load_config
-from cove_book_forge.config.models import AnalysisConfig, AppConfig, ObsidianOutputConfig
+from cove_book_forge.config.models import (
+    AnalysisConfig,
+    AppConfig,
+    ObsidianOutputConfig,
+    SkillOutputConfig,
+)
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 
 
@@ -120,3 +125,22 @@ def test_obsidian_folders_are_canonical_relative_posix_paths() -> None:
 def test_obsidian_folders_reject_portability_hazards(value: str) -> None:
     with pytest.raises(ValidationError):
         ObsidianOutputConfig(notes_folder=value)
+
+
+@pytest.mark.parametrize("path", [None, Path("relative"), Path("../escape")])
+def test_enabled_skill_output_requires_an_absolute_canonical_root(path: Path | None) -> None:
+    with pytest.raises(ValidationError):
+        SkillOutputConfig(enabled=True, canonical_path=path)
+
+
+def test_skill_output_rejects_duplicate_or_unsupported_install_targets(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        SkillOutputConfig(
+            enabled=True,
+            canonical_path=tmp_path,
+            install_to=("agents", "agents"),
+        )
+    with pytest.raises(ValidationError):
+        SkillOutputConfig.model_validate(
+            {"enabled": True, "canonical_path": str(tmp_path), "install_to": ["shell"]}
+        )

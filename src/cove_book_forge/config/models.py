@@ -68,6 +68,15 @@ class SkillOutputConfig(ConfigModel):
     canonical_path: Path | None = None
     install_to: tuple[Literal["agents", "codex", "claude"], ...] = ()
 
+    @field_validator("install_to")
+    @classmethod
+    def reject_duplicate_install_targets(
+        cls, value: tuple[Literal["agents", "codex", "claude"], ...]
+    ) -> tuple[Literal["agents", "codex", "claude"], ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("Skill install_to targets must be unique")
+        return value
+
     @model_validator(mode="after")
     def require_absolute_enabled_path(self) -> Self:
         if self.enabled and (self.canonical_path is None or not self.canonical_path.is_absolute()):

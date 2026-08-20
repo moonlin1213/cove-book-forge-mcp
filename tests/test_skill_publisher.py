@@ -6,6 +6,8 @@ import json
 import os
 import shutil
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -36,6 +38,60 @@ def _next(
         _analyzed(fingerprint=f"{chapter_index + 1:x}" * 64),
         previous.manifest,
     )
+
+
+def _run_skill_cleanup_hard_crash(root: Path, checkpoint: str) -> None:
+    script = r"""
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path.cwd() / "tests"))
+from test_skill_render import _analyzed, _render, _snapshot
+
+from cove_book_forge.config import SkillOutputConfig
+from cove_book_forge.outputs import AgentSkillRenderer
+from cove_book_forge.outputs.skill_publisher import CanonicalSkillPublisher
+
+root = Path(os.environ["COVE_SKILL_CRASH_ROOT"])
+checkpoint = os.environ["COVE_SKILL_CRASH_POINT"]
+first = _render()
+renderer = AgentSkillRenderer(SkillOutputConfig())
+second = renderer.render(
+    _snapshot(chapter_index=1, title="Second chapter"),
+    _analyzed(fingerprint="2" * 64),
+    first.manifest,
+)
+third = renderer.render(
+    _snapshot(chapter_index=2, title="Third chapter"),
+    _analyzed(fingerprint="3" * 64),
+    second.manifest,
+)
+
+def crash(_self, phase):
+    if phase == checkpoint:
+        os._exit(86)
+
+CanonicalSkillPublisher._checkpoint = crash
+CanonicalSkillPublisher(
+    SkillOutputConfig(enabled=True, canonical_path=root)
+).publish(third)
+raise SystemExit(98)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[1],
+        env={
+            **os.environ,
+            "COVE_SKILL_CRASH_POINT": checkpoint,
+            "COVE_SKILL_CRASH_ROOT": str(root),
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert completed.returncode == 86, completed.stderr
 
 
 def _active(root: Path, rendered: RenderedAgentSkill) -> Path:
@@ -558,6 +614,152 @@ def test_restart_never_adopts_or_deletes_unowned_transaction_debris(tmp_path: Pa
     assert (competitor / "competitor.txt").read_text(encoding="utf-8") == "keep"
 
 
+def test_transaction_recovery_preserves_a_same_size_wrong_digest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rendered = _render()
+    publisher = _publisher(tmp_path)
+
+    def interrupt(phase: str) -> None:
+        if phase == "stage:file":
+            raise SimulatedProcessCrash(phase)
+
+    monkeypatch.setattr(publisher, "_checkpoint", interrupt)
+    with pytest.raises(SimulatedProcessCrash):
+        publisher.publish(rendered)
+
+    transactions = tmp_path / ".cove-book-forge" / "transactions"
+    transaction = next(transactions.glob("tx-*"))
+    content_file = next(path for path in (transaction / "content").rglob("*") if path.is_file())
+    original = content_file.read_bytes()
+    corrupted = bytes([original[0] ^ 0xFF]) + original[1:]
+    content_file.write_bytes(corrupted)
+
+    with pytest.raises(ForgeException) as error:
+        _publisher(tmp_path).publish(rendered)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert transaction.is_dir()
+    assert content_file.read_bytes() == corrupted
+
+
+def test_transaction_final_delete_rechecks_the_owner_digest_after_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rendered = _render()
+    crashing = _publisher(tmp_path)
+
+    def interrupt(phase: str) -> None:
+        if phase == "stage:file":
+            raise SimulatedProcessCrash(phase)
+
+    monkeypatch.setattr(crashing, "_checkpoint", interrupt)
+    with pytest.raises(SimulatedProcessCrash):
+        crashing.publish(rendered)
+
+    transaction = next((tmp_path / ".cove-book-forge" / "transactions").glob("tx-*"))
+    content_file = next(path for path in (transaction / "content").rglob("*") if path.is_file())
+    original = content_file.read_bytes()
+    corrupted = bytes([original[0] ^ 0xFF]) + original[1:]
+    publisher = _publisher(tmp_path)
+    unlink_identity = publisher._unlink_identity
+    raced = False
+
+    def modify_before_isolation(
+        directory_fd: int,
+        name: str,
+        identity: tuple[int, int],
+        **kwargs: object,
+    ) -> None:
+        nonlocal raced
+        if name == content_file.name and not raced:
+            descriptor = os.open(name, os.O_WRONLY, dir_fd=directory_fd)
+            try:
+                os.write(descriptor, corrupted)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            raced = True
+        unlink_identity(directory_fd, name, identity, **kwargs)
+
+    monkeypatch.setattr(publisher, "_unlink_identity", modify_before_isolation)
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(rendered)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert raced
+    assert any(path.is_file() and path.read_bytes() == corrupted for path in transaction.rglob("*"))
+
+
+@pytest.mark.parametrize("entry_kind", ["file", "directory"])
+def test_final_cleanup_atomically_isolates_a_competitor_before_deletion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entry_kind: str,
+) -> None:
+    first = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(first)
+    second = _next(first)
+    publisher.publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+    rename_noreplace = skill_publisher_module._rename_noreplace
+    competitor_identity: tuple[int, int] | None = None
+
+    def race_entry_move(
+        source: str,
+        destination: str,
+        *,
+        source_fd: int,
+        destination_fd: int,
+    ) -> bool:
+        nonlocal competitor_identity
+        target = ".owner.json" if entry_kind == "file" else "chapters"
+        if source == target and competitor_identity is None:
+            os.rename(
+                source,
+                f"saved-{target}",
+                src_dir_fd=source_fd,
+                dst_dir_fd=source_fd,
+            )
+            if entry_kind == "file":
+                descriptor = os.open(
+                    source,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                    dir_fd=source_fd,
+                )
+                try:
+                    os.write(descriptor, b"competitor")
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            else:
+                os.mkdir(source, 0o700, dir_fd=source_fd)
+            status = os.stat(source, dir_fd=source_fd, follow_symlinks=False)
+            competitor_identity = (status.st_dev, status.st_ino)
+        return rename_noreplace(
+            source,
+            destination,
+            source_fd=source_fd,
+            destination_fd=destination_fd,
+        )
+
+    monkeypatch.setattr(skill_publisher_module, "_rename_noreplace", race_entry_move)
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(third)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert competitor_identity is not None
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    identities: set[tuple[int, int]] = set()
+    for path in quarantine.rglob("*"):
+        status = os.lstat(path)
+        identities.add((status.st_dev, status.st_ino))
+    assert competitor_identity in identities
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+
 def test_cleanup_keeps_current_and_one_complete_previous_generation(tmp_path: Path) -> None:
     first = _render()
     publisher = _publisher(tmp_path)
@@ -763,6 +965,77 @@ def test_quarantine_recovery_rechecks_the_remaining_payload_digest(
 
     _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
     assert payload.read_bytes() == b"X" * len(original)
+
+
+def test_unpublished_wrapper_crashes_never_exhaust_the_quarantine_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+
+    for _ in range(128):
+        publisher = _publisher(tmp_path)
+
+        def interrupt(phase: str) -> None:
+            if phase == "cleanup:wrapper-staged":
+                raise SimulatedProcessCrash(phase)
+
+        monkeypatch.setattr(publisher, "_checkpoint", interrupt)
+        with pytest.raises(SimulatedProcessCrash, match="wrapper-staged"):
+            publisher.publish(third)
+
+    _publisher(tmp_path).publish(third)
+
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    assert list(quarantine.iterdir()) == []
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+
+def test_published_journal_only_wrapper_is_restartable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+    publisher = _publisher(tmp_path)
+
+    def interrupt(phase: str) -> None:
+        if phase == "cleanup:wrapper-published":
+            raise SimulatedProcessCrash(phase)
+
+    monkeypatch.setattr(publisher, "_checkpoint", interrupt)
+    with pytest.raises(SimulatedProcessCrash, match="wrapper-published"):
+        publisher.publish(third)
+
+    _publisher(tmp_path).publish(third)
+
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    assert list(quarantine.iterdir()) == []
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+
+def test_terminal_journal_removal_hard_crash_recovers_the_proven_empty_wrapper(
+    tmp_path: Path,
+) -> None:
+    first = _render()
+    _publisher(tmp_path).publish(first)
+    second = _next(first)
+    _publisher(tmp_path).publish(second)
+    third = _next(second, chapter_index=2, title="Third chapter")
+
+    _run_skill_cleanup_hard_crash(tmp_path, "cleanup:terminal-journal-removed")
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
+
+    _publisher(tmp_path).publish(third)
+
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    assert list(quarantine.iterdir()) == []
+    assert validate_skill_bundle(_active_files(tmp_path, third)) == third.manifest
 
 
 def test_configuration_root_and_ancestor_are_opened_without_following_links(tmp_path: Path) -> None:

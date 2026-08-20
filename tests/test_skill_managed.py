@@ -220,6 +220,11 @@ def test_bundle_scans_for_forbidden_content_and_escaping_links(forbidden: bytes)
         ("SKILL.md", b"\n[outside][escape]\n[escape]: glossary.md\n"),
         ("SKILL.md", b'\n<a href="glossary.md">outside</a>\n'),
         ("SKILL.md", b'\n<img src="glossary.md">\n'),
+        ("SKILL.md", b'\n<form action="glossary.md"></form>\n'),
+        ("SKILL.md", b'\n<meta http-equiv="refresh" content="0; glossary.md">\n'),
+        ("SKILL.md", b'\n<object data="glossary.md"></object>\n'),
+        ("SKILL.md", b"\n<!-- hidden navigation -->\n"),
+        ("SKILL.md", b"\n<!DOCTYPE html>\n"),
         ("SKILL.md", b"\n<https://example.invalid>\n"),
         ("SKILL.md", b"\n<ftp://example.invalid/file>\n"),
         ("SKILL.md", b"\n<reader@example.invalid>\n"),
@@ -237,6 +242,19 @@ def test_resigned_managed_markdown_rejects_every_non_allowlisted_navigation_form
         validate_skill_bundle(files)
 
     assert _error_code(error) is ForgeErrorCode.EXTERNAL_MODIFICATION
+
+
+def test_resigned_managed_markdown_allows_escaped_angle_bracket_text() -> None:
+    rendered = _render()
+    path = "SKILL.md"
+    escaped = b'\n&lt;form action="glossary.md"&gt;example&lt;/form&gt;\n'
+    files = _resigned_file_mutation(
+        rendered,
+        path,
+        rendered.files[path] + escaped,
+    )
+
+    assert validate_skill_bundle(files).skill_slug == rendered.skill_slug
 
 
 def test_markdown_navigation_probe_reaches_the_semantic_scanner(

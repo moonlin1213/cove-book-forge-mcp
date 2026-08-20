@@ -36,7 +36,7 @@ _MAX_FILE_BYTES: Final = 8 * 1024 * 1024
 _MAX_TOTAL_BYTES: Final = 64 * 1024 * 1024
 _INLINE_LINK = re.compile(r"(?<!!)\[[^\]\n]+\]\(([^)\n]+)\)")
 _UNESCAPED_BRACKET = re.compile(r"(?<!\\)[\[\]]")
-_HTML_NAVIGATION = re.compile(r"(?is)<[^>]+\s(?:href|src)\s*=")
+_RAW_HTML = re.compile(r"(?is)(?<!\\)<(?:/?[a-z][^>]*|!--.*?--\s*|![^>]*|\?[^>]*\?)>")
 _AUTOLINK = re.compile(r"(?i)<(?:(?:[a-z][a-z0-9+.-]*):[^>\n]+|www\.[^>\n]+|[^<>\s@]+@[^<>\s@]+)>")
 _BARE_URL = re.compile(r"(?i)(?:\bhttps?://|\bwww\.)\S+")
 _FORBIDDEN_BYTES: Final = (
@@ -189,7 +189,7 @@ def _validate_links(path: str, text: str, expected_paths: frozenset[str]) -> Non
     remaining = "".join(masked)
     if (
         _UNESCAPED_BRACKET.search(remaining)
-        or _HTML_NAVIGATION.search(remaining)
+        or _RAW_HTML.search(remaining)
         or _AUTOLINK.search(remaining)
         or _BARE_URL.search(remaining)
     ):

@@ -33,3 +33,13 @@ def test_snapshot_rejects_empty_content_and_private_unknown_fields() -> None:
         ChapterContent(index=0, title="Opening", content="")
     with pytest.raises(ValidationError):
         BookMetadata(title="A Book", moon_private=True)
+
+
+def test_book_chapter_counts_are_bounded_before_output_materialization() -> None:
+    with pytest.raises(ValidationError):
+        BookMetadata(title="A Book", total_chapters=5_001)
+    with pytest.raises(ValidationError):
+        ChapterContent(index=5_000, title="Too far", content="Content.")
+
+    assert BookMetadata(title="A Book", total_chapters=5_000).total_chapters == 5_000
+    assert ChapterContent(index=4_999, title="Last", content="Content.").index == 4_999

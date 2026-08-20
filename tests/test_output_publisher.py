@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import os
 import stat
@@ -513,6 +514,240 @@ def test_directory_child_fd_closes_when_post_open_validation_fails(
     assert len(opened_child) == 1
     with pytest.raises(OSError):
         os.fstat(opened_child[0])
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [KeyboardInterrupt("absolute open interrupt"), asyncio.CancelledError("absolute open cancel")],
+)
+def test_absolute_directory_open_closes_every_fd_on_fstat_signal(
+    tmp_path: Path, monkeypatch, signal: BaseException
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    real_open = publisher_module.os.open
+    real_fstat = publisher_module.os.fstat
+    opened: list[int] = []
+    fired = False
+
+    def record_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        opened.append(descriptor)
+        return descriptor
+
+    def interrupt_final_fstat(descriptor: int):
+        nonlocal fired
+        if opened and descriptor == opened[-1] and not fired:
+            fired = True
+            raise signal
+        return real_fstat(descriptor)
+
+    monkeypatch.setattr(publisher_module.os, "open", record_open)
+    monkeypatch.setattr(publisher_module.os, "fstat", interrupt_final_fstat)
+
+    with pytest.raises(type(signal)) as raised:
+        publisher_module._open_absolute_directory(vault, missing_is_unconfigured=False)
+
+    assert raised.value is signal
+    assert fired
+    assert opened
+    for descriptor in opened:
+        with pytest.raises(OSError):
+            real_fstat(descriptor)
+
+
+@pytest.mark.parametrize("hook", ["_backup", "_remove_published", "_restore_backup"])
+@pytest.mark.parametrize(
+    "signal",
+    [KeyboardInterrupt("transition interrupt"), asyncio.CancelledError("transition cancel")],
+)
+def test_transaction_parent_fd_closes_on_fstat_signal(
+    tmp_path: Path,
+    monkeypatch,
+    hook: str,
+    signal: BaseException,
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed())
+    before = _visible(vault)
+    original_hook = getattr(publisher_module.GuardedPublisher, hook)
+    real_open_directory = publisher_module.GuardedPublisher._open_directory
+    real_fstat = publisher_module.os.fstat
+    real_link = publisher_module.os.link
+    armed = False
+    fired = False
+    matching_opens = 0
+    acquired: list[int] = []
+    manifest_failed = False
+
+    def arm_hook(self, *args, **kwargs):
+        nonlocal armed
+        armed = True
+        try:
+            return original_hook(self, *args, **kwargs)
+        finally:
+            armed = False
+
+    def record_open_directory(self, anchor, relative, **kwargs):
+        nonlocal matching_opens
+        descriptor = real_open_directory(self, anchor, relative, **kwargs)
+        if armed and relative.endswith("Chapters") and descriptor is not None:
+            matching_opens += 1
+            wanted = matching_opens == (2 if hook == "_backup" else 1)
+            if wanted:
+                acquired.append(descriptor)
+        return descriptor
+
+    def interrupt_owned_fstat(descriptor: int):
+        nonlocal fired
+        if armed and acquired and descriptor == acquired[-1] and not fired:
+            fired = True
+            raise signal
+        return real_fstat(descriptor)
+
+    def fail_manifest_once(src, dst, **kwargs):
+        nonlocal manifest_failed
+        if (
+            hook != "_backup"
+            and not manifest_failed
+            and isinstance(dst, str)
+            and dst.endswith(".json")
+        ):
+            manifest_failed = True
+            raise OSError("PRIVATE-MANIFEST-FAILURE")
+        return real_link(src, dst, **kwargs)
+
+    monkeypatch.setattr(publisher_module.GuardedPublisher, hook, arm_hook)
+    monkeypatch.setattr(
+        publisher_module.GuardedPublisher,
+        "_open_directory",
+        record_open_directory,
+    )
+    monkeypatch.setattr(publisher_module.os, "fstat", interrupt_owned_fstat)
+    monkeypatch.setattr(publisher_module.os, "link", fail_manifest_once)
+
+    with pytest.raises(type(signal)) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64))
+
+    assert raised.value is signal
+    assert fired
+    assert acquired
+    for descriptor in acquired:
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    assert _visible(vault) == before
+
+
+def test_fsync_never_treats_ebadf_as_an_unsupported_filesystem(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    def fail_fsync(_descriptor: int) -> None:
+        raise OSError(errno.EBADF, "bad descriptor")
+
+    monkeypatch.setattr(publisher_module.os, "fsync", fail_fsync)
+
+    with pytest.raises(OSError) as file_error:
+        publisher_module._fsync_file(100)
+    with pytest.raises(OSError) as directory_error:
+        publisher_module._fsync_directory(101)
+
+    assert file_error.value.errno == errno.EBADF
+    assert directory_error.value.errno == errno.EBADF
+
+
+@pytest.mark.parametrize("unsupported", [errno.EINVAL, errno.ENOTSUP])
+def test_only_explicit_directory_fsync_unsupported_errors_are_tolerated(
+    monkeypatch: pytest.MonkeyPatch, unsupported: int
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    monkeypatch.setattr(
+        publisher_module.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError(unsupported, "unsupported")),
+    )
+
+    publisher_module._fsync_directory(100)
+    with pytest.raises(OSError) as raised:
+        publisher_module._fsync_file(101)
+    assert raised.value.errno == unsupported
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["stage", "recovery", "backup_parent", "target_parent", "manifest"],
+)
+def test_ebadf_durability_failure_never_reports_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed(card=True))
+    before = _visible(vault)
+    context: list[str] = []
+    fired = False
+    real_file_fsync = publisher_module._fsync_file
+    real_directory_fsync = publisher_module._fsync_directory
+
+    def wrap(name: str):
+        original = getattr(publisher_module.GuardedPublisher, name)
+
+        def wrapped(self, *args, **kwargs):
+            if name == "_publish_stage":
+                label = "manifest" if args[2].endswith(".json") else "target_parent"
+            elif name == "_protect_moved":
+                label = "recovery"
+            elif name == "_backup":
+                label = "backup_parent"
+            else:
+                label = "stage"
+            context.append(label)
+            try:
+                return original(self, *args, **kwargs)
+            finally:
+                context.pop()
+
+        monkeypatch.setattr(publisher_module.GuardedPublisher, name, wrapped)
+
+    for method in ("_stage", "_protect_moved", "_backup", "_publish_stage"):
+        wrap(method)
+
+    def fail_file_fsync(descriptor: int) -> None:
+        nonlocal fired
+        if not fired and context and context[-1] == phase:
+            fired = True
+            raise OSError(errno.EBADF, "bad descriptor")
+        real_file_fsync(descriptor)
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        nonlocal fired
+        if not fired and context and context[-1] == phase:
+            fired = True
+            raise OSError(errno.EBADF, "bad descriptor")
+        real_directory_fsync(descriptor)
+
+    monkeypatch.setattr(publisher_module, "_fsync_file", fail_file_fsync)
+    monkeypatch.setattr(publisher_module, "_fsync_directory", fail_directory_fsync)
+
+    with pytest.raises(ForgeException) as raised:
+        _publish(vault, _analyzed(fingerprint="b" * 64, card=True))
+
+    assert fired
+    assert raised.value.code in {
+        ForgeErrorCode.OUTPUT_PERMISSION_DENIED,
+        ForgeErrorCode.EXTERNAL_MODIFICATION,
+    }
+    assert _visible(vault) == before
+    _assert_no_transactions(vault)
 
 
 def test_staged_bytes_are_verified_before_any_visible_mutation(tmp_path: Path, monkeypatch) -> None:
@@ -1292,7 +1527,7 @@ def test_recovery_intent_persistence_failure_happens_before_backup_move(
     _publish(vault, _analyzed())
     before = _visible(vault)
     real_write = publisher_module.os.write
-    real_fsync = publisher_module._fsync
+    real_fsync = publisher_module._fsync_file
     recovery_written = False
 
     def fail_recovery_write(descriptor: int, data: bytes) -> int:
@@ -1311,7 +1546,7 @@ def test_recovery_intent_persistence_failure_happens_before_backup_move(
         real_fsync(descriptor)
 
     monkeypatch.setattr(publisher_module.os, "write", fail_recovery_write)
-    monkeypatch.setattr(publisher_module, "_fsync", fail_recovery_fsync)
+    monkeypatch.setattr(publisher_module, "_fsync_file", fail_recovery_fsync)
 
     with pytest.raises(ForgeException):
         _publish(vault, _analyzed(fingerprint="b" * 64))

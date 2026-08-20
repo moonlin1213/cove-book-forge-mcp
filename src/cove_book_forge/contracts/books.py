@@ -1,6 +1,10 @@
+from typing import Final
+
 from pydantic import Field
 
 from cove_book_forge.contracts.base import ContractModel
+
+MAX_BOOK_CHAPTERS: Final = 5_000
 
 
 class ExternalIdentity(ContractModel):
@@ -12,7 +16,7 @@ class BookMetadata(ContractModel):
     title: str = Field(min_length=1, max_length=500)
     author: str = Field(default="", max_length=300)
     language: str = Field(default="", max_length=40)
-    total_chapters: int = Field(default=0, ge=0)
+    total_chapters: int = Field(default=0, ge=0, le=MAX_BOOK_CHAPTERS)
 
 
 class BookRef(ContractModel):
@@ -20,7 +24,7 @@ class BookRef(ContractModel):
 
 
 class ChapterContent(ContractModel):
-    index: int = Field(ge=0)
+    index: int = Field(ge=0, lt=MAX_BOOK_CHAPTERS)
     title: str = Field(default="", max_length=500)
     content: str = Field(min_length=1)
     source_locator: str = Field(default="", max_length=500)

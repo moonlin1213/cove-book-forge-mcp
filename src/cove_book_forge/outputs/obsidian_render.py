@@ -47,6 +47,7 @@ _UNSAFE_FILENAME = re.compile(r'[\\/:*?"<>|%]+')
 _BARE_LINK = re.compile(r"(?i)\b(?:www\.|[a-z][a-z0-9+.-]*:)(?=\S)")
 _EMAIL_LINK = re.compile(r"(?i)(?<![\w.+-])[\w.+-]+@[\w.-]+\.[a-z]{2,}(?![\w.-])")
 _BLOCK_LINE = re.compile(r"^ {0,3}(?:#{1,6}(?:\s|$)|>|[-+*]\s|\d+[.)]\s|`{3,}|~{3,}|(?:=+|-+)\s*$)")
+_MAX_MISSING_CHAPTER_PREVIEW = 100
 
 
 def canonical_manifest_bytes(manifest: ObsidianBookManifest) -> bytes:
@@ -572,11 +573,18 @@ class ObsidianRenderer:
         known = str(manifest.total_chapters) if manifest.total_chapters else "unknown"
         sections.extend(_list((f"Rendered: {len(manifest.chapters)} / known total: {known}.",)))
         sections.extend(["", "## Unprocessed chapters"])
-        missing = [
-            f"{index + 1:02d}"
-            for index in range(manifest.total_chapters)
-            if index not in {chapter.index for chapter in manifest.chapters}
-        ]
+        processed_indices = {chapter.index for chapter in manifest.chapters}
+        missing: list[str] = []
+        missing_count = 0
+        for index in range(manifest.total_chapters):
+            if index in processed_indices:
+                continue
+            missing_count += 1
+            if len(missing) < _MAX_MISSING_CHAPTER_PREVIEW:
+                missing.append(f"{index + 1:02d}")
+        remaining = missing_count - len(missing)
+        if remaining:
+            missing.append(f"{remaining:,} additional unprocessed chapters.")
         sections.extend(_list(missing))
         sections.extend(["", "## Chapter directory"])
         sections.extend(

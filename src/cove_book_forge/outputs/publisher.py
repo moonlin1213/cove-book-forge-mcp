@@ -18,9 +18,14 @@ from typing import Final
 from uuid import uuid4
 
 from cove_book_forge.config import ObsidianOutputConfig
+from cove_book_forge.contracts.books import MAX_BOOK_CHAPTERS
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 from cove_book_forge.outputs.managed import parse_obsidian_manifest, plan_obsidian_update
-from cove_book_forge.outputs.obsidian_models import ObsidianBookManifest, RenderedObsidianBook
+from cove_book_forge.outputs.obsidian_models import (
+    MAX_OBSIDIAN_CARDS,
+    ObsidianBookManifest,
+    RenderedObsidianBook,
+)
 from cove_book_forge.path_safety import validate_relative_path
 
 _O_DIRECTORY: Final = getattr(os, "O_DIRECTORY", 0)
@@ -32,8 +37,8 @@ _WRITE_FLAGS: Final = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
 _MAX_MANIFEST_BYTES: Final = 2 * 1024 * 1024
 _MAX_MARKDOWN_BYTES: Final = 32 * 1024 * 1024
 _MAX_CANDIDATE_COUNT: Final = 10_000
-_MAX_MANAGED_CHAPTERS: Final = 5_000
-_MAX_MANAGED_CARDS: Final = 10_000
+_MAX_MANAGED_CHAPTERS: Final = MAX_BOOK_CHAPTERS
+_MAX_MANAGED_CARDS: Final = MAX_OBSIDIAN_CARDS
 _MAX_TOTAL_TRANSACTION_BYTES: Final = 256 * 1024 * 1024
 _READ_CHUNK: Final = 1024 * 1024
 _TRANSACTIONS_PATH: Final = ".cove-book-forge/.transactions"
@@ -147,6 +152,11 @@ def _open_absolute_directory(path: Path, *, missing_is_unconfigured: bool) -> in
             with suppress(OSError):
                 os.close(descriptor)
         raise _error(ForgeErrorCode.PATH_NOT_ALLOWED) from None
+    except BaseException:
+        if descriptor is not None:
+            with suppress(OSError):
+                os.close(descriptor)
+        raise
 
 
 @dataclass
@@ -349,11 +359,15 @@ class PublisherReceipt:
     unchanged: bool
 
 
-def _fsync(descriptor: int) -> None:
+def _fsync_file(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _fsync_directory(descriptor: int) -> None:
     try:
         os.fsync(descriptor)
     except OSError as exc:
-        if exc.errno not in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
+        if exc.errno not in {errno.EINVAL, errno.ENOTSUP}:
             raise
 
 
@@ -860,7 +874,7 @@ class GuardedPublisher:
             os.mkdir("backup", mode=0o700, dir_fd=tx_fd)
             stage_fd = os.open("stage", _DIRECTORY_FLAGS, dir_fd=tx_fd)
             backup_fd = os.open("backup", _DIRECTORY_FLAGS, dir_fd=tx_fd)
-            _fsync(parent_fd)
+            _fsync_directory(parent_fd)
             return _Transaction(parent_fd, name, tx_fd, stage_fd, backup_fd, created)
         except BaseException as exc:
             for descriptor in (backup_fd, stage_fd):
@@ -879,7 +893,7 @@ class GuardedPublisher:
                     current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
                     if stat.S_ISDIR(current.st_mode) and _identity(current) == tx_identity:
                         os.rmdir(name, dir_fd=parent_fd)
-                        _fsync(parent_fd)
+                        _fsync_directory(parent_fd)
                 except (FileNotFoundError, OSError):
                     pass
             with suppress(OSError):
@@ -907,7 +921,7 @@ class GuardedPublisher:
                     if written <= 0:
                         raise OSError("short write")
                     offset += written
-                _fsync(descriptor)
+                _fsync_file(descriptor)
                 status = os.fstat(descriptor)
                 verified = self._snapshot_in_directory(transaction.stage_fd, name)
                 expected_digest = hashlib.sha256(data).hexdigest()
@@ -924,7 +938,7 @@ class GuardedPublisher:
                 if descriptor is not None:
                     with suppress(OSError):
                         os.close(descriptor)
-        _fsync(transaction.stage_fd)
+        _fsync_directory(transaction.stage_fd)
 
     def _require_snapshot(self, anchor: _VaultAnchor, path: str, expected: _FileSnapshot) -> None:
         current = self._read_snapshot(anchor, path)
@@ -979,23 +993,23 @@ class GuardedPublisher:
         self._require_snapshot(anchor, path, expected)
         parent_path, _, name = path.rpartition("/")
         parent = self._open_directory(anchor, parent_path, create=False)
-        if parent is None or _identity(os.fstat(parent)) != expected.parent_identity:
-            if parent is not None:
-                os.close(parent)
+        if parent is None:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-        backup_name = f"b{len(transaction.backups):06d}"
-        backup = _BackupFile(
-            path=path,
-            parent_path=parent_path,
-            source_name=name,
-            name=backup_name,
-            parent_identity=expected.parent_identity,
-            identity=expected.identity,
-            digest=expected.digest,
-            size=expected.size,
-        )
-        transaction.backups.append(backup)
         try:
+            if _identity(os.fstat(parent)) != expected.parent_identity:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            backup_name = f"b{len(transaction.backups):06d}"
+            backup = _BackupFile(
+                path=path,
+                parent_path=parent_path,
+                source_name=name,
+                name=backup_name,
+                parent_identity=expected.parent_identity,
+                identity=expected.identity,
+                digest=expected.digest,
+                size=expected.size,
+            )
+            transaction.backups.append(backup)
             self._protect_moved(
                 transaction,
                 transaction.backup_fd,
@@ -1022,8 +1036,8 @@ class GuardedPublisher:
             ):
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             backup.status = _BackupStatus.VERIFIED
-            _fsync(parent)
-            _fsync(transaction.backup_fd)
+            _fsync_directory(parent)
+            _fsync_directory(transaction.backup_fd)
         except FileNotFoundError:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
         except ForgeException:
@@ -1091,8 +1105,8 @@ class GuardedPublisher:
                 if written <= 0:
                     raise OSError("short recovery write")
                 offset += written
-            _fsync(descriptor)
-            _fsync(transaction.fd)
+            _fsync_file(descriptor)
+            _fsync_directory(transaction.fd)
             recovery.durable = True
         finally:
             if descriptor is not None:
@@ -1135,8 +1149,8 @@ class GuardedPublisher:
         if not restored:
             return False
         self._forget_moved(transaction, directory_fd, moved_name)
-        _fsync(directory_fd)
-        _fsync(parent_fd)
+        _fsync_directory(directory_fd)
+        _fsync_directory(parent_fd)
         return True
 
     def _snapshot_in_directory(self, directory_fd: int, name: str) -> _FileSnapshot:
@@ -1226,8 +1240,8 @@ class GuardedPublisher:
             if _identity(stage_status) != staged.identity:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             os.unlink(staged.name, dir_fd=transaction.stage_fd)
-            _fsync(transaction.stage_fd)
-            _fsync(parent)
+            _fsync_directory(transaction.stage_fd)
+            _fsync_directory(parent)
         except FileExistsError:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION) from None
         except ForgeException:
@@ -1396,11 +1410,11 @@ class GuardedPublisher:
         parent_path = published.parent_path
         name = published.name
         parent = self._open_directory(anchor, parent_path, create=False)
-        if parent is None or _identity(os.fstat(parent)) != published.parent_identity:
-            if parent is not None:
-                os.close(parent)
+        if parent is None:
             return False
         try:
+            if _identity(os.fstat(parent)) != published.parent_identity:
+                return False
             if published.rollback_name is not None:
                 if published.rollback_status is _RollbackMoveStatus.MOVED:
                     settled = self._settle_published_move(transaction, published, parent)
@@ -1504,8 +1518,8 @@ class GuardedPublisher:
             return None if source_state == "expected" else False
         removed = self._discard_moved_published(transaction, rollback_name, published)
         if removed:
-            _fsync(transaction.fd)
-            _fsync(parent)
+            _fsync_directory(transaction.fd)
+            _fsync_directory(parent)
             published.status = _PublishedStatus.REMOVED
             published.rollback_name = None
             published.rollback_status = _RollbackMoveStatus.MOVED
@@ -1608,11 +1622,11 @@ class GuardedPublisher:
             ):
                 return False
             parent = self._open_directory(anchor, parent_path, create=False)
-            if parent is None or _identity(os.fstat(parent)) != backup.parent_identity:
-                if parent is not None:
-                    os.close(parent)
+            if parent is None:
                 return False
             try:
+                if _identity(os.fstat(parent)) != backup.parent_identity:
+                    return False
                 os.link(
                     backup.name,
                     name,
@@ -1635,7 +1649,7 @@ class GuardedPublisher:
                     return False
                 backup.status = _BackupStatus.RESTORED
                 self._forget_moved(transaction, transaction.backup_fd, backup.name)
-                _fsync(parent)
+                _fsync_directory(parent)
                 return True
             except FileExistsError:
                 return False
@@ -1666,8 +1680,8 @@ class GuardedPublisher:
             )
             if removed:
                 self._forget_moved(transaction, transaction.backup_fd, backup.name)
-        _fsync(transaction.stage_fd)
-        _fsync(transaction.backup_fd)
+        _fsync_directory(transaction.stage_fd)
+        _fsync_directory(transaction.backup_fd)
 
     def _cleanup_failed(self, transaction: _Transaction) -> None:
         with suppress(OSError, ForgeException):
@@ -1683,8 +1697,8 @@ class GuardedPublisher:
                         backup.name,
                         backup.identity,
                     )
-            _fsync(transaction.stage_fd)
-            _fsync(transaction.backup_fd)
+            _fsync_directory(transaction.stage_fd)
+            _fsync_directory(transaction.backup_fd)
 
     @staticmethod
     def _unlink_identity_without_protection(

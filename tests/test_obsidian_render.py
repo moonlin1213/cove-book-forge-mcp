@@ -483,3 +483,18 @@ def test_total_chapters_covers_current_declared_and_previous_actual_indices() ->
     second = renderer.render(declared_low, _analyzed(), first.manifest)
     assert second.manifest.total_chapters == 6
     assert "- 06" not in second.files[second.moc_path].decode("utf-8")
+
+
+def test_large_valid_book_has_a_bounded_missing_chapter_preview() -> None:
+    baseline = _snapshot()
+    largest = baseline.model_copy(
+        update={"book": baseline.book.model_copy(update={"total_chapters": 5_000})}
+    )
+
+    rendered = _render(largest)
+    moc = rendered.files[rendered.moc_path].decode("utf-8")
+
+    assert "- 02" in moc
+    assert "4,899 additional unprocessed chapters." in moc
+    assert "- 5000" not in moc
+    assert len(moc) < 20_000

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Literal
+from typing import Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cove_book_forge.contracts.books import MAX_BOOK_CHAPTERS
 from cove_book_forge.path_safety import validate_relative_path
+
+MAX_OBSIDIAN_CARDS: Final = 10_000
 
 
 class ObsidianModel(BaseModel):
@@ -20,7 +23,7 @@ class ObsidianCardManifest(ObsidianModel):
     kind: Literal["concept", "decision_rule"]
     title: str = Field(min_length=1, max_length=120)
     path: str = Field(min_length=1, max_length=500)
-    chapter_index: int = Field(ge=0)
+    chapter_index: int = Field(ge=0, lt=MAX_BOOK_CHAPTERS)
 
     @field_validator("path")
     @classmethod
@@ -29,11 +32,11 @@ class ObsidianCardManifest(ObsidianModel):
 
 
 class ObsidianChapterManifest(ObsidianModel):
-    index: int = Field(ge=0)
+    index: int = Field(ge=0, lt=MAX_BOOK_CHAPTERS)
     title: str = Field(min_length=1, max_length=120)
     input_fingerprint: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     note_path: str = Field(min_length=1, max_length=500)
-    card_paths: tuple[str, ...] = ()
+    card_paths: tuple[str, ...] = Field(default=(), max_length=MAX_OBSIDIAN_CARDS)
     frameworks: tuple[str, ...] = ()
     topics: tuple[str, ...] = ()
 
@@ -54,9 +57,9 @@ class ObsidianBookManifest(ObsidianModel):
     book_title: str = Field(min_length=1, max_length=120)
     book_directory: str = Field(min_length=1, max_length=240)
     moc_path: str = Field(min_length=1, max_length=500)
-    total_chapters: int = Field(default=0, ge=0)
-    chapters: tuple[ObsidianChapterManifest, ...] = ()
-    cards: tuple[ObsidianCardManifest, ...] = ()
+    total_chapters: int = Field(default=0, ge=0, le=MAX_BOOK_CHAPTERS)
+    chapters: tuple[ObsidianChapterManifest, ...] = Field(default=(), max_length=MAX_BOOK_CHAPTERS)
+    cards: tuple[ObsidianCardManifest, ...] = Field(default=(), max_length=MAX_OBSIDIAN_CARDS)
     checksum: str = Field(default="", pattern=r"^(|[0-9a-f]{64})$")
 
     @field_validator("book_directory", "moc_path")

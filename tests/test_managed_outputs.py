@@ -184,6 +184,33 @@ def test_parses_only_canonical_manifest_with_matching_checksum_and_internal_path
     _assert_safe_error(raised.value, "secret.md")
 
 
+def test_parser_rejects_legacy_manifest_with_unbounded_chapter_count() -> None:
+    rendered = _render()
+    manifest_path = _manifest_path(rendered)
+    payload = json.loads(rendered.files[manifest_path])
+    payload["total_chapters"] = 5_001
+    checksum_payload = {key: value for key, value in payload.items() if key != "checksum"}
+    payload["checksum"] = hashlib.sha256(
+        json.dumps(
+            checksum_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    legacy = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    with pytest.raises(ForgeException) as raised:
+        parse_obsidian_manifest(legacy)
+
+    assert raised.value.code is ForgeErrorCode.CONFIG_INVALID
+
+
 def test_rejects_manifest_duplicate_and_cross_book_references() -> None:
     """Duplicate ownership or cross-book note paths could delete another bundle's content."""
     rendered = _render()

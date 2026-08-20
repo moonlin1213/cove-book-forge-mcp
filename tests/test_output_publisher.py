@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import traceback
 import weakref
 from pathlib import Path
@@ -27,11 +28,15 @@ from cove_book_forge.outputs.obsidian_render import ObsidianRenderer
 from cove_book_forge.outputs.publisher import GuardedPublisher
 
 
-def _snapshot() -> ChapterSnapshot:
+def _snapshot(
+    *,
+    external_book_id: str = "book-atomic",
+    title: str = "Atomic book",
+) -> ChapterSnapshot:
     return ChapterSnapshot(
         source_system="publisher-tests",
-        external_book_id="book-atomic",
-        book=BookMetadata(title="Atomic book", total_chapters=1),
+        external_book_id=external_book_id,
+        book=BookMetadata(title=title, total_chapters=1),
         chapter=ChapterContent(index=0, title="Transaction", content="Private source."),
     )
 
@@ -52,10 +57,16 @@ def _publisher(vault: Path) -> GuardedPublisher:
 
 
 def _publish(vault: Path, analyzed: AnalyzedChapter):
+    return _publish_snapshot(vault, _snapshot(), analyzed)
+
+
+def _publish_snapshot(
+    vault: Path,
+    snapshot: ChapterSnapshot,
+    analyzed: AnalyzedChapter,
+):
     renderer = ObsidianRenderer(ObsidianOutputConfig(enabled=True, vault_path=vault))
-    return _publisher(vault).publish(
-        lambda previous: renderer.render(_snapshot(), analyzed, previous)
-    )
+    return _publisher(vault).publish(lambda previous: renderer.render(snapshot, analyzed, previous))
 
 
 def _visible(vault: Path) -> dict[str, bytes]:
@@ -76,6 +87,58 @@ def _assert_safe(error: ForgeException, vault: Path) -> None:
     assert str(vault) not in public
     assert "Private source" not in public
     assert error.__cause__ is None
+
+
+def test_live_prepared_transaction_is_not_recovered_by_a_parallel_book_publish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    prepared = threading.Event()
+    resume = threading.Event()
+    real_prepare = publisher_module.GuardedPublisher._prepare_durable_transaction
+    outcomes: dict[str, object] = {}
+
+    def prepare_then_pause(self, *args, **kwargs) -> None:
+        real_prepare(self, *args, **kwargs)
+        if threading.current_thread().name == "publisher-a":
+            prepared.set()
+            assert resume.wait(5)
+
+    monkeypatch.setattr(
+        publisher_module.GuardedPublisher,
+        "_prepare_durable_transaction",
+        prepare_then_pause,
+    )
+
+    def publish_a() -> None:
+        try:
+            outcomes["a"] = _publish(vault, _analyzed(card=True))
+        except BaseException as exc:
+            outcomes["a_error"] = exc
+
+    thread = threading.Thread(target=publish_a, name="publisher-a")
+    thread.start()
+    assert prepared.wait(5)
+    try:
+        outcomes["b"] = _publish_snapshot(
+            vault,
+            _snapshot(external_book_id="book-parallel", title="Parallel book"),
+            _analyzed(fingerprint="b" * 64, card=True),
+        )
+    finally:
+        resume.set()
+        thread.join(5)
+
+    assert not thread.is_alive()
+    assert "a_error" not in outcomes
+    assert outcomes["a"]
+    assert outcomes["b"]
+    manifests = list((vault / ".cove-book-forge" / "obsidian").glob("*.json"))
+    assert len(manifests) == 2
+    _assert_no_transactions(vault)
 
 
 @pytest.mark.parametrize("broad", [Path("/"), Path.home(), Path.cwd()])
@@ -824,6 +887,14 @@ if crash_point == "first_backup":
         return result
 
     GuardedPublisher._backup = crash_after_backup
+elif crash_point == "new_transaction":
+    original = GuardedPublisher._new_transaction
+
+    def crash_after_new_transaction(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        os._exit(86)
+
+    GuardedPublisher._new_transaction = crash_after_new_transaction
 elif crash_point in {"partial_publish", "manifest_link"}:
     original = GuardedPublisher._publish_stage
     non_manifest = 0
@@ -841,6 +912,26 @@ elif crash_point in {"partial_publish", "manifest_link"}:
         return result
 
     GuardedPublisher._publish_stage = crash_after_publish
+elif crash_point == "manifest_before_parent_fsync":
+    real_publish = GuardedPublisher._publish_stage
+    real_fsync = publisher_module._fsync_directory
+    manifest_active = False
+
+    def publish_with_manifest_context(self, anchor, transaction, path, expected):
+        global manifest_active
+        manifest_active = path.endswith(".json")
+        try:
+            return real_publish(self, anchor, transaction, path, expected)
+        finally:
+            manifest_active = False
+
+    def crash_before_manifest_parent_fsync(descriptor):
+        if manifest_active:
+            os._exit(86)
+        return real_fsync(descriptor)
+
+    GuardedPublisher._publish_stage = publish_with_manifest_context
+    publisher_module._fsync_directory = crash_before_manifest_parent_fsync
 elif crash_point == "committed_cleanup":
     original = GuardedPublisher._unlink_identity_without_protection
 
@@ -865,6 +956,36 @@ elif crash_point == "recovery_intent":
         return result
 
     GuardedPublisher._protect_moved = crash_after_recovery_intent
+elif crash_point.startswith("recovery_cleanup_"):
+    cleanup_kind, raw_index = crash_point.removeprefix("recovery_cleanup_").rsplit("_", 1)
+    cleanup_name = (
+        "_cleanup_committed" if cleanup_kind == "committed" else "_cleanup_rolled_back"
+    )
+    deletion_index = int(raw_index)
+    real_cleanup = getattr(GuardedPublisher, cleanup_name)
+    real_unlink = GuardedPublisher._unlink_if_identity
+    cleanup_active = False
+    deletions = 0
+
+    def cleanup_with_context(self, transaction):
+        global cleanup_active
+        cleanup_active = True
+        try:
+            return real_cleanup(self, transaction)
+        finally:
+            cleanup_active = False
+
+    def crash_after_evidence_unlink(transaction, directory_fd, name, expected):
+        global deletions
+        removed = real_unlink(transaction, directory_fd, name, expected)
+        if cleanup_active and removed and (name.startswith("s") or name.startswith("b")):
+            deletions += 1
+            if deletions == deletion_index:
+                os._exit(86)
+        return removed
+
+    setattr(GuardedPublisher, cleanup_name, cleanup_with_context)
+    GuardedPublisher._unlink_if_identity = staticmethod(crash_after_evidence_unlink)
 else:
     raise SystemExit(99)
 
@@ -954,6 +1075,93 @@ def test_hard_crash_recovery_never_clobbers_or_adopts_a_competitor(tmp_path: Pat
     _assert_safe(raised.value, vault)
 
 
+def test_hard_crash_releases_transaction_owner_lock_for_restart_recovery(
+    tmp_path: Path,
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed(card=True))
+    _run_hard_crashing_publish(vault, "partial_publish")
+    owners = list((vault / ".cove-book-forge" / ".transactions").glob("tx-*/owner.lock"))
+    assert len(owners) == 1
+    assert owners[0].is_file() and owners[0].read_bytes() == b""
+
+    receipt = _publish(vault, _analyzed(fingerprint="b" * 64, card=True))
+
+    assert receipt.rendered.manifest.checksum
+    _assert_no_transactions(vault)
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "directory", "regular"])
+def test_restart_never_adopts_a_replaced_transaction_owner_lock(
+    tmp_path: Path, replacement: str
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed(card=True))
+    _run_hard_crashing_publish(vault, "partial_publish")
+    transaction = next((vault / ".cove-book-forge" / ".transactions").glob("tx-*"))
+    owner = transaction / "owner.lock"
+    owner.unlink()
+    if replacement == "symlink":
+        owner.symlink_to(transaction / "stage")
+    elif replacement == "directory":
+        owner.mkdir()
+    else:
+        owner.write_bytes(b"")
+
+    with pytest.raises(ForgeException) as raised:
+        _publisher(vault).publish(lambda _previous: pytest.fail("renderer ran"))
+
+    assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
+    assert transaction.exists()
+    if replacement == "symlink":
+        assert owner.is_symlink()
+    elif replacement == "directory":
+        assert owner.is_dir()
+    else:
+        assert owner.is_file() and owner.read_bytes() == b""
+    _assert_safe(raised.value, vault)
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [KeyboardInterrupt("owner lock interrupt"), asyncio.CancelledError("owner lock cancel")],
+)
+def test_restart_owner_lock_signal_closes_fd_and_releases_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signal: BaseException
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed(card=True))
+    _run_hard_crashing_publish(vault, "partial_publish")
+    real_try_lock = publisher_module._try_owner_lock
+    captured: list[int] = []
+
+    def lock_then_signal(descriptor: int) -> bool:
+        assert real_try_lock(descriptor)
+        captured.append(descriptor)
+        raise signal
+
+    monkeypatch.setattr(publisher_module, "_try_owner_lock", lock_then_signal)
+
+    with pytest.raises(type(signal)) as raised:
+        _publisher(vault).publish(lambda _previous: pytest.fail("renderer ran"))
+
+    assert raised.value is signal
+    assert len(captured) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(captured[0])
+    assert closed.value.errno == errno.EBADF
+
+    monkeypatch.setattr(publisher_module, "_try_owner_lock", real_try_lock)
+    receipt = _publish(vault, _analyzed(fingerprint="b" * 64, card=True))
+    assert receipt.rendered.manifest.checksum
+    _assert_no_transactions(vault)
+
+
 def test_restart_recovery_fsync_failure_preserves_old_bundle_and_durable_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1007,6 +1215,239 @@ def test_restart_recovery_can_resume_after_a_second_hard_crash(tmp_path: Path) -
 
     assert receipt.rendered.manifest.checksum
     assert _visible(vault) == expected
+    _assert_no_transactions(vault)
+
+
+@pytest.mark.parametrize("branch", ["committed", "rolled_back"])
+@pytest.mark.parametrize("deletion_index", [1, 2])
+def test_terminal_recovery_survives_a_second_crash_during_evidence_cleanup(
+    tmp_path: Path, branch: str, deletion_index: int
+) -> None:
+    expected_vault = tmp_path / "expected"
+    expected_vault.mkdir()
+    _publish(expected_vault, _analyzed(card=True))
+    _publish(expected_vault, _analyzed(fingerprint="b" * 64, card=True))
+    expected = _visible(expected_vault)
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed(card=True))
+    first_crash = "manifest_link" if branch == "committed" else "partial_publish"
+    _run_hard_crashing_publish(vault, first_crash)
+    _run_hard_crashing_publish(
+        vault,
+        f"recovery_cleanup_{'committed' if branch == 'committed' else 'failed'}_{deletion_index}",
+    )
+    terminal = "state-committed.json" if branch == "committed" else "state-rolled_back.json"
+    transactions = vault / ".cove-book-forge" / ".transactions"
+    assert list(transactions.rglob(terminal))
+
+    receipt = _publish(vault, _analyzed(fingerprint="b" * 64, card=True))
+
+    assert receipt.rendered.manifest.checksum
+    assert _visible(vault) == expected
+    _assert_no_transactions(vault)
+
+
+def test_pending_complete_recovery_fsyncs_visible_bundle_before_committed_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed(card=True))
+    _run_hard_crashing_publish(vault, "manifest_before_parent_fsync")
+    pending_path = next(
+        (vault / ".cove-book-forge" / ".transactions").rglob("state-manifest_pending.json")
+    )
+    pending = json.loads(pending_path.read_bytes())
+    expected_files = {tuple(write["identity"]) for write in pending["writes"]}
+    expected_parents = {tuple(write["parent_identity"]) for write in pending["writes"]}
+    file_fsyncs: set[tuple[int, int]] = set()
+    directory_fsyncs: set[tuple[int, int]] = set()
+    real_file_fsync = publisher_module._fsync_file
+    real_directory_fsync = publisher_module._fsync_directory
+    real_persist = publisher_module.GuardedPublisher._persist_transaction_phase
+    committed_checked = False
+
+    def record_file_fsync(descriptor: int) -> None:
+        file_fsyncs.add(publisher_module._identity(os.fstat(descriptor)))
+        real_file_fsync(descriptor)
+
+    def record_directory_fsync(descriptor: int) -> None:
+        directory_fsyncs.add(publisher_module._identity(os.fstat(descriptor)))
+        real_directory_fsync(descriptor)
+
+    def require_durability_before_terminal(self, transaction, phase) -> None:
+        nonlocal committed_checked
+        if phase is publisher_module._TransactionPhase.COMMITTED and not committed_checked:
+            committed_checked = True
+            assert expected_files <= file_fsyncs
+            assert expected_parents <= directory_fsyncs
+        real_persist(self, transaction, phase)
+
+    monkeypatch.setattr(publisher_module, "_fsync_file", record_file_fsync)
+    monkeypatch.setattr(publisher_module, "_fsync_directory", record_directory_fsync)
+    monkeypatch.setattr(
+        publisher_module.GuardedPublisher,
+        "_persist_transaction_phase",
+        require_durability_before_terminal,
+    )
+
+    receipt = _publish(vault, _analyzed(fingerprint="b" * 64, card=True))
+
+    assert committed_checked
+    assert receipt.rendered.manifest.checksum
+    _assert_no_transactions(vault)
+
+
+@pytest.mark.parametrize("structure", ["returned", "empty", "stage_only"])
+def test_strict_prejournal_empty_transaction_is_safely_reclaimed(
+    tmp_path: Path, structure: str
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    transactions = vault / ".cove-book-forge" / ".transactions"
+    if structure == "returned":
+        _run_hard_crashing_publish(vault, "new_transaction")
+        orphan = next(transactions.glob("tx-*"))
+    else:
+        orphan = transactions / f"tx-{'1' if structure == 'empty' else '2'}{'0' * 31}"
+        orphan.mkdir(parents=True)
+        if structure == "stage_only":
+            (orphan / "stage").mkdir()
+
+    receipt = _publish(vault, _analyzed(card=True))
+
+    assert receipt.rendered.manifest.checksum
+    assert not orphan.exists()
+    _assert_no_transactions(vault)
+
+
+@pytest.mark.parametrize("unexpected", ["regular", "symlink", "directory"])
+def test_prejournal_transaction_with_unexpected_evidence_fails_closed(
+    tmp_path: Path, unexpected: str
+) -> None:
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _run_hard_crashing_publish(vault, "new_transaction")
+    transaction = next((vault / ".cove-book-forge" / ".transactions").glob("tx-*"))
+    evidence = transaction / "unexpected"
+    if unexpected == "regular":
+        evidence.write_bytes(b"competitor")
+    elif unexpected == "symlink":
+        evidence.symlink_to(transaction / "stage")
+    else:
+        evidence.mkdir()
+
+    with pytest.raises(ForgeException) as raised:
+        _publisher(vault).publish(lambda _previous: pytest.fail("renderer ran"))
+
+    assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
+    assert transaction.exists()
+    assert evidence.exists() or evidence.is_symlink()
+    _assert_safe(raised.value, vault)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "terminal_unlink",
+        "stage_rmdir",
+        "transaction_rmdir",
+        "transaction_fsync",
+        "parent_fsync",
+    ],
+)
+def test_close_fault_is_retried_without_a_successful_debris_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed(card=True))
+    expected_vault = tmp_path / "expected"
+    expected_vault.mkdir()
+    _publish(expected_vault, _analyzed(card=True))
+    _publish(expected_vault, _analyzed(fingerprint="b" * 64, card=True))
+    expected = _visible(expected_vault)
+    real_close = publisher_module.GuardedPublisher._close_transaction
+    real_unlink = publisher_module.os.unlink
+    real_rmdir = publisher_module.os.rmdir
+    real_fsync = publisher_module._fsync_directory
+    close_active = False
+    tx_identity: tuple[int, int] | None = None
+    parent_identity: tuple[int, int] | None = None
+    fired = False
+
+    def close_with_context(self, transaction) -> None:
+        nonlocal close_active, tx_identity, parent_identity
+        close_active = True
+        tx_identity = transaction.identity
+        parent_identity = publisher_module._identity(os.fstat(transaction.parent_fd))
+        try:
+            real_close(self, transaction)
+        finally:
+            close_active = False
+
+    def fail_unlink_once(path, *args, **kwargs):
+        nonlocal fired
+        if (
+            not fired
+            and close_active
+            and fault == "terminal_unlink"
+            and isinstance(path, str)
+            and path == "state-committed.json"
+        ):
+            fired = True
+            raise OSError(errno.EIO, "close terminal unlink")
+        return real_unlink(path, *args, **kwargs)
+
+    def fail_rmdir_once(path, *args, **kwargs):
+        nonlocal fired
+        selected = (
+            fault == "stage_rmdir"
+            and path == "stage"
+            or (fault == "transaction_rmdir" and isinstance(path, str) and path.startswith("tx-"))
+        )
+        if not fired and close_active and selected:
+            fired = True
+            raise OSError(errno.EIO, "close rmdir")
+        return real_rmdir(path, *args, **kwargs)
+
+    def fail_fsync_once(descriptor: int) -> None:
+        nonlocal fired
+        identity = publisher_module._identity(os.fstat(descriptor))
+        selected = (
+            fault == "transaction_fsync"
+            and identity == tx_identity
+            or (fault == "parent_fsync" and identity == parent_identity)
+        )
+        if not fired and close_active and selected:
+            fired = True
+            raise OSError(errno.EBADF, "close fsync")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(publisher_module.GuardedPublisher, "_close_transaction", close_with_context)
+    monkeypatch.setattr(publisher_module.os, "unlink", fail_unlink_once)
+    monkeypatch.setattr(publisher_module.os, "rmdir", fail_rmdir_once)
+    monkeypatch.setattr(publisher_module, "_fsync_directory", fail_fsync_once)
+
+    try:
+        first = _publish(vault, _analyzed(fingerprint="b" * 64, card=True))
+    except ForgeException as error:
+        assert error.code is ForgeErrorCode.EXTERNAL_MODIFICATION
+        _assert_safe(error, vault)
+    else:
+        assert first.rendered.manifest.checksum
+        _assert_no_transactions(vault)
+
+    assert fired
+    assert _visible(vault) == expected
+    retry = _publish(vault, _analyzed(fingerprint="b" * 64, card=True))
+    assert retry.unchanged is True
     _assert_no_transactions(vault)
 
 

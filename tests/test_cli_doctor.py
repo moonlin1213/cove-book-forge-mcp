@@ -96,11 +96,13 @@ def _create_library_schema(path: Path, *, version: int) -> None:
     with closing(sqlite3.connect(path)) as connection, connection:
         for statement in library_database._SCHEMA_V1:  # noqa: SLF001 - canonical fixture schema
             connection.execute(statement)
-        if version == 2:
+        if version >= 2:
             connection.execute(
                 "ALTER TABLE chapter_snapshots "
                 "ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
             )
+        if version == 3:
+            connection.execute(library_database._SCHEMA_V3_CHAPTER_ANALYSES)
         connection.execute(f"PRAGMA user_version = {version}")
 
 
@@ -136,6 +138,15 @@ _REQUIRED_VIEW_COLUMNS = {
         "created_at",
         "updated_at",
     ),
+    "chapter_analyses": (
+        "source_system",
+        "external_book_id",
+        "chapter_index",
+        "input_fingerprint",
+        "analysis_json",
+        "created_at",
+        "updated_at",
+    ),
 }
 
 
@@ -146,7 +157,7 @@ def _create_required_view(
     version: int,
 ) -> None:
     columns = _REQUIRED_VIEW_COLUMNS[name]
-    if name == "chapter_snapshots" and version == 2:
+    if name == "chapter_snapshots" and version >= 2:
         columns = (*columns, "content_fingerprint")
     projection = ", ".join(f'NULL AS "{column}"' for column in columns)
     connection.execute(f'CREATE VIEW "{name}" AS SELECT {projection}')
@@ -528,7 +539,7 @@ def test_doctor_opens_existing_library_database_read_only_without_side_effects(
     data_dir = tmp_path / "library"
     data_dir.mkdir()
     database = data_dir / "library.sqlite3"
-    _create_library_schema(database, version=2)
+    _create_library_schema(database, version=3)
     config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
     before = _filesystem_snapshot(tmp_path)
 
@@ -944,10 +955,13 @@ def test_doctor_and_book_library_share_data_root_rejection_and_skip_database(
     ("case", "expected_status", "expected_fragment"),
     [
         ("v1", "warn", "migration"),
-        ("v2", "pass", None),
+        ("v2", "warn", "migration"),
+        ("v3", "pass", None),
         ("future", "fail", None),
         ("v2_missing_table", "fail", None),
         ("v2_missing_column", "fail", None),
+        ("v3_missing_table", "fail", None),
+        ("v3_missing_column", "fail", None),
         ("v0_unrelated", "fail", None),
         ("v0_empty", "warn", "uninitialized"),
     ],
@@ -965,6 +979,8 @@ def test_doctor_validates_library_application_schema_without_writing(
         _create_library_schema(database, version=1)
     elif case == "v2":
         _create_library_schema(database, version=2)
+    elif case == "v3":
+        _create_library_schema(database, version=3)
     elif case == "future":
         database.touch()
         with closing(sqlite3.connect(database)) as connection, connection:
@@ -977,6 +993,14 @@ def test_doctor_validates_library_application_schema_without_writing(
         _create_library_schema(database, version=1)
         with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute("PRAGMA user_version = 2")
+    elif case == "v3_missing_table":
+        _create_library_schema(database, version=3)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("DROP TABLE chapter_analyses")
+    elif case == "v3_missing_column":
+        _create_library_schema(database, version=3)
+        with closing(sqlite3.connect(database)) as connection, connection:
+            connection.execute("ALTER TABLE chapter_analyses RENAME COLUMN analysis_json TO missing")
     elif case == "v0_unrelated":
         with closing(sqlite3.connect(database)) as connection, connection:
             connection.execute("CREATE TABLE private_unrelated (secret TEXT)")
@@ -1039,8 +1063,15 @@ def test_doctor_rejects_v2_schema_composed_of_same_named_views(
     assert _filesystem_snapshot(tmp_path) == before
 
 
-@pytest.mark.parametrize("version", [1, 2])
-@pytest.mark.parametrize("required_name", list(_REQUIRED_VIEW_COLUMNS))
+@pytest.mark.parametrize(
+    ("version", "required_name"),
+    [
+        (version, required_name)
+        for version in (1, 2, 3)
+        for required_name in _REQUIRED_VIEW_COLUMNS
+        if version == 3 or required_name != "chapter_analyses"
+    ],
+)
 def test_doctor_rejects_required_table_replaced_by_same_named_view(
     tmp_path: Path,
     version: int,
@@ -1063,7 +1094,10 @@ def test_doctor_rejects_required_table_replaced_by_same_named_view(
     assert _filesystem_snapshot(tmp_path) == before
 
 
-@pytest.mark.parametrize(("version", "expected_status"), [(1, "warn"), (2, "pass")])
+@pytest.mark.parametrize(
+    ("version", "expected_status"),
+    [(1, "warn"), (2, "warn"), (3, "pass")],
+)
 def test_doctor_allows_non_conflicting_extra_schema_objects(
     tmp_path: Path,
     version: int,

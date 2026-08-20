@@ -398,7 +398,7 @@ def test_managed_and_external_books_coexist_without_identity_collisions(tmp_path
     assert library.get_book(external).format is None
 
 
-def test_real_v1_external_data_migrates_to_readable_idempotent_v2(
+def test_real_v1_external_data_migrates_to_readable_idempotent_v3(
     tmp_path: Path,
 ) -> None:
     data_dir = tmp_path / "library"
@@ -433,7 +433,7 @@ def test_real_v1_external_data_migrates_to_readable_idempotent_v2(
             tuple(tuple(row) for row in connection.execute(f"SELECT * FROM {table} ORDER BY 1"))
             for table in ("books", "chapters", "external_sources", "chapter_snapshots")
         )
-    assert version == 2
+    assert version == 3
     assert snapshot_row is not None
     assert snapshot_row["chapter_snapshot_id"] == _LEGACY_SNAPSHOT_ID
     assert snapshot_row["external_source_id"] == _LEGACY_EXTERNAL_SOURCE_ID

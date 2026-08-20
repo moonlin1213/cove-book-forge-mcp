@@ -14,6 +14,7 @@ from cove_book_forge.config import AppConfig, library_data_path
 from cove_book_forge.contracts import (
     BookMetadata,
     BookRef,
+    ChapterAnalysis,
     ChapterContent,
     ChapterSnapshot,
     ExternalIdentity,
@@ -506,6 +507,40 @@ class BookLibrary:
                 content_fingerprint=_canonical_fingerprint(snapshot_json),
             )
         return record.book
+
+    def load_chapter_analysis(
+        self,
+        source_system: str,
+        external_book_id: str,
+        chapter_index: int,
+        input_fingerprint: str,
+    ) -> ChapterAnalysis | None:
+        self._require_initialized()
+        with self._data_root_guard():
+            return self._repository.load_chapter_analysis(
+                source_system,
+                external_book_id,
+                chapter_index,
+                input_fingerprint,
+            )
+
+    def store_chapter_analysis(
+        self,
+        source_system: str,
+        external_book_id: str,
+        chapter_index: int,
+        input_fingerprint: str,
+        analysis: ChapterAnalysis,
+    ) -> None:
+        self._require_initialized()
+        with self._data_root_guard():
+            self._repository.store_chapter_analysis(
+                source_system,
+                external_book_id,
+                chapter_index,
+                input_fingerprint,
+                analysis,
+            )
 
     def list_books(self) -> tuple[StoredBook, ...]:
         self._require_initialized()

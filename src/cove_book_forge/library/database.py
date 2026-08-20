@@ -15,7 +15,7 @@ from uuid import uuid4
 from cove_book_forge.contracts import ChapterSnapshot, ExternalIdentity
 from cove_book_forge.errors import ForgeErrorCode, ForgeException
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 _SCHEMA_V1 = (
     """
@@ -81,6 +81,19 @@ CREATE TABLE chapter_snapshots (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (external_source_id, chapter_index)
+)
+"""
+
+_SCHEMA_V3_CHAPTER_ANALYSES = """
+CREATE TABLE chapter_analyses (
+    source_system TEXT NOT NULL,
+    external_book_id TEXT NOT NULL,
+    chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),
+    input_fingerprint TEXT NOT NULL,
+    analysis_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (source_system, external_book_id, chapter_index)
 )
 """
 
@@ -155,18 +168,30 @@ def _inspect_library_schema(connection: sqlite3.Connection) -> _LibrarySchemaRea
         if schema_objects:
             raise sqlite3.DatabaseError("unrecognized unversioned schema")
         return _LibrarySchemaReadiness.UNINITIALIZED
-    if version not in {1, _SCHEMA_VERSION}:
+    if version not in {1, 2, _SCHEMA_VERSION}:
         raise sqlite3.DatabaseError("unsupported schema version")
 
     required_columns = {
         table: columns
         | (
             {"content_fingerprint"}
-            if version == _SCHEMA_VERSION and table == "chapter_snapshots"
+            if version >= 2 and table == "chapter_snapshots"
             else set()
         )
         for table, columns in _REQUIRED_V1_COLUMNS.items()
     }
+    if version == _SCHEMA_VERSION:
+        required_columns["chapter_analyses"] = frozenset(
+            {
+                "source_system",
+                "external_book_id",
+                "chapter_index",
+                "input_fingerprint",
+                "analysis_json",
+                "created_at",
+                "updated_at",
+            }
+        )
     if any(schema_objects.get(table) != "table" for table in required_columns):
         raise sqlite3.DatabaseError("required application table is missing")
     for table, expected_columns in required_columns.items():
@@ -180,7 +205,7 @@ def _inspect_library_schema(connection: sqlite3.Connection) -> _LibrarySchemaRea
         if not expected_columns <= actual_columns:
             raise sqlite3.DatabaseError("required application column is missing")
 
-    if version == 1:
+    if version < _SCHEMA_VERSION:
         return _LibrarySchemaReadiness.MIGRATION_PENDING
     return _LibrarySchemaReadiness.READY
 
@@ -271,6 +296,8 @@ class LibraryDatabase:
                         ForgeErrorCode.CONFIG_INVALID,
                         "Library schema is newer than this application.",
                     )
+                if version != 0:
+                    _inspect_library_schema(connection)
                 if version == 0:
                     for statement in _SCHEMA_V1:
                         connection.execute(statement)
@@ -278,7 +305,11 @@ class LibraryDatabase:
                     connection.execute("PRAGMA user_version = 1")
                 if version == 1:
                     self._migrate_snapshot_fingerprints(connection)
+                    version = 2
                     connection.execute("PRAGMA user_version = 2")
+                if version == 2:
+                    connection.execute(_SCHEMA_V3_CHAPTER_ANALYSES)
+                    connection.execute("PRAGMA user_version = 3")
         except ForgeException:
             if opened_here:
                 self._close_connection()

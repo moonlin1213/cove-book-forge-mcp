@@ -45,8 +45,14 @@ def test_schema_migration_is_explicit_idempotent_and_forward_compatible(tmp_path
             row[1]: row[3] for row in connection.execute("PRAGMA table_info(books)").fetchall()
         }
 
-    assert version == 2
-    assert {"books", "chapters", "external_sources", "chapter_snapshots"} <= tables
+    assert version == 3
+    assert {
+        "books",
+        "chapters",
+        "external_sources",
+        "chapter_snapshots",
+        "chapter_analyses",
+    } <= tables
     assert book_columns["format"] == 0
     assert book_columns["import_mode"] == 0
     assert book_columns["source_fingerprint"] == 0
@@ -54,7 +60,7 @@ def test_schema_migration_is_explicit_idempotent_and_forward_compatible(tmp_path
     assert book_columns["reference_source_path"] == 0
 
 
-def test_v2_database_reopens_without_rerunning_or_mutating_schema(tmp_path: Path) -> None:
+def test_v3_database_reopens_without_rerunning_or_mutating_schema(tmp_path: Path) -> None:
     path = tmp_path / "library.sqlite3"
     first = LibraryDatabase(path)
     first.initialize()
@@ -70,7 +76,7 @@ def test_v2_database_reopens_without_rerunning_or_mutating_schema(tmp_path: Path
     reopened.initialize()
 
     with reopened.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert (
             connection.execute(
                 "SELECT sql FROM sqlite_master WHERE name = 'chapter_snapshots'"
@@ -78,6 +84,28 @@ def test_v2_database_reopens_without_rerunning_or_mutating_schema(tmp_path: Path
             == original_schema
         )
         assert connection.execute("SELECT book_id FROM books").fetchone()[0] == "book-1"
+
+
+def test_v2_database_migrates_to_v3_without_changing_existing_data(tmp_path: Path) -> None:
+    """Skipping the v2-to-v3 migration must leave this valid database cache-incomplete."""
+    path = tmp_path / "library.sqlite3"
+    with sqlite3.connect(path) as connection, connection:
+        for statement in library_database._SCHEMA_V1:  # noqa: SLF001 - legacy fixture
+            connection.execute(statement)
+        connection.execute(
+            "ALTER TABLE chapter_snapshots "
+            "ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''"
+        )
+        connection.execute("PRAGMA user_version = 2")
+        _insert_minimal_book(connection)
+
+    database = LibraryDatabase(path)
+    database.initialize()
+
+    with database.connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("SELECT book_id FROM books").fetchone()[0] == "book-1"
+        assert connection.execute("SELECT COUNT(*) FROM chapter_analyses").fetchone()[0] == 0
 
 
 def test_every_database_connection_enables_foreign_keys(tmp_path: Path) -> None:

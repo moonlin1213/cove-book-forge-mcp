@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from cove_book_forge.contracts import (
     BookFormat,
     BookMetadata,
     BookRef,
+    ChapterAnalysis,
     ChapterContent,
     ChapterSnapshot,
     ExternalIdentity,
@@ -66,6 +68,49 @@ def _external_incomplete() -> ForgeException:
     )
 
 
+def _invalid_cache_key() -> ForgeException:
+    return ForgeException(ForgeErrorCode.CONFIG_INVALID, "Chapter analysis cache key is invalid.")
+
+
+def _invalid_cached_analysis(cause: BaseException) -> ForgeException:
+    return ForgeException(
+        ForgeErrorCode.MODEL_OUTPUT_INVALID,
+        "Stored chapter analysis is invalid.",
+        cause=cause,
+    )
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def _validate_cache_key(
+    source_system: str,
+    external_book_id: str,
+    chapter_index: int,
+    input_fingerprint: str,
+) -> None:
+    if (
+        not isinstance(source_system, str)
+        or not 1 <= len(source_system) <= 80
+        or not isinstance(external_book_id, str)
+        or not 1 <= len(external_book_id) <= 240
+        or not isinstance(chapter_index, int)
+        or isinstance(chapter_index, bool)
+        or chapter_index < 0
+        or not isinstance(input_fingerprint, str)
+        or len(input_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in input_fingerprint)
+    ):
+        raise _invalid_cache_key()
+
+
 class LibraryRepository:
     """Own library SQL and conversion from rows to typed records."""
 
@@ -81,6 +126,86 @@ class LibraryRepository:
 
     def initialize(self) -> None:
         self._database.initialize()
+
+    def load_chapter_analysis(
+        self,
+        source_system: str,
+        external_book_id: str,
+        chapter_index: int,
+        input_fingerprint: str,
+    ) -> ChapterAnalysis | None:
+        _validate_cache_key(
+            source_system,
+            external_book_id,
+            chapter_index,
+            input_fingerprint,
+        )
+        try:
+            with self._database.connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT input_fingerprint, analysis_json
+                    FROM chapter_analyses
+                    WHERE source_system = ?
+                      AND external_book_id = ?
+                      AND chapter_index = ?
+                    """,
+                    (source_system, external_book_id, chapter_index),
+                ).fetchone()
+            if row is None or row["input_fingerprint"] != input_fingerprint:
+                return None
+            try:
+                return ChapterAnalysis.model_validate(json.loads(str(row["analysis_json"])))
+            except (json.JSONDecodeError, TypeError, ValueError, ValidationError) as exc:
+                raise _invalid_cached_analysis(exc) from exc
+        except ForgeException:
+            raise
+        except sqlite3.Error as exc:
+            raise _storage_error(exc) from exc
+
+    def store_chapter_analysis(
+        self,
+        source_system: str,
+        external_book_id: str,
+        chapter_index: int,
+        input_fingerprint: str,
+        analysis: ChapterAnalysis,
+    ) -> None:
+        _validate_cache_key(
+            source_system,
+            external_book_id,
+            chapter_index,
+            input_fingerprint,
+        )
+        try:
+            analysis_json = _canonical_json(analysis.model_dump(mode="json"))
+            now = datetime.now(UTC).isoformat()
+            with self._database.transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO chapter_analyses (
+                        source_system, external_book_id, chapter_index,
+                        input_fingerprint, analysis_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (source_system, external_book_id, chapter_index) DO UPDATE SET
+                        input_fingerprint = excluded.input_fingerprint,
+                        analysis_json = excluded.analysis_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        source_system,
+                        external_book_id,
+                        chapter_index,
+                        input_fingerprint,
+                        analysis_json,
+                        now,
+                        now,
+                    ),
+                )
+        except ForgeException:
+            raise
+        except (sqlite3.Error, TypeError, ValueError) as exc:
+            raise _storage_error(exc) from exc
 
     def find_managed_book(
         self,

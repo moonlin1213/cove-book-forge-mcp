@@ -1052,8 +1052,47 @@ def test_doctor_validates_library_application_schema_without_writing(
         updated_at TEXT NOT NULL,
         PRIMARY KEY (source_system, external_book_id, chapter_index)
         """,
+        """
+        source_system TEXT NOT NULL,
+        external_book_id TEXT NOT NULL,
+        chapter_index INTEGER NOT NULL /* CHECK (chapter_index >= 0) */,
+        input_fingerprint TEXT NOT NULL,
+        analysis_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (source_system, external_book_id, chapter_index)
+        """,
+        """
+        source_system TEXT NOT NULL,
+        external_book_id TEXT NOT NULL,
+        chapter_index INTEGER NOT NULL,
+        input_fingerprint TEXT NOT NULL,
+        analysis_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CONSTRAINT "CHECK (chapter_index >= 0)" UNIQUE (input_fingerprint),
+        PRIMARY KEY (source_system, external_book_id, chapter_index)
+        """,
+        """
+        source_system TEXT NOT NULL,
+        external_book_id TEXT NOT NULL,
+        chapter_index INTEGER NOT NULL CHECK (chapter_index >= 0),
+        input_fingerprint TEXT NOT NULL,
+        analysis_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        generated_extra TEXT GENERATED ALWAYS AS (source_system) VIRTUAL,
+        PRIMARY KEY (source_system, external_book_id, chapter_index)
+        """,
     ],
-    ids=("missing_primary_key", "nullable_column", "missing_chapter_index_check"),
+    ids=(
+        "missing_primary_key",
+        "nullable_column",
+        "missing_chapter_index_check",
+        "comment_check",
+        "quoted_check_name",
+        "generated_extra",
+    ),
 )
 def test_doctor_rejects_invalid_v3_analysis_cache_shape_without_writing(
     tmp_path: Path,

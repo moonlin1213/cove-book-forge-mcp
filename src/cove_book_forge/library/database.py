@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import stat
 import tempfile
@@ -138,23 +137,30 @@ _REQUIRED_V1_COLUMNS = {
     ),
 }
 
-_V3_ANALYSIS_COLUMNS = (
-    ("source_system", "TEXT", 1, None, 1),
-    ("external_book_id", "TEXT", 1, None, 2),
-    ("chapter_index", "INTEGER", 1, None, 3),
-    ("input_fingerprint", "TEXT", 1, None, 0),
-    ("analysis_json", "TEXT", 1, None, 0),
-    ("created_at", "TEXT", 1, None, 0),
-    ("updated_at", "TEXT", 1, None, 0),
+_V3_ANALYSIS_XINFO_COLUMNS = (
+    ("source_system", "TEXT", 1, None, 1, 0),
+    ("external_book_id", "TEXT", 1, None, 2, 0),
+    ("chapter_index", "INTEGER", 1, None, 3, 0),
+    ("input_fingerprint", "TEXT", 1, None, 0, 0),
+    ("analysis_json", "TEXT", 1, None, 0, 0),
+    ("created_at", "TEXT", 1, None, 0, 0),
+    ("updated_at", "TEXT", 1, None, 0, 0),
 )
+
+
+def _canonical_schema_sql(sql: str) -> str:
+    without_semicolon = sql.strip()
+    if without_semicolon.endswith(";"):
+        without_semicolon = without_semicolon[:-1].rstrip()
+    return " ".join(without_semicolon.split())
 
 
 def _has_v3_analysis_table_shape(connection: sqlite3.Connection) -> bool:
     columns = tuple(
-        (str(row[1]), str(row[2]).upper(), int(row[3]), row[4], int(row[5]))
-        for row in connection.execute("PRAGMA table_info(chapter_analyses)").fetchall()
+        (str(row[1]), str(row[2]).upper(), int(row[3]), row[4], int(row[5]), int(row[6]))
+        for row in connection.execute("PRAGMA table_xinfo(chapter_analyses)").fetchall()
     )
-    if columns != _V3_ANALYSIS_COLUMNS:
+    if columns != _V3_ANALYSIS_XINFO_COLUMNS:
         return False
     schema_row = connection.execute(
         "SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?",
@@ -162,12 +168,9 @@ def _has_v3_analysis_table_shape(connection: sqlite3.Connection) -> bool:
     ).fetchone()
     if schema_row is None or not isinstance(schema_row[0], str):
         return False
-    normalized = re.sub(r"\s+", "", schema_row[0].lower())
-    normalized = normalized.replace('"', "").replace("`", "").replace("[", "").replace("]", "")
-    return re.search(
-        r"check\(\(*(?:chapter_index>=0|0<=chapter_index)\)*\)",
-        normalized,
-    ) is not None
+    return _canonical_schema_sql(schema_row[0]) == _canonical_schema_sql(
+        _SCHEMA_V3_CHAPTER_ANALYSES
+    )
 
 
 class _LibrarySchemaReadiness(StrEnum):

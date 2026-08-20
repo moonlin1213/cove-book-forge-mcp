@@ -37,6 +37,8 @@ _VALID_ANALYSIS_TABLE_COLUMNS = """
     updated_at TEXT NOT NULL
 """
 
+_ANALYSIS_TABLE_PRIMARY_KEY = "PRIMARY KEY (source_system, external_book_id, chapter_index)"
+
 
 def _create_v3_database_with_analysis_table(path: Path, analysis_table_columns: str) -> None:
     with sqlite3.connect(path) as connection, connection:
@@ -66,8 +68,28 @@ def _create_v3_database_with_analysis_table(path: Path, analysis_table_columns: 
             "source_system TEXT NOT NULL", "source_system BLOB NOT NULL"
         ),
         _VALID_ANALYSIS_TABLE_COLUMNS + ", extra TEXT",
+        _VALID_ANALYSIS_TABLE_COLUMNS.replace(
+            "CHECK (chapter_index >= 0)", "/* CHECK (chapter_index >= 0) */"
+        )
+        + f", {_ANALYSIS_TABLE_PRIMARY_KEY}",
+        _VALID_ANALYSIS_TABLE_COLUMNS.replace("CHECK (chapter_index >= 0)", "")
+        + ", CONSTRAINT \"CHECK (chapter_index >= 0)\" UNIQUE (input_fingerprint)"
+        + f", {_ANALYSIS_TABLE_PRIMARY_KEY}",
+        _VALID_ANALYSIS_TABLE_COLUMNS
+        + ", generated_extra TEXT GENERATED ALWAYS AS (source_system) VIRTUAL"
+        + f", {_ANALYSIS_TABLE_PRIMARY_KEY}",
     ],
-    ids=("no_primary_key", "missing_column", "nullable", "missing_check", "wrong_type", "extra"),
+    ids=(
+        "no_primary_key",
+        "missing_column",
+        "nullable",
+        "missing_check",
+        "wrong_type",
+        "extra",
+        "comment_check",
+        "quoted_check_name",
+        "generated_extra",
+    ),
 )
 def test_v3_analysis_cache_schema_shape_fails_closed(
     tmp_path: Path,

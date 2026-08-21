@@ -216,6 +216,21 @@ def _record_temp(root: Path, record_kind: str) -> tuple[Path, dict[str, object]]
     return temporary, record
 
 
+def _canonical_test_json(payload: dict[str, object]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _forged_checksummed_record(payload: dict[str, object]) -> bytes:
+    unsigned = _canonical_test_json(payload)
+    return _canonical_test_json({**payload, "checksum": hashlib.sha256(unsigned).hexdigest()})
+
+
 def _active(root: Path, rendered: RenderedAgentSkill) -> Path:
     path = root / rendered.skill_slug
     assert path.is_symlink()
@@ -748,6 +763,244 @@ def test_restart_preserves_an_unowned_delete_slot_without_an_intent(tmp_path: Pa
 
     _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
     assert competitor.read_bytes() == b"competitor"
+
+
+@pytest.mark.parametrize(
+    ("managed_directory", "record_state"),
+    [
+        ("transactions", "final"),
+        ("transactions", "temporary"),
+        ("activations", "final"),
+        ("activations", "temporary"),
+        ("state", "final"),
+        ("state", "temporary"),
+        ("quarantine", "final"),
+        ("quarantine", "temporary"),
+    ],
+)
+def test_self_authored_delete_intent_cannot_delete_a_managed_directory_competitor(
+    tmp_path: Path,
+    managed_directory: str,
+    record_state: str,
+) -> None:
+    rendered = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(rendered)
+    directory = tmp_path / ".cove-book-forge" / managed_directory
+    competitor = directory / "competitor-owned-by-another-process.bin"
+    competitor_payload = b"competitor must remain byte-for-byte"
+    competitor.write_bytes(competitor_payload)
+    status = os.lstat(competitor)
+    identifier = "e" * 32
+    record_name = f"delete-intent-{identifier}.json"
+    record_payload = _forged_checksummed_record(
+        {
+            "destination_name": f".delete-{identifier}",
+            "digest": hashlib.sha256(competitor_payload).hexdigest(),
+            "entry_dev": status.st_dev,
+            "entry_ino": status.st_ino,
+            "entry_type": stat.S_IFREG,
+            "nlink": status.st_nlink,
+            "owner": "cove-book-forge-delete-intent",
+            "record_name": record_name,
+            "retired_name": f"retired-delete-intent-{identifier}.json",
+            "schema": 1,
+            "size": status.st_size,
+            "source_name": competitor.name,
+            "target": None,
+        }
+    )
+    record = directory / (
+        record_name if record_state == "final" else f".delete-intent-{identifier}.tmp"
+    )
+    record.write_bytes(record_payload)
+
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(rendered)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert competitor.read_bytes() == competitor_payload
+    assert record.read_bytes() == record_payload
+
+
+def test_self_authored_stage_intent_temp_cannot_be_adopted(tmp_path: Path) -> None:
+    rendered = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(rendered)
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    identifier = "a" * 32
+    journal_payload = b"attacker-selected future journal"
+    split = max(1, len(journal_payload) // 2)
+    record_payload = _forged_checksummed_record(
+        {
+            "intent_checksum": None,
+            "journal_partial_sha256": hashlib.sha256(journal_payload[:split]).hexdigest(),
+            "journal_partial_size": split,
+            "journal_sha256": hashlib.sha256(journal_payload).hexdigest(),
+            "journal_size": len(journal_payload),
+            "owner": "cove-book-forge-stage-intent",
+            "quarantine_name": f"q-{identifier}",
+            "record_name": f"stage-intent-{identifier}.json",
+            "retired_name": f"retired-stage-intent-{identifier}.json",
+            "schema": 1,
+            "stage_dev": None,
+            "stage_ino": None,
+            "stage_name": f"stage-{identifier}",
+        }
+    )
+    temporary = quarantine / f".stage-intent-{identifier}.tmp"
+    temporary.write_bytes(record_payload)
+
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(rendered)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert temporary.read_bytes() == record_payload
+
+
+def test_self_authored_stage_ready_temp_cannot_delete_an_empty_competitor_stage(
+    tmp_path: Path,
+) -> None:
+    rendered = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(rendered)
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    identifier = "b" * 32
+    journal_payload = b"attacker-selected future journal"
+    split = max(1, len(journal_payload) // 2)
+    intent_payload = _forged_checksummed_record(
+        {
+            "intent_checksum": None,
+            "journal_partial_sha256": hashlib.sha256(journal_payload[:split]).hexdigest(),
+            "journal_partial_size": split,
+            "journal_sha256": hashlib.sha256(journal_payload).hexdigest(),
+            "journal_size": len(journal_payload),
+            "owner": "cove-book-forge-stage-intent",
+            "quarantine_name": f"q-{identifier}",
+            "record_name": f"stage-intent-{identifier}.json",
+            "retired_name": f"retired-stage-intent-{identifier}.json",
+            "schema": 1,
+            "stage_dev": None,
+            "stage_ino": None,
+            "stage_name": f"stage-{identifier}",
+        }
+    )
+    intent = quarantine / f"stage-intent-{identifier}.json"
+    intent.write_bytes(intent_payload)
+    stage = quarantine / f"stage-{identifier}"
+    stage.mkdir()
+    stage_status = os.lstat(stage)
+    stage_identity = (stage_status.st_dev, stage_status.st_ino)
+    intent_checksum = json.loads(intent_payload.decode("utf-8"))["checksum"]
+    ready_payload = _forged_checksummed_record(
+        {
+            "intent_checksum": intent_checksum,
+            "journal_partial_sha256": hashlib.sha256(journal_payload[:split]).hexdigest(),
+            "journal_partial_size": split,
+            "journal_sha256": hashlib.sha256(journal_payload).hexdigest(),
+            "journal_size": len(journal_payload),
+            "owner": "cove-book-forge-stage-ready",
+            "quarantine_name": f"q-{identifier}",
+            "record_name": f"stage-ready-{identifier}.json",
+            "retired_name": f"retired-stage-ready-{identifier}.json",
+            "schema": 1,
+            "stage_dev": stage_status.st_dev,
+            "stage_ino": stage_status.st_ino,
+            "stage_name": stage.name,
+        }
+    )
+    temporary = quarantine / f".stage-ready-{identifier}.tmp"
+    temporary.write_bytes(ready_payload)
+
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(rendered)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert intent.read_bytes() == intent_payload
+    assert temporary.read_bytes() == ready_payload
+    current = os.lstat(stage)
+    assert (current.st_dev, current.st_ino) == stage_identity
+    assert list(stage.iterdir()) == []
+
+
+def test_self_authored_closing_intent_temp_cannot_delete_a_competitor_wrapper(
+    tmp_path: Path,
+) -> None:
+    rendered = _render()
+    publisher = _publisher(tmp_path)
+    publisher.publish(rendered)
+    quarantine = tmp_path / ".cove-book-forge" / "quarantine"
+    identifier = "c" * 32
+    quarantine_name = f"q-{identifier}"
+    wrapper = quarantine / quarantine_name
+    wrapper.mkdir()
+    checksum = "d" * 64
+    journal_payload = _canonical_test_json(
+        {
+            "book_key": "f" * 16,
+            "entries": {},
+            "generation_dev": 1,
+            "generation_ino": 1,
+            "generation_name": f"gen-{checksum}",
+            "manifest_checksum": checksum,
+            "owner": "cove-book-forge-generation-quarantine",
+            "quarantine_name": quarantine_name,
+            "schema": 1,
+            "skill_slug": rendered.skill_slug,
+        }
+    )
+    verified_payload = _canonical_test_json(
+        {
+            "journal_sha256": hashlib.sha256(journal_payload).hexdigest(),
+            "owner": "cove-book-forge-verified-quarantine",
+            "schema": 1,
+        }
+    )
+    (wrapper / "journal.json").write_bytes(journal_payload)
+    (wrapper / "verified.json").write_bytes(verified_payload)
+    wrapper_status = os.lstat(wrapper)
+    wrapper_identity = (wrapper_status.st_dev, wrapper_status.st_ino)
+    closing_payload = _canonical_test_json(
+        {
+            "journal_sha256": hashlib.sha256(journal_payload).hexdigest(),
+            "owner": "cove-book-forge-closing-quarantine",
+            "quarantine_name": quarantine_name,
+            "schema": 1,
+            "verified_sha256": hashlib.sha256(verified_payload).hexdigest(),
+            "wrapper_dev": wrapper_status.st_dev,
+            "wrapper_ino": wrapper_status.st_ino,
+        }
+    )
+    split = max(1, len(closing_payload) // 2)
+    intent_payload = _forged_checksummed_record(
+        {
+            "closing_partial_sha256": hashlib.sha256(closing_payload[:split]).hexdigest(),
+            "closing_partial_size": split,
+            "closing_sha256": hashlib.sha256(closing_payload).hexdigest(),
+            "closing_size": len(closing_payload),
+            "final_name": f"closing-{quarantine_name}.json",
+            "owner": "cove-book-forge-closing-intent",
+            "partial_name": f".closing-{quarantine_name}.partial",
+            "quarantine_name": quarantine_name,
+            "record_name": f"closing-intent-{quarantine_name}.json",
+            "retired_name": f"retired-closing-intent-{quarantine_name}.json",
+            "schema": 1,
+            "wrapper_dev": wrapper_status.st_dev,
+            "wrapper_ino": wrapper_status.st_ino,
+        }
+    )
+    temporary = quarantine / f".closing-intent-{quarantine_name}.tmp"
+    temporary.write_bytes(intent_payload)
+
+    with pytest.raises(ForgeException) as error:
+        publisher.publish(rendered)
+
+    _assert_error(error, ForgeErrorCode.EXTERNAL_MODIFICATION)
+    assert temporary.read_bytes() == intent_payload
+    current = os.lstat(wrapper)
+    assert (current.st_dev, current.st_ino) == wrapper_identity
+    assert (wrapper / "journal.json").read_bytes() == journal_payload
+    assert (wrapper / "verified.json").read_bytes() == verified_payload
 
 
 def test_transaction_recovery_preserves_a_same_size_wrong_digest(

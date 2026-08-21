@@ -431,6 +431,68 @@ class _AuditEntry:
     digest: str | None = None
 
 
+@dataclass(frozen=True)
+class _DeleteAuthority:
+    identifier: str
+    operation: str
+    source_name: str
+    mode_type: int
+    identity: _Identity
+    nlink: int
+    size: int
+    digest: str | None
+    target: str | None
+
+    @property
+    def destination_name(self) -> str:
+        return f".delete-{self.identifier}"
+
+    @property
+    def record_name(self) -> str:
+        return f"delete-intent-{self.identifier}.json"
+
+    @property
+    def retired_name(self) -> str:
+        return f"retired-delete-intent-{self.identifier}.json"
+
+    @property
+    def expected(self) -> _RawEntry:
+        return _RawEntry(self.mode_type, self.identity, self.target)
+
+
+@dataclass(frozen=True)
+class _GenerationCleanupAuthority:
+    identifier: str
+    book_key: str
+    skill_slug: str
+    generation_name: str
+    generation_identity: _Identity
+    journal_size: int
+    journal_digest: str
+    journal_partial_size: int
+    journal_partial_digest: str
+
+    @property
+    def stage_name(self) -> str:
+        return f"stage-{self.identifier}"
+
+    @property
+    def quarantine_name(self) -> str:
+        return f"q-{self.identifier}"
+
+
+@dataclass(frozen=True)
+class _PendingActivation:
+    name: str
+    marker_payload: bytes
+    marker_identity: _Identity
+    active_name: str
+    book_key: str
+    new_target: str
+    old_target: str | None
+    cleanup_authorities: tuple[_GenerationCleanupAuthority, ...]
+
+
 def _rename_noreplace(
     source: str, destination: str, *, source_fd: int, destination_fd: int
 ) -> bool:
@@ -556,15 +618,36 @@ class CanonicalSkillPublisher:
         management: _Management | None = None
         try:
             management = self._management(anchor)
+            self._recover_transactions(management)
+            pending_activations = self._recover_activations(anchor, management)
             for directory_fd in (
                 management.transactions,
                 management.activations,
                 management.state,
             ):
-                self._recover_delete_transitions(directory_fd)
-            self._recover_transactions(management)
-            self._recover_activations(anchor, management)
-            self._recover_quarantines(management)
+                self._recover_delete_transitions(directory_fd, {})
+            cleanup_authorities = tuple(
+                authority
+                for pending in pending_activations
+                for authority in pending.cleanup_authorities
+            )
+            self._recover_quarantines(management, cleanup_authorities)
+            for pending in pending_activations:
+                pending_manifest, _ = self._validate_target(
+                    management,
+                    pending.new_target,
+                    expected_slug=pending.active_name,
+                    anchor=anchor,
+                )
+                if pending_manifest.book_key != pending.book_key:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                self._cleanup_generations(
+                    management,
+                    pending_manifest,
+                    pending.new_target,
+                    pending.cleanup_authorities,
+                )
+                self._finish_activation(management, pending)
             anchor.verify()
             active = self._active_generation(anchor, management, render.skill_slug)
             if active is None:
@@ -574,7 +657,25 @@ class CanonicalSkillPublisher:
             if plan.unchanged:
                 assert active is not None
                 anchor.verify()
-                self._cleanup_generations(management, render.manifest, active.target)
+                state = self._read_state(
+                    management,
+                    book_key=render.manifest.book_key,
+                    skill_slug=render.skill_slug,
+                )
+                if state is None or state[0].current_target != active.target:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                cleanup_authorities = self._plan_generation_cleanup(
+                    management,
+                    render.manifest,
+                    active.target,
+                    state[0].previous_target,
+                )
+                self._cleanup_generations(
+                    management,
+                    render.manifest,
+                    active.target,
+                    cleanup_authorities,
+                )
                 self._checkpoint("hierarchy:before-return")
                 management.verify(anchor)
                 return SkillPublisherReceipt(render, render.skill_slug, (), True)
@@ -582,7 +683,7 @@ class CanonicalSkillPublisher:
             target = self._ensure_generation(management, render, plan.complete_files)
             self._checkpoint("hierarchy:after-stage")
             management.verify(anchor)
-            self._activate(anchor, management, render, target, active)
+            pending_activation = self._activate(anchor, management, render, target, active)
             self._checkpoint("hierarchy:after-cas")
             management.verify(anchor)
             self._checkpoint("manifest:switch")
@@ -590,7 +691,13 @@ class CanonicalSkillPublisher:
             if visible is None or visible.manifest != render.manifest or visible.target != target:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             self._checkpoint("cleanup:start")
-            self._cleanup_generations(management, render.manifest, target)
+            self._cleanup_generations(
+                management,
+                render.manifest,
+                target,
+                pending_activation.cleanup_authorities,
+            )
+            self._finish_activation(management, pending_activation)
             self._checkpoint("hierarchy:before-return")
             management.verify(anchor)
             return SkillPublisherReceipt(
@@ -976,21 +1083,188 @@ class CanonicalSkillPublisher:
         finally:
             os.close(book_fd)
 
+    def _delete_authority_payload(self, authority: _DeleteAuthority) -> dict[str, object]:
+        return {
+            "destination_name": authority.destination_name,
+            "digest": authority.digest,
+            "entry_dev": authority.identity[0],
+            "entry_ino": authority.identity[1],
+            "entry_type": authority.mode_type,
+            "intent_id": authority.identifier,
+            "nlink": authority.nlink,
+            "operation": authority.operation,
+            "record_name": authority.record_name,
+            "retired_name": authority.retired_name,
+            "size": authority.size,
+            "source_name": authority.source_name,
+            "target": authority.target,
+        }
+
+    def _parse_delete_authority(self, raw: object) -> _DeleteAuthority | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, dict) or set(raw) != {
+            "destination_name",
+            "digest",
+            "entry_dev",
+            "entry_ino",
+            "entry_type",
+            "intent_id",
+            "nlink",
+            "operation",
+            "record_name",
+            "retired_name",
+            "size",
+            "source_name",
+            "target",
+        }:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        identifier = raw.get("intent_id")
+        operation = raw.get("operation")
+        source_name = raw.get("source_name")
+        mode_type = raw.get("entry_type")
+        digest = raw.get("digest")
+        target = raw.get("target")
+        if (
+            not isinstance(identifier, str)
+            or re.fullmatch(r"[0-9a-f]{32}", identifier) is None
+            or operation != "replace-state"
+            or not isinstance(source_name, str)
+            or _ACTIVATION_NAME.fullmatch(source_name.removesuffix(".state")) is None
+            or mode_type != stat.S_IFREG
+            or not isinstance(raw.get("entry_dev"), int)
+            or not isinstance(raw.get("entry_ino"), int)
+            or raw.get("nlink") != 1
+            or not isinstance(raw.get("size"), int)
+            or raw["size"] < 0
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+            or target is not None
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        authority = _DeleteAuthority(
+            identifier,
+            operation,
+            source_name,
+            mode_type,
+            (raw["entry_dev"], raw["entry_ino"]),
+            raw["nlink"],
+            raw["size"],
+            digest,
+            target,
+        )
+        if self._delete_authority_payload(authority) != raw:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return authority
+
+    def _cleanup_authority_payload(
+        self, authority: _GenerationCleanupAuthority
+    ) -> dict[str, object]:
+        return {
+            "book_key": authority.book_key,
+            "intent_id": authority.identifier,
+            "journal_partial_sha256": authority.journal_partial_digest,
+            "journal_partial_size": authority.journal_partial_size,
+            "journal_sha256": authority.journal_digest,
+            "journal_size": authority.journal_size,
+            "operation": "retire-generation",
+            "quarantine_name": authority.quarantine_name,
+            "skill_slug": authority.skill_slug,
+            "source_dev": authority.generation_identity[0],
+            "source_ino": authority.generation_identity[1],
+            "source_name": authority.generation_name,
+            "stage_name": authority.stage_name,
+        }
+
+    def _parse_cleanup_authority(self, raw: object) -> _GenerationCleanupAuthority:
+        if not isinstance(raw, dict) or set(raw) != {
+            "book_key",
+            "intent_id",
+            "journal_partial_sha256",
+            "journal_partial_size",
+            "journal_sha256",
+            "journal_size",
+            "operation",
+            "quarantine_name",
+            "skill_slug",
+            "source_dev",
+            "source_ino",
+            "source_name",
+            "stage_name",
+        }:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        identifier = raw.get("intent_id")
+        book_key = raw.get("book_key")
+        skill_slug = raw.get("skill_slug")
+        source_name = raw.get("source_name")
+        journal_size = raw.get("journal_size")
+        journal_digest = raw.get("journal_sha256")
+        partial_size = raw.get("journal_partial_size")
+        partial_digest = raw.get("journal_partial_sha256")
+        if (
+            not isinstance(identifier, str)
+            or re.fullmatch(r"[0-9a-f]{32}", identifier) is None
+            or raw.get("operation") != "retire-generation"
+            or not isinstance(book_key, str)
+            or re.fullmatch(r"[0-9a-f]{16}", book_key) is None
+            or not isinstance(skill_slug, str)
+            or not isinstance(source_name, str)
+            or _GENERATION_NAME.fullmatch(source_name) is None
+            or not isinstance(raw.get("source_dev"), int)
+            or not isinstance(raw.get("source_ino"), int)
+            or raw.get("stage_name") != f"stage-{identifier}"
+            or raw.get("quarantine_name") != f"q-{identifier}"
+            or not isinstance(journal_size, int)
+            or not 0 < journal_size <= _MAX_OWNER_BYTES
+            or not isinstance(journal_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", journal_digest) is None
+            or not isinstance(partial_size, int)
+            or not 0 < partial_size <= journal_size
+            or not isinstance(partial_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", partial_digest) is None
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        authority = _GenerationCleanupAuthority(
+            identifier,
+            book_key,
+            skill_slug,
+            source_name,
+            (raw["source_dev"], raw["source_ino"]),
+            journal_size,
+            journal_digest,
+            partial_size,
+            partial_digest,
+        )
+        if self._cleanup_authority_payload(authority) != raw:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return authority
+
     def _activation_marker(
         self,
         name: str,
         render: RenderedAgentSkill,
         new_target: str,
         old_target: str | None,
+        *,
+        cleanup_authorities: tuple[_GenerationCleanupAuthority, ...],
+        state_delete_authority: _DeleteAuthority | None,
     ) -> dict[str, object]:
         return {
             "active_name": render.skill_slug,
             "book_key": render.manifest.book_key,
+            "cleanup_authorities": [
+                self._cleanup_authority_payload(authority) for authority in cleanup_authorities
+            ],
             "name": name,
             "new_target": new_target,
             "old_target": old_target,
             "owner": "cove-book-forge-skill-activation",
             "schema": 1,
+            "state_delete_authority": (
+                self._delete_authority_payload(state_delete_authority)
+                if state_delete_authority is not None
+                else None
+            ),
         }
 
     def _state_payload(
@@ -1068,6 +1342,7 @@ class CanonicalSkillPublisher:
         current_target: str,
         previous_target: str | None,
         scratch_name: str,
+        delete_authority: _DeleteAuthority | None,
     ) -> None:
         payload = self._state_payload(
             book_key=book_key,
@@ -1079,6 +1354,22 @@ class CanonicalSkillPublisher:
         name = f"{book_key}.json"
         scratch = f"{scratch_name}.state"
         previous = self._read_state(management, book_key=book_key, skill_slug=skill_slug)
+
+        def require_authority(source_payload: bytes, source_identity: _Identity) -> None:
+            expected_authority = _DeleteAuthority(
+                delete_authority.identifier if delete_authority is not None else "",
+                "replace-state",
+                scratch,
+                stat.S_IFREG,
+                source_identity,
+                1,
+                len(source_payload),
+                hashlib.sha256(source_payload).hexdigest(),
+                None,
+            )
+            if delete_authority != expected_authority:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
         try:
             stale_payload, stale_identity = _read_file(
                 management.state, scratch, max_bytes=_MAX_OWNER_BYTES
@@ -1087,19 +1378,24 @@ class CanonicalSkillPublisher:
             pass
         else:
             self._parse_state(stale_payload, book_key=book_key, skill_slug=skill_slug)
-            if stale_payload != payload and (previous is None or stale_payload != previous[1]):
-                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            require_authority(stale_payload, stale_identity)
             self._unlink_identity(
                 management.state,
                 scratch,
                 stale_identity,
                 expected_digest=hashlib.sha256(stale_payload).hexdigest(),
                 expected_size=len(stale_payload),
+                authority=delete_authority,
             )
             _fsync_directory(management.state)
 
         if previous is not None and previous[1] == payload:
             return
+        if previous is None:
+            if delete_authority is not None:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        else:
+            require_authority(previous[1], previous[2])
         new_identity = _write_file(management.state, scratch, payload)
         _fsync_directory(management.state)
         if previous is None:
@@ -1109,13 +1405,6 @@ class CanonicalSkillPublisher:
                 source_fd=management.state,
                 destination_fd=management.state,
             ):
-                self._unlink_identity(
-                    management.state,
-                    scratch,
-                    new_identity,
-                    expected_digest=hashlib.sha256(payload).hexdigest(),
-                    expected_size=len(payload),
-                )
                 _fsync_directory(management.state)
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         else:
@@ -1157,6 +1446,7 @@ class CanonicalSkillPublisher:
                 previous_identity,
                 expected_digest=hashlib.sha256(previous_payload).hexdigest(),
                 expected_size=len(previous_payload),
+                authority=delete_authority,
             )
         _fsync_directory(management.state)
         stored = self._read_state(management, book_key=book_key, skill_slug=skill_slug)
@@ -1169,16 +1459,47 @@ class CanonicalSkillPublisher:
         render: RenderedAgentSkill,
         new_target: str,
         old_target: str | None,
-    ) -> tuple[str, _Identity]:
+        *,
+        previous_state: tuple[_PublicationState, bytes, _Identity] | None,
+        cleanup_authorities: tuple[_GenerationCleanupAuthority, ...],
+    ) -> tuple[str, _Identity, _DeleteAuthority | None, bytes, _Identity]:
         name = f"activate-{uuid4().hex}"
-        marker = self._activation_marker(name, render, new_target, old_target)
-        _write_file(management.activations, f"{name}.json", _canonical_json(marker))
+        state_delete_authority: _DeleteAuthority | None = None
+        if previous_state is not None:
+            _, previous_payload, previous_identity = previous_state
+            state_delete_authority = _DeleteAuthority(
+                uuid4().hex,
+                "replace-state",
+                f"{name}.state",
+                stat.S_IFREG,
+                previous_identity,
+                1,
+                len(previous_payload),
+                hashlib.sha256(previous_payload).hexdigest(),
+                None,
+            )
+        marker = self._activation_marker(
+            name,
+            render,
+            new_target,
+            old_target,
+            cleanup_authorities=cleanup_authorities,
+            state_delete_authority=state_delete_authority,
+        )
+        marker_payload = _canonical_json(marker)
+        marker_identity = _write_file(management.activations, f"{name}.json", marker_payload)
         os.symlink(new_target, name, dir_fd=management.activations)
         entry = os.stat(name, dir_fd=management.activations, follow_symlinks=False)
         if not stat.S_ISLNK(entry.st_mode):
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         _fsync_directory(management.activations)
-        return name, _identity(entry)
+        return (
+            name,
+            _identity(entry),
+            state_delete_authority,
+            marker_payload,
+            marker_identity,
+        )
 
     def _publish_record(
         self,
@@ -1456,7 +1777,39 @@ class CanonicalSkillPublisher:
             finally:
                 os.close(child)
 
-    def _recover_delete_record_temporaries(self, directory_fd: int) -> None:
+    def _require_delete_authority(
+        self,
+        authorities: Mapping[str, _DeleteAuthority] | None,
+        *,
+        record_name: str,
+        source_name: str,
+        destination_name: str,
+        retired_name: str,
+        expected: _RawEntry,
+        expected_nlink: int,
+        expected_size: int,
+        expected_digest: str | None,
+    ) -> None:
+        if authorities is None:
+            return
+        authority = authorities.get(record_name)
+        if (
+            authority is None
+            or authority.source_name != source_name
+            or authority.destination_name != destination_name
+            or authority.retired_name != retired_name
+            or authority.expected != expected
+            or authority.nlink != expected_nlink
+            or authority.size != expected_size
+            or authority.digest != expected_digest
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+    def _recover_delete_record_temporaries(
+        self,
+        directory_fd: int,
+        authorities: Mapping[str, _DeleteAuthority] | None,
+    ) -> None:
         for temporary_name in sorted(_bounded_names(directory_fd, _MAX_TREE_ENTRIES)):
             match = _DELETE_INTENT_TEMP_NAME.fullmatch(temporary_name)
             if match is None:
@@ -1470,7 +1823,7 @@ class CanonicalSkillPublisher:
             (
                 source_name,
                 destination_name,
-                _,
+                retired_name,
                 expected,
                 expected_nlink,
                 expected_size,
@@ -1478,6 +1831,17 @@ class CanonicalSkillPublisher:
             ) = self._parse_delete_intent(payload, record_name=record_name)
             if _raw_entry(directory_fd, record_name) is not None:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            self._require_delete_authority(
+                authorities,
+                record_name=record_name,
+                source_name=source_name,
+                destination_name=destination_name,
+                retired_name=retired_name,
+                expected=expected,
+                expected_nlink=expected_nlink,
+                expected_size=expected_size,
+                expected_digest=expected_digest,
+            )
             self._verify_delete_record_association(
                 directory_fd,
                 source_name=source_name,
@@ -1541,9 +1905,13 @@ class CanonicalSkillPublisher:
             os.rmdir(name, dir_fd=directory_fd)
         _fsync_directory(directory_fd)
 
-    def _recover_delete_transitions(self, directory_fd: int) -> None:
+    def _recover_delete_transitions(
+        self,
+        directory_fd: int,
+        authorities: Mapping[str, _DeleteAuthority] | None = None,
+    ) -> None:
         self._recover_retired_records(directory_fd)
-        self._recover_delete_record_temporaries(directory_fd)
+        self._recover_delete_record_temporaries(directory_fd, authorities)
         names = _bounded_names(directory_fd, _MAX_TREE_ENTRIES)
         for record_name in sorted(names):
             if _DELETE_INTENT_NAME.fullmatch(record_name) is None:
@@ -1560,6 +1928,17 @@ class CanonicalSkillPublisher:
                 expected_size,
                 expected_digest,
             ) = self._parse_delete_intent(payload, record_name=record_name)
+            self._require_delete_authority(
+                authorities,
+                record_name=record_name,
+                source_name=source_name,
+                destination_name=destination_name,
+                retired_name=retired_name,
+                expected=expected,
+                expected_nlink=expected_nlink,
+                expected_size=expected_size,
+                expected_digest=expected_digest,
+            )
             source = _raw_entry(directory_fd, source_name)
             destination = _raw_entry(directory_fd, destination_name)
             if source == expected and destination is None:
@@ -1645,6 +2024,7 @@ class CanonicalSkillPublisher:
         expected_nlink: int,
         expected_digest: str | None,
         expected_size: int,
+        authority: _DeleteAuthority | None = None,
     ) -> tuple[str, str, str, bytes, _Identity]:
         status = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if (
@@ -1664,7 +2044,7 @@ class CanonicalSkillPublisher:
             target = None
         else:
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-        identifier = uuid4().hex
+        identifier = authority.identifier if authority is not None else uuid4().hex
         slot = f".delete-{identifier}"
         record_name = f"delete-intent-{identifier}.json"
         retired_name = f"retired-delete-intent-{identifier}.json"
@@ -1677,6 +2057,19 @@ class CanonicalSkillPublisher:
             digest=expected_digest,
             target=target,
         )
+        actual_authority = _DeleteAuthority(
+            identifier,
+            authority.operation if authority is not None else "runtime-delete",
+            name,
+            stat.S_IFMT(status.st_mode),
+            _identity(status),
+            status.st_nlink,
+            status.st_size,
+            expected_digest,
+            target,
+        )
+        if authority is not None and actual_authority != authority:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         record_identity = self._publish_record(
             directory_fd,
             temporary_name=f".delete-intent-{identifier}.tmp",
@@ -1702,6 +2095,7 @@ class CanonicalSkillPublisher:
         *,
         expected_digest: str | None = None,
         expected_size: int | None = None,
+        authority: _DeleteAuthority | None = None,
     ) -> None:
         current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         if _identity(current) != identity or (
@@ -1732,6 +2126,7 @@ class CanonicalSkillPublisher:
             expected_nlink=current.st_nlink,
             expected_digest=expected_digest,
             expected_size=current.st_size,
+            authority=authority,
         )
         self._delete_isolated_entry(
             directory_fd,
@@ -1801,7 +2196,7 @@ class CanonicalSkillPublisher:
         render: RenderedAgentSkill,
         target: str,
         active: _ActiveGeneration | None,
-    ) -> None:
+    ) -> _PendingActivation:
         old_target = active.target if active is not None else None
         state = self._read_state(
             management,
@@ -1812,7 +2207,26 @@ class CanonicalSkillPublisher:
             active is not None and (state is None or state[0].current_target != active.target)
         ):
             raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
-        activation, new_identity = self._create_activation(management, render, target, old_target)
+        cleanup_authorities = self._plan_generation_cleanup(
+            management,
+            render.manifest,
+            target,
+            old_target,
+        )
+        (
+            activation,
+            new_identity,
+            state_delete_authority,
+            marker_payload,
+            marker_identity,
+        ) = self._create_activation(
+            management,
+            render,
+            target,
+            old_target,
+            previous_state=state,
+            cleanup_authorities=cleanup_authorities,
+        )
         self._checkpoint("activation:before")
         self._checkpoint("hierarchy:before-cas")
         management.verify(anchor)
@@ -1872,14 +2286,32 @@ class CanonicalSkillPublisher:
             current_target=target,
             previous_target=old_target,
             scratch_name=activation,
+            delete_authority=state_delete_authority,
         )
         self._checkpoint("cleanup:start")
+        return _PendingActivation(
+            activation,
+            marker_payload,
+            marker_identity,
+            render.skill_slug,
+            render.manifest.book_key,
+            target,
+            old_target,
+            cleanup_authorities,
+        )
+
+    def _finish_activation(
+        self,
+        management: _Management,
+        pending: _PendingActivation,
+    ) -> None:
+        activation = pending.name
         try:
             leftover = os.stat(activation, dir_fd=management.activations, follow_symlinks=False)
         except FileNotFoundError:
             leftover = None
         if leftover is not None:
-            expected_target = active.target if active is not None else target
+            expected_target = pending.old_target or pending.new_target
             if (
                 not stat.S_ISLNK(leftover.st_mode)
                 or os.readlink(activation, dir_fd=management.activations) != expected_target
@@ -1927,9 +2359,12 @@ class CanonicalSkillPublisher:
             self._target_parts(target)
         return target, _identity(entry)
 
-    def _recover_activations(self, anchor: _RootAnchor, management: _Management) -> None:
+    def _recover_activations(
+        self, anchor: _RootAnchor, management: _Management
+    ) -> tuple[_PendingActivation, ...]:
         names = _bounded_names(management.activations, _MAX_ACTIVATION_ENTRIES)
         marker_names = sorted(name for name in names if name.endswith(".json"))
+        pending_activations: list[_PendingActivation] = []
         for marker_name in marker_names:
             activation = marker_name.removesuffix(".json")
             if _ACTIVATION_NAME.fullmatch(activation) is None:
@@ -1941,11 +2376,13 @@ class CanonicalSkillPublisher:
             expected_keys = {
                 "active_name",
                 "book_key",
+                "cleanup_authorities",
                 "name",
                 "new_target",
                 "old_target",
                 "owner",
                 "schema",
+                "state_delete_authority",
             }
             if set(marker) != expected_keys or marker.get("name") != activation:
                 continue
@@ -1953,6 +2390,7 @@ class CanonicalSkillPublisher:
             book_key = marker.get("book_key")
             new_target = marker.get("new_target")
             old_target = marker.get("old_target")
+            raw_cleanup_authorities = marker.get("cleanup_authorities")
             if (
                 marker.get("owner") != "cove-book-forge-skill-activation"
                 or marker.get("schema") != 1
@@ -1961,6 +2399,27 @@ class CanonicalSkillPublisher:
                 or not isinstance(new_target, str)
                 or old_target is not None
                 and not isinstance(old_target, str)
+                or not isinstance(raw_cleanup_authorities, list)
+            ):
+                continue
+            try:
+                cleanup_authorities = tuple(
+                    self._parse_cleanup_authority(raw) for raw in raw_cleanup_authorities
+                )
+                state_delete_authority = self._parse_delete_authority(
+                    marker.get("state_delete_authority")
+                )
+            except ForgeException:
+                continue
+            if (
+                len({authority.identifier for authority in cleanup_authorities})
+                != len(cleanup_authorities)
+                or any(
+                    authority.book_key != book_key or authority.skill_slug != active_name
+                    for authority in cleanup_authorities
+                )
+                or state_delete_authority is not None
+                and state_delete_authority.source_name != f"{activation}.state"
             ):
                 continue
             new_manifest, _ = self._validate_target(
@@ -1992,6 +2451,12 @@ class CanonicalSkillPublisher:
                 continue
             durable = self._read_state(management, book_key=book_key, skill_slug=active_name)
             if state[0] == new_target:
+                authorities = (
+                    {state_delete_authority.record_name: state_delete_authority}
+                    if state_delete_authority is not None
+                    else {}
+                )
+                self._recover_delete_transitions(management.state, authorities)
                 self._write_state(
                     management,
                     book_key=book_key,
@@ -1999,7 +2464,21 @@ class CanonicalSkillPublisher:
                     current_target=new_target,
                     previous_target=old_target,
                     scratch_name=activation,
+                    delete_authority=state_delete_authority,
                 )
+                pending_activations.append(
+                    _PendingActivation(
+                        activation,
+                        marker_bytes,
+                        marker_identity,
+                        active_name,
+                        book_key,
+                        new_target,
+                        old_target,
+                        cleanup_authorities,
+                    )
+                )
+                continue
             elif old_target is None:
                 if durable is not None:
                     continue
@@ -2015,6 +2494,7 @@ class CanonicalSkillPublisher:
                 expected_size=len(marker_bytes),
             )
             _fsync_directory(management.activations)
+        return tuple(pending_activations)
 
     def _recover_transactions(self, management: _Management) -> None:
         names = _bounded_names(management.transactions, _MAX_TRANSACTION_COUNT)
@@ -2470,7 +2950,78 @@ class CanonicalSkillPublisher:
             )
         )
 
-    def _recover_quarantine_record_temporaries(self, management: _Management) -> None:
+    def _cleanup_authority_map(
+        self, authorities: tuple[_GenerationCleanupAuthority, ...]
+    ) -> dict[str, _GenerationCleanupAuthority]:
+        mapped = {authority.identifier: authority for authority in authorities}
+        if len(mapped) != len(authorities):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return mapped
+
+    def _stage_record_matches_authority(
+        self,
+        record: Mapping[str, Any],
+        authority: _GenerationCleanupAuthority,
+    ) -> bool:
+        return all(
+            record[key] == expected
+            for key, expected in (
+                ("journal_partial_sha256", authority.journal_partial_digest),
+                ("journal_partial_size", authority.journal_partial_size),
+                ("journal_sha256", authority.journal_digest),
+                ("journal_size", authority.journal_size),
+                ("quarantine_name", authority.quarantine_name),
+                ("stage_name", authority.stage_name),
+            )
+        )
+
+    def _verify_cleanup_authority_source(
+        self,
+        management: _Management,
+        authority: _GenerationCleanupAuthority,
+    ) -> None:
+        book_fd, _ = _open_directory(management.generations, authority.book_key)
+        try:
+            manifest, _, _ = self._validate_generation(
+                book_fd,
+                authority.generation_name,
+                expected_book_key=authority.book_key,
+                expected_slug=authority.skill_slug,
+            )
+            generation_identity, audit = self._audit_generation_for_cleanup(
+                book_fd,
+                authority.generation_name,
+                manifest,
+            )
+            expected, _ = self._generation_cleanup_authority(
+                identifier=authority.identifier,
+                generation_name=authority.generation_name,
+                generation_identity=generation_identity,
+                manifest=manifest,
+                audit=audit,
+            )
+            if expected != authority:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        finally:
+            os.close(book_fd)
+
+    def _require_authorized_journal(
+        self,
+        payload: bytes,
+        authority: _GenerationCleanupAuthority,
+    ) -> tuple[_Identity, dict[str, _AuditEntry]]:
+        if (
+            len(payload) != authority.journal_size
+            or hashlib.sha256(payload).hexdigest() != authority.journal_digest
+        ):
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+        return self._parse_journal(payload, quarantine_name=authority.quarantine_name)
+
+    def _recover_quarantine_record_temporaries(
+        self,
+        management: _Management,
+        authorities: Mapping[str, _GenerationCleanupAuthority],
+    ) -> None:
         names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
         for temporary_name in sorted(names):
             stage_intent_match = _STAGE_INTENT_TEMP_NAME.fullmatch(temporary_name)
@@ -2478,6 +3029,9 @@ class CanonicalSkillPublisher:
             closing_match = _CLOSING_INTENT_TEMP_NAME.fullmatch(temporary_name)
             if stage_intent_match is not None:
                 identifier = stage_intent_match.group(1)
+                authority = authorities.get(identifier)
+                if authority is None:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
                 record_name = f"stage-intent-{identifier}.json"
                 payload, temporary_identity = _read_file(
                     management.quarantine,
@@ -2489,6 +3043,9 @@ class CanonicalSkillPublisher:
                     record_name=record_name,
                     ready=False,
                 )
+                if not self._stage_record_matches_authority(intent, authority):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                self._verify_cleanup_authority_source(management, authority)
                 related_names = (
                     record_name,
                     intent["stage_name"],
@@ -2502,6 +3059,9 @@ class CanonicalSkillPublisher:
                     raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             elif stage_ready_match is not None:
                 identifier = stage_ready_match.group(1)
+                authority = authorities.get(identifier)
+                if authority is None:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
                 record_name = f"stage-ready-{identifier}.json"
                 payload, temporary_identity = _read_file(
                     management.quarantine,
@@ -2524,6 +3084,11 @@ class CanonicalSkillPublisher:
                     record_name=intent_name,
                     ready=False,
                 )
+                if not self._stage_record_matches_authority(
+                    intent, authority
+                ) or not self._stage_record_matches_authority(ready, authority):
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                self._verify_cleanup_authority_source(management, authority)
                 stage = _raw_entry(management.quarantine, ready["stage_name"])
                 if (
                     not self._stage_records_match(intent, ready)
@@ -2548,6 +3113,10 @@ class CanonicalSkillPublisher:
                     os.close(stage_fd)
             elif closing_match is not None:
                 quarantine_name = closing_match.group(1)
+                identifier = quarantine_name.removeprefix("q-")
+                authority = authorities.get(identifier)
+                if authority is None or authority.quarantine_name != quarantine_name:
+                    raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
                 record_name = f"closing-intent-{quarantine_name}.json"
                 payload, temporary_identity = _read_file(
                     management.quarantine,
@@ -2589,6 +3158,7 @@ class CanonicalSkillPublisher:
                     )
                 finally:
                     os.close(wrapper_fd)
+                self._require_authorized_journal(journal_payload, authority)
                 closing_payload = self._closing_payload(
                     quarantine_name=quarantine_name,
                     wrapper_identity=wrapper_identity,
@@ -3088,9 +3658,15 @@ class CanonicalSkillPublisher:
             if _STAGE_READY_NAME.fullmatch(name) is not None and name not in recovered_ready:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
 
-    def _recover_quarantines(self, management: _Management) -> None:
-        self._recover_delete_transitions(management.quarantine)
-        self._recover_quarantine_record_temporaries(management)
+    def _recover_quarantines(
+        self,
+        management: _Management,
+        authorities: tuple[_GenerationCleanupAuthority, ...],
+    ) -> None:
+        self._recover_delete_transitions(management.quarantine, {})
+        self._recover_quarantine_record_temporaries(
+            management, self._cleanup_authority_map(authorities)
+        )
         names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
         self._recover_closing_intents(management, names)
         names = _bounded_names(management.quarantine, _MAX_QUARANTINE_ENTRIES)
@@ -3162,20 +3738,18 @@ class CanonicalSkillPublisher:
             finally:
                 os.close(wrapper_fd)
 
-    def _remove_owned_generation(
+    def _audit_generation_for_cleanup(
         self,
-        management: _Management,
         book_fd: int,
         generation_name: str,
         manifest: AgentSkillManifest,
-    ) -> None:
+    ) -> tuple[_Identity, dict[str, _AuditEntry]]:
         _, _, generation_identity = self._validate_generation(
             book_fd,
             generation_name,
             expected_book_key=manifest.book_key,
             expected_slug=manifest.skill_slug,
         )
-        self._checkpoint("cleanup:generation")
         generation_fd, opened_identity = _open_directory(book_fd, generation_name)
         try:
             if opened_identity != generation_identity:
@@ -3199,17 +3773,108 @@ class CanonicalSkillPublisher:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
         finally:
             os.close(generation_fd)
+        return generation_identity, audit
 
-        wrapper_id = uuid4().hex
-        staging_name = f"stage-{wrapper_id}"
-        quarantine_name = f"q-{wrapper_id}"
+    def _generation_cleanup_authority(
+        self,
+        *,
+        identifier: str,
+        generation_name: str,
+        generation_identity: _Identity,
+        manifest: AgentSkillManifest,
+        audit: Mapping[str, _AuditEntry],
+    ) -> tuple[_GenerationCleanupAuthority, bytes]:
         journal_payload = self._journal_payload(
-            quarantine_name=quarantine_name,
+            quarantine_name=f"q-{identifier}",
             generation_name=generation_name,
             generation_identity=generation_identity,
             manifest=manifest,
             audit=audit,
         )
+        split = max(1, len(journal_payload) // 2)
+        return (
+            _GenerationCleanupAuthority(
+                identifier,
+                manifest.book_key,
+                manifest.skill_slug,
+                generation_name,
+                generation_identity,
+                len(journal_payload),
+                hashlib.sha256(journal_payload).hexdigest(),
+                split,
+                hashlib.sha256(journal_payload[:split]).hexdigest(),
+            ),
+            journal_payload,
+        )
+
+    def _plan_generation_cleanup(
+        self,
+        management: _Management,
+        manifest: AgentSkillManifest,
+        active_target: str,
+        previous_target: str | None,
+    ) -> tuple[_GenerationCleanupAuthority, ...]:
+        _, active_name = self._target_parts(active_target)
+        keep = {active_name}
+        if previous_target is not None:
+            previous_book, previous_name = self._target_parts(previous_target)
+            if previous_book != manifest.book_key:
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+            keep.add(previous_name)
+        book_fd, _ = _open_directory(management.generations, manifest.book_key)
+        try:
+            authorities: list[_GenerationCleanupAuthority] = []
+            for generation_name in sorted(_bounded_names(book_fd, _MAX_TRANSACTION_COUNT)):
+                if _GENERATION_NAME.fullmatch(generation_name) is None:
+                    continue
+                candidate, _, _ = self._validate_generation(
+                    book_fd,
+                    generation_name,
+                    expected_book_key=manifest.book_key,
+                    expected_slug=manifest.skill_slug,
+                )
+                if generation_name in keep:
+                    continue
+                generation_identity, audit = self._audit_generation_for_cleanup(
+                    book_fd, generation_name, candidate
+                )
+                authority, _ = self._generation_cleanup_authority(
+                    identifier=uuid4().hex,
+                    generation_name=generation_name,
+                    generation_identity=generation_identity,
+                    manifest=candidate,
+                    audit=audit,
+                )
+                authorities.append(authority)
+            return tuple(authorities)
+        finally:
+            os.close(book_fd)
+
+    def _remove_owned_generation(
+        self,
+        management: _Management,
+        book_fd: int,
+        generation_name: str,
+        manifest: AgentSkillManifest,
+        authority: _GenerationCleanupAuthority,
+    ) -> None:
+        self._checkpoint("cleanup:generation")
+        generation_identity, audit = self._audit_generation_for_cleanup(
+            book_fd, generation_name, manifest
+        )
+        expected_authority, journal_payload = self._generation_cleanup_authority(
+            identifier=authority.identifier,
+            generation_name=generation_name,
+            generation_identity=generation_identity,
+            manifest=manifest,
+            audit=audit,
+        )
+        if authority != expected_authority:
+            raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+
+        wrapper_id = authority.identifier
+        staging_name = f"stage-{wrapper_id}"
+        quarantine_name = f"q-{wrapper_id}"
         intent_name = f"stage-intent-{wrapper_id}.json"
         retired_intent_name = f"retired-stage-intent-{wrapper_id}.json"
         intent_payload = self._stage_record_payload(
@@ -3312,7 +3977,11 @@ class CanonicalSkillPublisher:
         _fsync_directory(book_fd)
 
     def _cleanup_generations(
-        self, management: _Management, manifest: AgentSkillManifest, active_target: str
+        self,
+        management: _Management,
+        manifest: AgentSkillManifest,
+        active_target: str,
+        authorities: tuple[_GenerationCleanupAuthority, ...],
     ) -> None:
         _, active_name = self._target_parts(active_target)
         state = self._read_state(
@@ -3348,8 +4017,26 @@ class CanonicalSkillPublisher:
             keep = {active_name}
             if previous_name is not None:
                 keep.add(previous_name)
+            authority_by_source = {
+                authority.generation_name: authority for authority in authorities
+            }
+            if len(authority_by_source) != len(authorities) or any(
+                authority.book_key != manifest.book_key
+                or authority.skill_slug != manifest.skill_slug
+                for authority in authorities
+            ):
+                raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             for name, candidate in candidates:
                 if name not in keep:
-                    self._remove_owned_generation(management, book_fd, name, candidate)
+                    authority = authority_by_source.get(name)
+                    if authority is None:
+                        raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
+                    self._remove_owned_generation(
+                        management,
+                        book_fd,
+                        name,
+                        candidate,
+                        authority,
+                    )
         finally:
             os.close(book_fd)

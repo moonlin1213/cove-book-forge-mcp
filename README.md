@@ -1,19 +1,83 @@
 # cove-book-forge-mcp
 
-`cove-book-forge-mcp` is a local-first, open-source Python core for securely
-normalizing books and stable external reading snapshots. The implemented phases
-support deterministic EPUB/PDF ingestion, an optional local SQLite library,
-explicit model Provider adapters, and reusable structured chapter analysis.
+**Turn a PDF or EPUB into reusable knowledge—not another one-off chat.**
 
-> **Status boundary:** standards-valid EPUB ingestion, text-layer PDF ingestion,
-> the optional SQLite library, external `ChapterSnapshot` caching, model Provider
-> adapters, validated per-chapter analysis with persistent fingerprint reuse,
-> guarded Obsidian publication, persistent complete-book Agent Skill forging,
-> and the MCP tools/resources over stdio or loopback Streamable HTTP are implemented.
-> Cove's private adapter and reading UI remain future integrations.
+`cove-book-forge-mcp` is a local-first, open-source MCP server that transforms
+books into structured AI analysis, Obsidian notes, chapter-level Skills, or one
+complete installable Agent Skill. Analyze a chapter once, reuse the result across
+outputs, and bring the finished knowledge into Codex, Claude Code, or another
+MCP-capable reading system.
 
-This repository is independent of private Cove/栖渡 code and does not include an
-official reading UI.
+## What you can do
+
+- **Forge an entire book into one Agent Skill.** Import a PDF or EPUB, analyze
+  every chapter through a resumable job, and publish a progressively disclosed
+  Skill that an agent can use without loading the whole book into every prompt.
+- **Choose the right output for each chapter.** Send the same analyzed chapter
+  to a guarded Obsidian knowledge base or turn it into a reusable chapter Skill.
+- **Analyze once instead of paying twice.** Stable fingerprints cache validated
+  chapter analysis, so Obsidian, chapter-Skill, and whole-book workflows reuse
+  matching results with zero additional model calls.
+- **Install Skills where you already work.** Generated Skills can be installed
+  for Codex, Claude Code, or a conventional generic Agent Skills directory.
+- **Use your preferred model.** Built-in adapters cover OpenAI, DeepSeek and
+  other OpenAI-compatible endpoints, and Anthropic; applications can inject a
+  custom provider without changing the forge.
+- **Keep or skip the built-in library.** Store managed copies locally, retain
+  verified references, or let an existing reading system remain authoritative
+  and send complete chapter snapshots through the public boundary.
+- **Build any reading experience around it.** The MCP exposes books, chapters,
+  analysis, outputs, complete-book jobs, controls, status, and generated Skills
+  over stdio or loopback-only Streamable HTTP.
+
+## From book to reusable intelligence
+
+```text
+PDF / EPUB / existing reading system
+                 │
+                 ▼
+       normalized chapters
+                 │
+                 ▼
+    validated AI analysis + cache
+          ┌──────┼───────────┐
+          ▼      ▼           ▼
+     Obsidian  chapter     complete-book
+       notes    Skill          Skill
+          └──────┼───────────┘
+                 ▼
+       Codex / Claude Code /
+       any compatible client
+```
+
+## Why it is different
+
+This is more than a document parser or a prompt that summarizes a book once.
+The forge provides a reusable application boundary: deterministic chapters,
+schema-validated analysis, persistent caching, atomic managed outputs, and
+restartable whole-book jobs. It is useful both as a ready-made MCP backend and
+as infrastructure for developers building their own reading interface.
+
+Use it when you want to:
+
+- turn a book you may not read chapter by chapter into a complete reusable Skill;
+- keep reading in your existing app while delegating analysis and publication;
+- build an AI reading interface without rebuilding ingestion, caching, jobs,
+  Obsidian output, and Agent Skill generation from scratch; or
+- make book-derived knowledge available to multiple agents without repeatedly
+  pasting the source text into chat.
+
+## What is included
+
+The current release implements standards-valid EPUB ingestion, text-layer PDF
+ingestion, an optional local SQLite library, external chapter-snapshot caching,
+model provider adapters, validated reusable chapter analysis, guarded Obsidian
+publication, persistent complete-book Agent Skill forging, and MCP tools and
+resources over stdio or loopback Streamable HTTP.
+
+The repository is independent of private Cove/栖渡 code and intentionally does
+not prescribe a reading UI. Scanned PDFs still require an external OCR step;
+the core fails explicitly instead of silently uploading or guessing at content.
 
 ## Supported input and safety boundaries
 

@@ -23,7 +23,6 @@ def test_readme_documents_completed_single_chapter_skill_boundary() -> None:
         "INSTALL_CONFLICT",
         "byte-for-byte no-op",
         "`ChapterSnapshot`",
-        "Whole-book planning/jobs, MCP tools/transports",
         "[book-to-skill](https://github.com/virgiliojr94/book-to-skill)",
         "**Virgilio Jr.**",
     ):

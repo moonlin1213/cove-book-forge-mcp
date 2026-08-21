@@ -618,3 +618,8 @@ def run_doctor(config_path: Path | None = None) -> DoctorReport:
             checks=(DoctorCheck(name="configuration", status=CheckStatus.FAIL, message=str(exc)),)
         )
     return DoctorReport(checks=tuple(_checks_for_config(config)))
+
+
+def run_doctor_config(config: AppConfig) -> DoctorReport:
+    """Run the same read-only checks for an already validated application config."""
+    return DoctorReport(checks=tuple(_checks_for_config(config)))

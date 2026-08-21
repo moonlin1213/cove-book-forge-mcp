@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "cove-book-forge-mcp"
 version = "0.1.0.dev0"
-description = "Local-first ingestion, SQLite library, and model-provider core for a planned MCP server."
+description = "Local-first book analysis, persistent whole-book Skill forging, and MCP server."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
@@ -13,6 +13,7 @@ dependencies = [
   "beautifulsoup4>=4.13,<5",
   "defusedxml>=0.7,<1",
   "httpx>=0.28,<1",
+  "mcp>=1.26,<2",
   "platformdirs>=4.3,<5",
   "pydantic>=2.11,<3",
   "pypdf>=5,<7",
@@ -84,3 +85,8 @@ select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM"]
 python_version = "3.11"
 strict = true
 packages = ["cove_book_forge"]
+
+[[tool.mypy.overrides]]
+module = ["mcp", "mcp.*", "starlette", "starlette.*"]
+follow_imports = "skip"
+ignore_missing_imports = true

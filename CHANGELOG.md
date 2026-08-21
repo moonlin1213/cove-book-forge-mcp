@@ -41,5 +41,13 @@
 - Added deterministic, guarded single-chapter Agent Skill publication with
   verified optional Codex, Claude Code, and generic Agent installation.
   `doctor` now probes configured Skill roots read-only without creating output
-  state. Whole-book jobs and MCP tools/transports remain future work; Cove will
-  integrate later through the planned MCP boundary.
+  state.
+- Added persistent complete-book Agent Skill forging from managed books or
+  complete external snapshots, including fingerprint-bound 30-minute plans,
+  cache-aware token/call estimates, explicit confirmation, per-book idempotent
+  control, chapter checkpoints, boundary pause/cancel, retry, and restart resume.
+- Added the official Python MCP SDK server with strict structured tools for the
+  library, analysis, chapter outputs, complete-book jobs, and Skill discovery;
+  corresponding `cove-book-forge://` resources; stdio by default; and explicit
+  loopback-only Streamable HTTP. Custom Providers remain injectable through the
+  application context. Cove's private adapter and UI remain future work.

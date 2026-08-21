@@ -643,6 +643,26 @@ class CanonicalSkillPublisher:
                 management.close()
             anchor.close()
 
+    def list_active_manifests(self) -> tuple[AgentSkillManifest, ...]:
+        """List validated active managed Skills without exposing filesystem paths."""
+        anchor = _RootAnchor.capture(self._config)
+        management: _Management | None = None
+        try:
+            management = self._management(anchor)
+            self._recover_transactions(management)
+            manifests: list[AgentSkillManifest] = []
+            for name in sorted(_bounded_names(anchor.descriptor, _MAX_TREE_ENTRIES)):
+                if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*--[0-9a-f]{16}", name) is None:
+                    continue
+                active = self._active_generation(anchor, management, name)
+                if active is not None:
+                    manifests.append(active.manifest)
+            return tuple(manifests)
+        finally:
+            if management is not None:
+                management.close()
+            anchor.close()
+
     def publish(self, render: RenderedAgentSkill) -> SkillPublisherReceipt:
         try:
             return self._publish(render)

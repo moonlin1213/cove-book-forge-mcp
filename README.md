@@ -8,9 +8,9 @@ explicit model Provider adapters, and reusable structured chapter analysis.
 > **Status boundary:** standards-valid EPUB ingestion, text-layer PDF ingestion,
 > the optional SQLite library, external `ChapterSnapshot` caching, model Provider
 > adapters, validated per-chapter analysis with persistent fingerprint reuse,
-> guarded single-chapter Obsidian publication, and generated single-chapter
-> Agent Skill publication/installation are implemented. Whole-book jobs and MCP
-> tools/transports remain planned and are **not implemented**.
+> guarded Obsidian publication, persistent complete-book Agent Skill forging,
+> and the MCP tools/resources over stdio or loopback Streamable HTTP are implemented.
+> Cove's private adapter and reading UI remain future integrations.
 
 This repository is independent of private Cove/栖渡 code and does not include an
 official reading UI.
@@ -169,6 +169,50 @@ The same `AnalyzedChapter` feeds both implemented outputs without re-analysis.
 An existing reading system supplies the complete `ChapterSnapshot`; its local
 cache supplies the matching `AnalyzedChapter`, so a Skill publication does not
 call a Provider again.
+
+## Persistent complete-book Skill forging
+
+`WholeBookForge` accepts either a managed library `book_id` or a complete ordered
+sequence of external `ChapterSnapshot` values. Planning creates a secret-free
+30-minute `ForgePlan` bound to every chapter analysis fingerprint, the selected
+Provider/model, prompt and generator versions, and Skill output configuration.
+Its estimate reports tokens and model calls only for uncached analyses; it does
+not invent prices.
+
+Starting a plan requires explicit confirmation and an idempotency key. One
+controller owns a book's Skill at a time. The persistent SQLite journal records
+plans, jobs, and chapter publication checkpoints. Each chapter is analyzed
+through `ChapterAnalyzer` and published through `AgentSkillOutput`, so cache hits
+make no model calls and the final Skill contains the complete chapter set.
+Pause and cancellation take effect at chapter boundaries; cancellation preserves
+already published chapters. Interrupted or failed jobs can resume/retry without
+repeating completed checkpoints, including after process restart.
+
+## MCP server
+
+Install the project and start the default stdio server with:
+
+```console
+cove-book-forge mcp --config /absolute/path/to/config.yaml
+```
+
+The server exposes library import/read operations, chapter analysis and outputs,
+whole-book planning/jobs/control/status, generated Skill discovery, and matching
+`cove-book-forge://` resources. All tools return Pydantic-defined structured
+results. Public errors use safe `ForgeErrorDetail` data and do not reveal source
+paths, chapter text, Provider responses, or credentials.
+
+An explicit local HTTP transport is also available:
+
+```console
+cove-book-forge mcp --transport http --host 127.0.0.1 --port 8000 \
+  --config /absolute/path/to/config.yaml
+```
+
+Unauthenticated Streamable HTTP is restricted to loopback addresses. The server
+does not provide a remote unauthenticated mode. Applications can construct an
+`AppContext` with a custom `ModelProvider`; built-in DeepSeek configuration uses
+the existing OpenAI-compatible Provider route.
 
 ## Safe Obsidian output
 

@@ -283,9 +283,10 @@ publication restores the last successful visible bundle when it can prove
 ownership and never adopts or deletes a competing file. Successful unchanged
 publication is a byte-for-byte no-op.
 
-The future Cove integration will call the planned MCP application boundary;
-this repository does not yet expose MCP tools or transports, and does not run
-whole-book jobs.
+The private Cove reading interface can call the public MCP application boundary
+implemented in this repository. The core remains UI-agnostic: other reading
+systems can use the same tools and resources, while users without an existing
+reader can build their own interface around them.
 
 ## Generated Agent Skills
 
@@ -328,9 +329,10 @@ matching the generated Skill's description. Codex uses `~/.codex/skills`,
 Claude Code uses `~/.claude/skills`, and generic agents use `~/.agents/skills`;
 only roots named in `install_to` are inspected or changed.
 
-This completed boundary is deliberately limited to one already analyzed
-chapter. Whole-book planning/jobs, MCP tools/transports, UI work, and private
-Cove adapters remain future work.
+The same output boundary is used by the whole-book forge, which analyzes and
+publishes chapters through persistent, resumable jobs. The public MCP server
+exposes both chapter-level and whole-book workflows; only the private Cove UI
+adapter remains outside this open-source repository.
 
 ## Model Providers
 

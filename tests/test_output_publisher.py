@@ -1284,6 +1284,37 @@ def test_restart_never_adopts_a_replaced_transaction_owner_lock(
     _assert_safe(raised.value, vault)
 
 
+def test_restart_rejects_replaced_owner_lock_when_inode_identity_is_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cove_book_forge.outputs.publisher as publisher_module
+
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    _publish(vault, _analyzed(card=True))
+    _run_hard_crashing_publish(vault, "partial_publish")
+    transaction = next((vault / ".cove-book-forge" / ".transactions").glob("tx-*"))
+    owner = transaction / "owner.lock"
+    real_identity = publisher_module._identity
+    original_identity = real_identity(owner.stat(follow_symlinks=False))
+    owner.unlink()
+    owner.write_bytes(b"")
+    replacement_identity = real_identity(owner.stat(follow_symlinks=False))
+
+    def simulate_reused_inode(status: os.stat_result):
+        identity = real_identity(status)
+        return original_identity if identity == replacement_identity else identity
+
+    monkeypatch.setattr(publisher_module, "_identity", simulate_reused_inode)
+
+    with pytest.raises(ForgeException) as raised:
+        _publisher(vault).publish(lambda _previous: pytest.fail("renderer ran"))
+
+    assert raised.value.code is ForgeErrorCode.EXTERNAL_MODIFICATION
+    assert owner.is_file() and owner.read_bytes() == b""
+    _assert_safe(raised.value, vault)
+
+
 @pytest.mark.parametrize(
     "signal",
     [KeyboardInterrupt("owner lock interrupt"), asyncio.CancelledError("owner lock cancel")],
@@ -2794,7 +2825,13 @@ def test_rollback_noreplace_collision_never_adopts_or_deletes_destination(
     assert manifest_failed
     assert collision_name is not None
     assert _visible(vault) == before
-    matches = list((vault / ".cove-book-forge" / ".transactions").rglob(collision_name))
+    transactions = vault / ".cove-book-forge" / ".transactions"
+    matches = [
+        Path(directory, entry)
+        for directory, directories, files in os.walk(transactions, followlinks=False)
+        for entry in (*directories, *files)
+        if entry == collision_name
+    ]
     assert len(matches) == 1
     collision = matches[0]
     status = collision.lstat()

@@ -14,7 +14,10 @@ from cove_book_forge.config.paths import AuthorizedPathPolicy
 from cove_book_forge.errors import ForgeException
 from cove_book_forge.library.database import _inspect_library_schema, _LibrarySchemaReadiness
 from cove_book_forge.library.service import _validate_data_root
+from cove_book_forge.outputs import skill_install as skill_install_module
+from cove_book_forge.outputs import skill_publisher as skill_publisher_module
 from cove_book_forge.outputs.publisher import check_obsidian_output_readiness
+from cove_book_forge.outputs.skill_publisher import check_skill_output_readiness
 from cove_book_forge.providers import ProviderRegistry
 from cove_book_forge.providers.credentials import resolve_provider_credential
 
@@ -495,6 +498,86 @@ def _obsidian_output_check(config: AppConfig) -> DoctorCheck:
     )
 
 
+def _skill_install_root_check(target: str) -> DoctorCheck:
+    """Probe one conventional install root through a no-follow descriptor."""
+    name = f"skill_install_{target}"
+    try:
+        home = Path.home()
+        root = home / skill_install_module._ROOTS[target]  # type: ignore[index]
+        home_status = home.lstat()
+        root_status = root.lstat()
+        if (
+            not home.is_absolute()
+            or home == Path(home.anchor)
+            or not stat.S_ISDIR(home_status.st_mode)
+            or stat.S_ISLNK(home_status.st_mode)
+            or not stat.S_ISDIR(root_status.st_mode)
+            or stat.S_ISLNK(root_status.st_mode)
+        ):
+            raise OSError("unsafe install root")
+        descriptor = skill_publisher_module._open_absolute_directory(root)
+    except (ForgeException, OSError, RuntimeError, ValueError, KeyError):
+        return DoctorCheck(
+            name=name, status=CheckStatus.FAIL, message="Skill installation root is not ready."
+        )
+    try:
+        accessible = False
+        probe_failed = not (
+            skill_publisher_module._EFFECTIVE_ACCESS_DIR_FD_SUPPORTED
+            and skill_publisher_module._EFFECTIVE_ACCESS_IDS_SUPPORTED
+        )
+        if not probe_failed:
+            try:
+                accessible = os.access(
+                    ".",
+                    os.R_OK | os.W_OK | os.X_OK,
+                    dir_fd=descriptor,
+                    effective_ids=True,
+                )
+            except Exception:
+                probe_failed = True
+        if not probe_failed and accessible:
+            return DoctorCheck(
+                name=name, status=CheckStatus.PASS, message="Skill installation root is ready."
+            )
+        return DoctorCheck(
+            name=name, status=CheckStatus.FAIL, message="Skill installation root is not ready."
+        )
+    finally:
+        with suppress(OSError):
+            os.close(descriptor)
+
+
+def _skill_output_checks(config: AppConfig) -> tuple[DoctorCheck, ...]:
+    output_config = config.outputs.skills
+    if not output_config.enabled:
+        return (
+            DoctorCheck(
+                name="skill_output",
+                status=CheckStatus.WARN,
+                message="Agent Skill output is disabled.",
+            ),
+        )
+    try:
+        check_skill_output_readiness(output_config)
+    except ForgeException:
+        canonical_check = DoctorCheck(
+            name="skill_canonical",
+            status=CheckStatus.FAIL,
+            message="Agent Skill canonical directory is not ready.",
+        )
+    else:
+        canonical_check = DoctorCheck(
+            name="skill_canonical",
+            status=CheckStatus.PASS,
+            message="Agent Skill canonical directory is ready.",
+        )
+    return (
+        canonical_check,
+        *(_skill_install_root_check(target) for target in output_config.install_to),
+    )
+
+
 def _checks_for_config(config: AppConfig) -> list[DoctorCheck]:
     checks = [
         DoctorCheck(
@@ -523,10 +606,7 @@ def _checks_for_config(config: AppConfig) -> list[DoctorCheck]:
         else _database_check(data_path, enabled=config.library.enabled)
     )
     checks.append(_obsidian_output_check(config))
-    if config.outputs.skills.enabled and config.outputs.skills.canonical_path is not None:
-        checks.append(
-            _authorized_directory_check("skill_root", config.outputs.skills.canonical_path)
-        )
+    checks.extend(_skill_output_checks(config))
     return checks
 
 

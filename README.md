@@ -7,10 +7,10 @@ explicit model Provider adapters, and reusable structured chapter analysis.
 
 > **Status boundary:** standards-valid EPUB ingestion, text-layer PDF ingestion,
 > the optional SQLite library, external `ChapterSnapshot` caching, model Provider
-> adapters, validated per-chapter analysis with persistent fingerprint reuse, and
-> guarded single-chapter Obsidian publication are implemented. Agent Skill
-> generation/installation, whole-book jobs, and MCP tools/transports remain
-> planned and are **not implemented**.
+> adapters, validated per-chapter analysis with persistent fingerprint reuse,
+> guarded single-chapter Obsidian publication, and generated single-chapter
+> Agent Skill publication/installation are implemented. Whole-book jobs and MCP
+> tools/transports remain planned and are **not implemented**.
 
 This repository is independent of private Cove/栖渡 code and does not include an
 official reading UI.
@@ -165,10 +165,10 @@ analyzed = await analyzer.analyze(snapshot)
 print(analyzed.analysis.core_idea, analyzed.cache_hit)
 ```
 
-The same `AnalyzedChapter` feeds the implemented Obsidian output without
-re-analysis and is the future input boundary for Agent Skill rendering. Agent
-Skill rendering, whole-book job orchestration, and MCP endpoints are outside the
-currently implemented phase.
+The same `AnalyzedChapter` feeds both implemented outputs without re-analysis.
+An existing reading system supplies the complete `ChapterSnapshot`; its local
+cache supplies the matching `AnalyzedChapter`, so a Skill publication does not
+call a Provider again.
 
 ## Safe Obsidian output
 
@@ -240,8 +240,53 @@ ownership and never adopts or deletes a competing file. Successful unchanged
 publication is a byte-for-byte no-op.
 
 The future Cove integration will call the planned MCP application boundary;
-this repository does not yet expose MCP tools or transports. It also does not
-generate or install Agent Skills and does not run whole-book jobs.
+this repository does not yet expose MCP tools or transports, and does not run
+whole-book jobs.
+
+## Generated Agent Skills
+
+`AgentSkillOutput` turns one already analyzed `ChapterSnapshot` into a managed,
+single-chapter Agent Skill. Configure an existing canonical directory and only
+the conventional discovery roots you want to use:
+
+```yaml
+outputs:
+  skills:
+    enabled: true
+    canonical_path: /absolute/path/to/generated-skills
+    install_to: [codex, claude, agents]
+```
+
+The public synchronous boundary mirrors the Obsidian boundary. It accepts a
+cached analysis and therefore never invokes a Provider:
+
+```python
+from cove_book_forge.contracts import AnalyzedChapter, ChapterSnapshot
+from cove_book_forge.outputs import AgentSkillOutput
+
+result = AgentSkillOutput(config.outputs.skills).publish(snapshot, analyzed)
+print(result.skill_slug, result.canonical_path)
+```
+
+Run [`examples/publish_chapter_skill.py`](examples/publish_chapter_skill.py)
+for a complete, local demonstration. The canonical root remains the source of
+truth and has a guarded, recoverable managed layout. Each selected target is
+installed as a verified relative symlink when supported; if symlinks are not
+available, it receives a verified managed copy. Existing non-managed files,
+directories, and links are never overwritten: an installation collision returns
+`INSTALL_CONFLICT` while leaving the canonical Skill usable. Repeating an
+unchanged publication reuses the cached analysis and performs a byte-for-byte
+no-op.
+
+After installation, invoke the generated skill as `$<skill-slug>` (for example,
+`$durable-decisions--0123abcd0123abcd`) or make a natural-language request
+matching the generated Skill's description. Codex uses `~/.codex/skills`,
+Claude Code uses `~/.claude/skills`, and generic agents use `~/.agents/skills`;
+only roots named in `install_to` are inspected or changed.
+
+This completed boundary is deliberately limited to one already analyzed
+chapter. Whole-book planning/jobs, MCP tools/transports, UI work, and private
+Cove adapters remain future work.
 
 ## Model Providers
 

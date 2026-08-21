@@ -37,5 +37,9 @@
   recoverable atomic bundle updates inside an explicitly authorized vault.
 - Extended `doctor` with a read-only, path-safe Obsidian readiness check that
   reuses the publisher's narrow vault validation without rendering, staging, or
-  writing. Agent Skill output, whole-book jobs, and MCP tools/transports remain
-  future work; Cove will integrate later through the planned MCP boundary.
+  writing.
+- Added deterministic, guarded single-chapter Agent Skill publication with
+  verified optional Codex, Claude Code, and generic Agent installation.
+  `doctor` now probes configured Skill roots read-only without creating output
+  state. Whole-book jobs and MCP tools/transports remain future work; Cove will
+  integrate later through the planned MCP boundary.

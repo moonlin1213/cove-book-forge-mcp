@@ -257,6 +257,117 @@ def test_doctor_reports_disabled_obsidian_output_as_non_blocking(tmp_path: Path)
     assert _filesystem_metadata_snapshot(tmp_path) == before
 
 
+def test_doctor_reports_disabled_skill_output_as_non_blocking(tmp_path: Path) -> None:
+    """Disabled Skills are intentional, and Doctor must not create their roots."""
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    config = _write_config(tmp_path / "config.yaml", data_dir, enabled=False)
+    before = _filesystem_metadata_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert _check(payload, "skill_output") == {
+        "name": "skill_output",
+        "status": "warn",
+        "message": "Agent Skill output is disabled.",
+    }
+    assert _filesystem_metadata_snapshot(tmp_path) == before
+
+
+def test_doctor_checks_enabled_skill_roots_read_only_and_without_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Doctor must validate configured canonical/selected roots without publishing or installing."""
+    home = tmp_path / "private-home"
+    install_root = home / ".codex" / "skills"
+    install_root.mkdir(parents=True)
+    canonical = tmp_path / "private-canonical"
+    canonical.mkdir()
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+library:
+  enabled: false
+  data_dir: {data_dir}
+model:
+  provider: openai-compatible
+  model: local-model
+  base_url: http://localhost:11434/v1
+outputs:
+  skills:
+    enabled: true
+    canonical_path: {canonical}
+    install_to: [codex]
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    before = _filesystem_metadata_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert _check(payload, "skill_canonical") == {
+        "name": "skill_canonical",
+        "status": "pass",
+        "message": "Agent Skill canonical directory is ready.",
+    }
+    assert _check(payload, "skill_install_codex") == {
+        "name": "skill_install_codex",
+        "status": "pass",
+        "message": "Skill installation root is ready.",
+    }
+    assert str(canonical) not in result.stdout
+    assert str(install_root) not in result.stdout
+    assert _filesystem_metadata_snapshot(tmp_path) == before
+
+
+def test_doctor_rejects_unsafe_skill_roots_without_revealing_paths(tmp_path: Path) -> None:
+    """A link or missing conventional root cannot be reported as ready."""
+    data_dir = tmp_path / "library"
+    data_dir.mkdir()
+    canonical_target = tmp_path / "canonical-target"
+    canonical_target.mkdir()
+    canonical = tmp_path / "private-canonical-link"
+    canonical.symlink_to(canonical_target, target_is_directory=True)
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        f"""
+library:
+  enabled: false
+  data_dir: {data_dir}
+model:
+  provider: openai-compatible
+  model: local-model
+  base_url: http://localhost:11434/v1
+outputs:
+  skills:
+    enabled: true
+    canonical_path: {canonical}
+""".strip(),
+        encoding="utf-8",
+    )
+    before = _filesystem_metadata_snapshot(tmp_path)
+
+    result = runner.invoke(app, ["doctor", "--config", str(config), "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert _check(payload, "skill_canonical") == {
+        "name": "skill_canonical",
+        "status": "fail",
+        "message": "Agent Skill canonical directory is not ready.",
+    }
+    assert str(canonical) not in result.stdout
+    assert _filesystem_metadata_snapshot(tmp_path) == before
+
+
 def test_doctor_checks_enabled_obsidian_vault_read_only_without_render_or_publish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

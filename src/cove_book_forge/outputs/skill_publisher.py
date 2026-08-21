@@ -78,6 +78,8 @@ _SECURE_PRIMITIVES: Final = (
         for function in (os.open, os.mkdir, os.stat, os.rename, os.unlink, os.rmdir)
     )
 )
+_EFFECTIVE_ACCESS_DIR_FD_SUPPORTED: Final = os.access in os.supports_dir_fd
+_EFFECTIVE_ACCESS_IDS_SUPPORTED: Final = os.access in os.supports_effective_ids
 
 _Identity = tuple[int, int]
 
@@ -312,6 +314,31 @@ class _RootAnchor:
 
     def close(self) -> None:
         os.close(self.descriptor)
+
+
+def check_skill_output_readiness(config: SkillOutputConfig) -> None:
+    """Validate canonical Skill-root access without creating publication state."""
+    anchor = _RootAnchor.capture(config)
+    try:
+        accessible = False
+        probe_failed = not (_EFFECTIVE_ACCESS_DIR_FD_SUPPORTED and _EFFECTIVE_ACCESS_IDS_SUPPORTED)
+        if not probe_failed:
+            try:
+                accessible = os.access(
+                    ".",
+                    os.R_OK | os.W_OK | os.X_OK,
+                    dir_fd=anchor.descriptor,
+                    effective_ids=True,
+                )
+            except Exception:
+                probe_failed = True
+        anchor.verify()
+        if probe_failed:
+            raise _error(ForgeErrorCode.PATH_NOT_ALLOWED)
+        if not accessible:
+            raise _error(ForgeErrorCode.OUTPUT_PERMISSION_DENIED)
+    finally:
+        anchor.close()
 
 
 @dataclass

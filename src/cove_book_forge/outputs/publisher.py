@@ -379,6 +379,7 @@ class _TransactionJournal:
     vault_identity: _Identity
     transaction_identity: _Identity
     owner_identity: _Identity
+    owner_ctime_ns: int
     stage_identity: _Identity
     backup_identity: _Identity
     manifest_path: str
@@ -400,6 +401,7 @@ class _Transaction:
     backup_fd: int
     identity: _Identity
     owner_identity: _Identity
+    owner_ctime_ns: int
     stage_identity: _Identity
     backup_identity: _Identity
     created_directories: list[_CreatedDirectory]
@@ -484,8 +486,9 @@ def _journal_payload(journal: _TransactionJournal, phase: _TransactionPhase) -> 
             for item in journal.old_files
         ],
         "phase": phase.value,
+        "owner_ctime_ns": journal.owner_ctime_ns,
         "owner_identity": list(journal.owner_identity),
-        "schema": 2,
+        "schema": 3,
         "stage_identity": list(journal.stage_identity),
         "transaction_identity": list(journal.transaction_identity),
         "transaction_name": journal.transaction_name,
@@ -553,6 +556,7 @@ def _parse_journal_record(data: bytes) -> tuple[_TransactionJournal, _Transactio
         "checksum",
         "manifest",
         "old_files",
+        "owner_ctime_ns",
         "owner_identity",
         "phase",
         "schema",
@@ -572,7 +576,7 @@ def _parse_journal_record(data: bytes) -> tuple[_TransactionJournal, _Transactio
     ).encode("utf-8")
     if not isinstance(checksum, str) or checksum != hashlib.sha256(canonical).hexdigest():
         raise ValueError("invalid transaction state checksum")
-    if payload["schema"] != 2:
+    if payload["schema"] != 3:
         raise ValueError("invalid transaction state schema")
     phase = _TransactionPhase(payload["phase"])
     transaction_name = payload["transaction_name"]
@@ -715,11 +719,15 @@ def _parse_journal_record(data: bytes) -> tuple[_TransactionJournal, _Transactio
         or (old_checksum is None) != (old_digest is None)
     ):
         raise ValueError("invalid transaction aggregate state")
+    owner_ctime_ns = payload["owner_ctime_ns"]
+    if type(owner_ctime_ns) is not int or owner_ctime_ns < 0:
+        raise ValueError("invalid owner change time")
     journal = _TransactionJournal(
         transaction_name=transaction_name,
         vault_identity=_parse_identity(payload["vault_identity"]),
         transaction_identity=_parse_identity(payload["transaction_identity"]),
         owner_identity=_parse_identity(payload["owner_identity"]),
+        owner_ctime_ns=owner_ctime_ns,
         stage_identity=_parse_identity(payload["stage_identity"]),
         backup_identity=_parse_identity(payload["backup_identity"]),
         manifest_path=manifest_path,
@@ -1167,6 +1175,7 @@ class GuardedPublisher:
                 _bounded_directory_names(tx_fd, _MAX_CANDIDATE_COUNT + len(_TransactionPhase) + 4)
             )
             owner_identity: _Identity | None = None
+            owner_ctime_ns: int | None = None
             if _OWNER_NAME in root_names:
                 owner_entry = os.stat(_OWNER_NAME, dir_fd=tx_fd, follow_symlinks=False)
                 if not stat.S_ISREG(owner_entry.st_mode) or owner_entry.st_size != 0:
@@ -1174,10 +1183,12 @@ class GuardedPublisher:
                 owner_fd = os.open(_OWNER_NAME, _OWNER_OPEN_FLAGS, dir_fd=tx_fd)
                 owner_status = os.fstat(owner_fd)
                 owner_identity = _identity(owner_status)
+                owner_ctime_ns = owner_status.st_ctime_ns
                 if (
                     not stat.S_ISREG(owner_status.st_mode)
                     or owner_status.st_size != 0
                     or owner_identity != _identity(owner_entry)
+                    or owner_ctime_ns != owner_entry.st_ctime_ns
                 ):
                     raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
                 if not _try_owner_lock(owner_fd):
@@ -1193,7 +1204,7 @@ class GuardedPublisher:
                     root_names,
                 )
                 return None
-            if owner_fd is None or owner_identity is None:
+            if owner_fd is None or owner_identity is None or owner_ctime_ns is None:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             stage_fd = os.open("stage", _DIRECTORY_FLAGS, dir_fd=tx_fd)
             backup_fd = os.open("backup", _DIRECTORY_FLAGS, dir_fd=tx_fd)
@@ -1230,6 +1241,7 @@ class GuardedPublisher:
                 or selected_journal.vault_identity != anchor.identity
                 or selected_journal.transaction_identity != tx_identity
                 or selected_journal.owner_identity != owner_identity
+                or selected_journal.owner_ctime_ns != owner_ctime_ns
                 or selected_journal.stage_identity != stage_identity
                 or selected_journal.backup_identity != backup_identity
             ):
@@ -1244,6 +1256,7 @@ class GuardedPublisher:
                 backup_fd=backup_fd,
                 identity=tx_identity,
                 owner_identity=owner_identity,
+                owner_ctime_ns=owner_ctime_ns,
                 stage_identity=stage_identity,
                 backup_identity=backup_identity,
                 created_directories=[],
@@ -2154,6 +2167,7 @@ class GuardedPublisher:
         owner_fd: int | None = None
         tx_identity: _Identity | None = None
         owner_identity: _Identity | None = None
+        owner_ctime_ns: int | None = None
         parent_locked = False
         try:
             fcntl.flock(parent_fd, fcntl.LOCK_EX)
@@ -2171,6 +2185,7 @@ class GuardedPublisher:
             if not stat.S_ISREG(owner_status.st_mode) or owner_status.st_size != 0:
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             owner_identity = _identity(owner_status)
+            owner_ctime_ns = owner_status.st_ctime_ns
             if not _try_owner_lock(owner_fd):
                 raise _error(ForgeErrorCode.EXTERNAL_MODIFICATION)
             _fsync_file(owner_fd)
@@ -2182,7 +2197,11 @@ class GuardedPublisher:
             stage_identity = _identity(os.fstat(stage_fd))
             backup_identity = _identity(os.fstat(backup_fd))
             _fsync_directory(parent_fd)
-            assert tx_identity is not None and owner_identity is not None
+            assert (
+                tx_identity is not None
+                and owner_identity is not None
+                and owner_ctime_ns is not None
+            )
             transaction = _Transaction(
                 parent_fd,
                 name,
@@ -2192,6 +2211,7 @@ class GuardedPublisher:
                 backup_fd,
                 tx_identity,
                 owner_identity,
+                owner_ctime_ns,
                 stage_identity,
                 backup_identity,
                 created,
@@ -2328,6 +2348,7 @@ class GuardedPublisher:
             vault_identity=anchor.identity,
             transaction_identity=transaction.identity,
             owner_identity=transaction.owner_identity,
+            owner_ctime_ns=transaction.owner_ctime_ns,
             stage_identity=transaction.stage_identity,
             backup_identity=transaction.backup_identity,
             manifest_path=manifest_path,

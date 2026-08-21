@@ -28,6 +28,8 @@ class ForgeErrorCode(StrEnum):
     JOB_CONFLICT = "JOB_CONFLICT"
     JOB_INTERRUPTED = "JOB_INTERRUPTED"
     JOB_CANCELLED = "JOB_CANCELLED"
+    PLAN_EXPIRED = "PLAN_EXPIRED"
+    CONFIRMATION_REQUIRED = "CONFIRMATION_REQUIRED"
 
 
 _PUBLIC_MESSAGES = {
@@ -51,6 +53,8 @@ _PUBLIC_MESSAGES = {
     ForgeErrorCode.JOB_CONFLICT: "Another job already controls this book and target.",
     ForgeErrorCode.JOB_INTERRUPTED: "Job was interrupted and can be resumed.",
     ForgeErrorCode.JOB_CANCELLED: "Job was cancelled.",
+    ForgeErrorCode.PLAN_EXPIRED: "Forge plan expired and must be recreated.",
+    ForgeErrorCode.CONFIRMATION_REQUIRED: "Explicit confirmation is required.",
 }
 
 

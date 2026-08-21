@@ -22,7 +22,9 @@ class AgentSkillOutput:
         analyzed: AnalyzedChapter,
     ) -> SkillPublishResult:
         try:
-            rendered = self._renderer.render(snapshot, analyzed, None)
+            initial = self._renderer.render(snapshot, analyzed, None)
+            previous = self._publisher.current_manifest(initial.skill_slug)
+            rendered = self._renderer.render(snapshot, analyzed, previous)
             receipt = self._publisher.publish(rendered)
             installations = self._installer.install(receipt)
             return SkillPublishResult(

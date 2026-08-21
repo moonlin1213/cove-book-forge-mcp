@@ -629,6 +629,20 @@ class CanonicalSkillPublisher:
     def _checkpoint(self, phase: str) -> None:
         del phase
 
+    def current_manifest(self, skill_slug: str) -> AgentSkillManifest | None:
+        """Return the validated active manifest used for an incremental render."""
+        anchor = _RootAnchor.capture(self._config)
+        management: _Management | None = None
+        try:
+            management = self._management(anchor)
+            self._recover_transactions(management)
+            active = self._active_generation(anchor, management, skill_slug)
+            return None if active is None else active.manifest
+        finally:
+            if management is not None:
+                management.close()
+            anchor.close()
+
     def publish(self, render: RenderedAgentSkill) -> SkillPublisherReceipt:
         try:
             return self._publish(render)

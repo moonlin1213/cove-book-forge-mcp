@@ -70,7 +70,7 @@ def fingerprint_source(source: Path, *, limits: ExtractionLimits | None = None) 
 
 def detect_book_format(source: Path) -> BookFormat:
     suffix = source.suffix.lower()
-    if suffix not in {".epub", ".pdf"}:
+    if suffix not in {".epub", ".pdf", ".txt"}:
         raise _source_error(ForgeErrorCode.UNSUPPORTED_FORMAT)
     try:
         with source.open("rb") as stream:
@@ -81,6 +81,8 @@ def detect_book_format(source: Path) -> BookFormat:
         return BookFormat.PDF
     if suffix == ".epub" and magic.startswith(_EPUB_MAGIC):
         return BookFormat.EPUB
+    if suffix == ".txt" and not magic.startswith((_PDF_MAGIC, _EPUB_MAGIC)):
+        return BookFormat.TXT
     raise _source_error(ForgeErrorCode.UNSUPPORTED_FORMAT)
 
 

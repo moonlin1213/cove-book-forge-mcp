@@ -11,6 +11,8 @@
   including archive preflight and bounded XHTML normalization.
 - Added deterministic text-layer PDF ingestion with explicit `OCR_REQUIRED`
   classification for scanned or image-only documents and no hidden OCR fallback.
+- Added deterministic Unicode TXT ingestion for UTF-8 and BOM-tagged UTF-16,
+  normalized as one reusable chapter with closed handling of malformed content.
 - Added an optional transactional SQLite library with `COPY` and `REFERENCE`
   import modes, ordered normalized chapters, source fingerprinting, and source
   availability reporting.

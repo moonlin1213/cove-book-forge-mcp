@@ -5,6 +5,7 @@ from fixtures import opf_document, write_epub, write_pdf, xhtml_document
 from cove_book_forge.config import AppConfig
 from cove_book_forge.contracts import (
     Annotation,
+    BookFormat,
     BookMetadata,
     BookRef,
     ChapterContent,
@@ -97,6 +98,28 @@ def test_default_pdf_reference_keeps_chapters_after_source_change_and_loss(
     source.unlink()
     assert restarted.get_book(imported.book).source_available is False
     assert restarted.get_chapter(imported.book, 0) == chapter
+
+
+def test_default_txt_copy_import_survives_restart_as_a_normalized_book(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "library"
+    source = tmp_path / "runtime.txt"
+    source.write_text("第一段。\r\n\r\n第二段。", encoding="utf-8")
+
+    imported = create_book_library(_config(data_dir)).import_book(source, ImportMode.COPY)
+    restarted = create_book_library(_config(data_dir))
+
+    stored = restarted.get_book(imported.book)
+    assert imported.format is BookFormat.TXT
+    assert stored.format is BookFormat.TXT
+    assert stored.source_available is True
+    assert restarted.get_chapter(imported.book, 0) == ChapterContent(
+        index=0,
+        title="runtime",
+        content="第一段。\n\n第二段。",
+        source_locator="txt:document",
+    )
 
 
 def test_external_snapshot_round_trip_survives_restart_when_library_is_disabled(

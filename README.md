@@ -1,6 +1,6 @@
 # cove-book-forge-mcp
 
-**Turn a PDF or EPUB into reusable knowledge—not another one-off chat.**
+**Turn a PDF, EPUB, or TXT into reusable knowledge—not another one-off chat.**
 
 `cove-book-forge-mcp` is a local-first, open-source MCP server that transforms
 books into structured AI analysis, Obsidian notes, chapter-level Skills, or one
@@ -10,7 +10,7 @@ MCP-capable reading system.
 
 ## What you can do
 
-- **Forge an entire book into one Agent Skill.** Import a PDF or EPUB, analyze
+- **Forge an entire book into one Agent Skill.** Import a PDF, EPUB, or TXT, analyze
   every chapter through a resumable job, and publish a progressively disclosed
   Skill that an agent can use without loading the whole book into every prompt.
 - **Choose the right output for each chapter.** Send the same analyzed chapter
@@ -33,7 +33,7 @@ MCP-capable reading system.
 ## From book to reusable intelligence
 
 ```text
-PDF / EPUB / existing reading system
+PDF / EPUB / TXT / existing reading system
                  │
                  ▼
        normalized chapters
@@ -70,10 +70,10 @@ Use it when you want to:
 ## What is included
 
 The current release implements standards-valid EPUB ingestion, text-layer PDF
-ingestion, an optional local SQLite library, external chapter-snapshot caching,
-model provider adapters, validated reusable chapter analysis, guarded Obsidian
-publication, persistent complete-book Agent Skill forging, and MCP tools and
-resources over stdio or loopback Streamable HTTP.
+ingestion, deterministic Unicode TXT ingestion, an optional local SQLite library,
+external chapter-snapshot caching, model provider adapters, validated reusable
+chapter analysis, guarded Obsidian publication, persistent complete-book Agent
+Skill forging, and MCP tools and resources over stdio or loopback Streamable HTTP.
 
 The repository is independent of private Cove/栖渡 code and intentionally does
 not prescribe a reading UI. Scanned PDFs still require an external OCR step;
@@ -98,6 +98,14 @@ the core fails explicitly instead of silently uploading or guessing at content.
   not download an OCR engine, call a remote service, or silently invoke an OCR
   fallback.
 - Encrypted and malformed PDFs fail with closed, path-safe errors.
+
+### TXT
+
+- UTF-8 text, with or without a BOM, and BOM-tagged UTF-16 text are supported.
+- A TXT file becomes one deterministic chapter named from the source filename,
+  preserving paragraphs and line order without guessing chapter boundaries.
+- Newlines are normalized and invisible or bidirectional control characters are
+  removed. Empty, malformed, NUL-containing, or known binary content fails closed.
 
 The default ingestion limits are:
 

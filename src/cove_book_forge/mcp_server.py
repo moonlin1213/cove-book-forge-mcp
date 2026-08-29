@@ -159,7 +159,7 @@ def create_mcp_server(
 
     @server.tool(structured_output=True)
     def import_book(source_path: str, mode: ImportMode = ImportMode.COPY) -> ImportedBook:
-        """Import a local EPUB or text-layer PDF into the managed library."""
+        """Import a local EPUB, text-layer PDF, or Unicode TXT into the managed library."""
         try:
             return context.library.import_book(Path(source_path), mode)
         except ForgeException as exc:

@@ -13,6 +13,7 @@ _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 class BookFormat(StrEnum):
     EPUB = "epub"
     PDF = "pdf"
+    TXT = "txt"
 
 
 class ImportMode(StrEnum):

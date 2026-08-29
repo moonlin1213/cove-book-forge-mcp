@@ -28,10 +28,12 @@ class BookExtractorRegistry:
         if extractors is None:
             from cove_book_forge.extractors.epub import EpubExtractor
             from cove_book_forge.extractors.pdf import PdfExtractor
+            from cove_book_forge.extractors.txt import TxtExtractor
 
             self._extractors = {
                 BookFormat.EPUB: EpubExtractor(limits=self._limits),
                 BookFormat.PDF: PdfExtractor(limits=self._limits),
+                BookFormat.TXT: TxtExtractor(limits=self._limits),
             }
         else:
             self._extractors = dict(extractors)
